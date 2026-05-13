@@ -1,0 +1,729 @@
+*{margin:0;padding:0;box-sizing:border-box}
+#root{display:flex;flex-direction:column;flex:1;height:100%}
+
+/* --- Theme variables ---
+ *
+ * All themes are CSS-only via `data-theme=<name>` on :root. Each
+ * theme MUST define every variable so palette swaps are atomic --
+ * partial themes were a foot-gun in earlier iterations.
+ *
+ * Two orthogonal customisations layer on top:
+ *   --font-scale  (0.85 ... 1.3) multiplies the base font sizing
+ *   --density     (compact|normal|spacious) tweaks paddings via
+ *                 the `--gap` variable
+ *
+ * `useTheme` writes both as CSS variables on :root so any component
+ * that reads them (incl. third-party widgets) reacts live.
+ */
+
+/* Dark is the default. Light + alternates override with :root specificity. */
+:root {
+  --bg:#0f0f17;--sidebar-bg:#1a1a2e;--panel-bg:#12121a;--card-bg:#1e1e2e;
+  --border:#2a2a3e;--text:#e0e0e0;--text-dim:#888;--accent:#6366f1;
+  --green:#22c55e;--yellow:#f59e0b;--blue:#3b82f6;--red:#ef4444;--purple:#a855f7;--orange:#f97316;
+  --text-faint:#555;--text-muted:#aaa;--text-subtle:#666;
+  --input-bg:#0d1117;--handle-bg:#555;--handle-border:#888;
+  --node-text:#e0e0e0;--node-badge-bg:#333;--node-badge-text:#aaa;
+  --ci-ring-bg:#2a2a3e;--selection-bg:rgba(99,102,241,0.3);
+  --btn-accent-hover:#5558e6;--shadow-color:rgba(0,0,0,0.4);
+  --toast-shadow:rgba(0,0,0,0.4);--scrollbar-hover:#444;
+  --graph-dim-node:0.15;--graph-dim-edge:0.08;
+  --graph-done-edge:#666;
+  /* Personalisation knobs (defaults) -- overridden by useTheme. */
+  --font-scale:1;
+  --gap:1;
+  --font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+}
+:root[data-theme="light"] {
+  --bg:#f5f5f7;--sidebar-bg:#eeeef2;--panel-bg:#f0f0f4;--card-bg:#ffffff;
+  --border:#d4d4d8;--text:#1e1e2e;--text-dim:#6b7280;--accent:#6366f1;
+  --green:#16a34a;--yellow:#d97706;--blue:#2563eb;--red:#dc2626;--purple:#9333ea;--orange:#ea580c;
+  --text-faint:#a1a1aa;--text-muted:#71717a;--text-subtle:#9ca3af;
+  --input-bg:#ffffff;--handle-bg:#d4d4d8;--handle-border:#a1a1aa;
+  --node-text:#1e1e2e;--node-badge-bg:#e4e4e7;--node-badge-text:#6b7280;
+  --ci-ring-bg:#e4e4e7;--selection-bg:rgba(99,102,241,0.15);
+  --btn-accent-hover:#4f46e5;--shadow-color:rgba(0,0,0,0.1);
+  --toast-shadow:rgba(0,0,0,0.12);--scrollbar-hover:#c4c4c4;
+  --graph-dim-node:0.35;--graph-dim-edge:0.2;
+  --graph-done-edge:#71717a;
+}
+/* Solarized Dark -- low-contrast warm palette popular in IDEs.
+ * Uses Solarized base16 ramp + cyan accent for distinctness from the
+ * default indigo theme. */
+:root[data-theme="solarized-dark"] {
+  --bg:#002b36;--sidebar-bg:#073642;--panel-bg:#01313d;--card-bg:#073642;
+  --border:#2a4d57;--text:#eee8d5;--text-dim:#93a1a1;--accent:#2aa198;
+  --green:#859900;--yellow:#b58900;--blue:#268bd2;--red:#dc322f;--purple:#6c71c4;--orange:#cb4b16;
+  --text-faint:#586e75;--text-muted:#839496;--text-subtle:#657b83;
+  --input-bg:#001f27;--handle-bg:#586e75;--handle-border:#839496;
+  --node-text:#eee8d5;--node-badge-bg:#073642;--node-badge-text:#839496;
+  --ci-ring-bg:#073642;--selection-bg:rgba(42,161,152,0.25);
+  --btn-accent-hover:#1e8a82;--shadow-color:rgba(0,0,0,0.5);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#586e75;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#586e75;
+}
+/* Solarized Light -- the warm cousin to the dark variant. */
+:root[data-theme="solarized-light"] {
+  --bg:#fdf6e3;--sidebar-bg:#eee8d5;--panel-bg:#f5efdc;--card-bg:#ffffff;
+  --border:#d9d3c0;--text:#073642;--text-dim:#586e75;--accent:#2aa198;
+  --green:#719e07;--yellow:#b58900;--blue:#268bd2;--red:#dc322f;--purple:#6c71c4;--orange:#cb4b16;
+  --text-faint:#93a1a1;--text-muted:#839496;--text-subtle:#657b83;
+  --input-bg:#ffffff;--handle-bg:#93a1a1;--handle-border:#586e75;
+  --node-text:#073642;--node-badge-bg:#eee8d5;--node-badge-text:#586e75;
+  --ci-ring-bg:#eee8d5;--selection-bg:rgba(42,161,152,0.15);
+  --btn-accent-hover:#1e8a82;--shadow-color:rgba(7,54,66,0.1);
+  --toast-shadow:rgba(7,54,66,0.12);--scrollbar-hover:#bfb7a0;
+  --graph-dim-node:0.35;--graph-dim-edge:0.2;
+  --graph-done-edge:#93a1a1;
+}
+/* High contrast -- maximum legibility for accessibility / projector
+ * use. Pure b/w background with bold accent saturation. */
+:root[data-theme="high-contrast"] {
+  --bg:#000000;--sidebar-bg:#0a0a0a;--panel-bg:#050505;--card-bg:#111111;
+  --border:#444444;--text:#ffffff;--text-dim:#cccccc;--accent:#00d4ff;
+  --green:#00ff85;--yellow:#ffd60a;--blue:#0a84ff;--red:#ff453a;--purple:#bf5af2;--orange:#ff9f0a;
+  --text-faint:#777777;--text-muted:#bbbbbb;--text-subtle:#999999;
+  --input-bg:#000000;--handle-bg:#999999;--handle-border:#ffffff;
+  --node-text:#ffffff;--node-badge-bg:#222222;--node-badge-text:#ffffff;
+  --ci-ring-bg:#333333;--selection-bg:rgba(0,212,255,0.4);
+  --btn-accent-hover:#00b8d9;--shadow-color:rgba(0,0,0,0.7);
+  --toast-shadow:rgba(0,0,0,0.7);--scrollbar-hover:#666666;
+  --graph-dim-node:0.1;--graph-dim-edge:0.05;
+  --graph-done-edge:#888888;
+}
+/* Nord -- cool blue-grey palette popular for terminals. */
+:root[data-theme="nord"] {
+  --bg:#2e3440;--sidebar-bg:#3b4252;--panel-bg:#353b48;--card-bg:#3b4252;
+  --border:#434c5e;--text:#eceff4;--text-dim:#a6acb8;--accent:#88c0d0;
+  --green:#a3be8c;--yellow:#ebcb8b;--blue:#5e81ac;--red:#bf616a;--purple:#b48ead;--orange:#d08770;
+  --text-faint:#6c7280;--text-muted:#a6acb8;--text-subtle:#7a8290;
+  --input-bg:#242933;--handle-bg:#6c7280;--handle-border:#a6acb8;
+  --node-text:#eceff4;--node-badge-bg:#434c5e;--node-badge-text:#a6acb8;
+  --ci-ring-bg:#434c5e;--selection-bg:rgba(136,192,208,0.25);
+  --btn-accent-hover:#7aafc0;--shadow-color:rgba(0,0,0,0.4);
+  --toast-shadow:rgba(0,0,0,0.4);--scrollbar-hover:#6c7280;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#6c7280;
+}
+/* Rose Pine Moon -- modern, warm-purple dim theme. Popular for long
+ * coding sessions because it cuts blue light without going full sepia.
+ * Accent uses iris (the canonical Rose Pine highlight). */
+:root[data-theme="rose-pine-moon"] {
+  --bg:#232136;--sidebar-bg:#2a283e;--panel-bg:#1f1d2e;--card-bg:#2a273f;
+  --border:#393552;--text:#e0def4;--text-dim:#908caa;--accent:#c4a7e7;
+  --green:#9ccfd8;--yellow:#f6c177;--blue:#3e8fb0;--red:#eb6f92;--purple:#c4a7e7;--orange:#ea9a97;
+  --text-faint:#56526e;--text-muted:#908caa;--text-subtle:#6e6a86;
+  --input-bg:#191724;--handle-bg:#56526e;--handle-border:#908caa;
+  --node-text:#e0def4;--node-badge-bg:#393552;--node-badge-text:#908caa;
+  --ci-ring-bg:#393552;--selection-bg:rgba(196,167,231,0.25);
+  --btn-accent-hover:#b596d6;--shadow-color:rgba(0,0,0,0.45);
+  --toast-shadow:rgba(0,0,0,0.45);--scrollbar-hover:#56526e;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#56526e;
+}
+/* GitHub Dimmed -- mirrors GitHub's "dark dimmed" reading-friendly
+ * dark theme. Lower contrast than the default GH dark, popular among
+ * devs who find pure dark too harsh. */
+:root[data-theme="github-dimmed"] {
+  --bg:#22272e;--sidebar-bg:#2d333b;--panel-bg:#1c2128;--card-bg:#2d333b;
+  --border:#444c56;--text:#adbac7;--text-dim:#768390;--accent:#539bf5;
+  --green:#57ab5a;--yellow:#c69026;--blue:#539bf5;--red:#e5534b;--purple:#b083f0;--orange:#cc6b2c;
+  --text-faint:#545d68;--text-muted:#768390;--text-subtle:#636e7b;
+  --input-bg:#1c2128;--handle-bg:#545d68;--handle-border:#768390;
+  --node-text:#adbac7;--node-badge-bg:#444c56;--node-badge-text:#768390;
+  --ci-ring-bg:#444c56;--selection-bg:rgba(83,155,245,0.22);
+  --btn-accent-hover:#3d83d8;--shadow-color:rgba(0,0,0,0.4);
+  --toast-shadow:rgba(0,0,0,0.4);--scrollbar-hover:#545d68;
+  --graph-dim-node:0.18;--graph-dim-edge:0.09;
+  --graph-done-edge:#545d68;
+}
+/* Cobalt -- saturated electric-blue dark theme inspired by VS Code's
+ * "Cobalt2". Vibrant accents stand out on a deep blue panel; great
+ * for users who like the brutalist / arcade aesthetic. */
+:root[data-theme="cobalt"] {
+  --bg:#193549;--sidebar-bg:#0d2438;--panel-bg:#15293c;--card-bg:#1a3a52;
+  --border:#1f4662;--text:#ffffff;--text-dim:#a0b9c9;--accent:#ffc600;
+  --green:#3ad900;--yellow:#ffc600;--blue:#39adb5;--red:#ff628c;--purple:#fb94ff;--orange:#ff9d00;
+  --text-faint:#5a7a8e;--text-muted:#a0b9c9;--text-subtle:#7a8fa3;
+  --input-bg:#0d2438;--handle-bg:#5a7a8e;--handle-border:#a0b9c9;
+  --node-text:#ffffff;--node-badge-bg:#1f4662;--node-badge-text:#a0b9c9;
+  --ci-ring-bg:#1f4662;--selection-bg:rgba(255,198,0,0.22);
+  --btn-accent-hover:#e6b400;--shadow-color:rgba(0,0,0,0.5);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#5a7a8e;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#5a7a8e;
+}
+/* Tokyo Night -- modern dev favourite, deep slate background with
+ * cyan/violet accents. Easier on the eyes than full black for long
+ * coding sessions while still feeling "dark". Maps the canonical
+ * Tokyo Night Storm ramp onto our variables. */
+:root[data-theme="tokyo-night"] {
+  --bg:#1a1b26;--sidebar-bg:#16161e;--panel-bg:#1e202e;--card-bg:#24283b;
+  --border:#2f334d;--text:#c0caf5;--text-dim:#9aa5ce;--accent:#7aa2f7;
+  --green:#9ece6a;--yellow:#e0af68;--blue:#7aa2f7;--red:#f7768e;--purple:#bb9af7;--orange:#ff9e64;
+  --text-faint:#414868;--text-muted:#9aa5ce;--text-subtle:#565f89;
+  --input-bg:#16161e;--handle-bg:#414868;--handle-border:#7aa2f7;
+  --node-text:#c0caf5;--node-badge-bg:#2f334d;--node-badge-text:#9aa5ce;
+  --ci-ring-bg:#2f334d;--selection-bg:rgba(122,162,247,0.25);
+  --btn-accent-hover:#5d87dc;--shadow-color:rgba(0,0,0,0.5);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#414868;
+  --graph-dim-node:0.18;--graph-dim-edge:0.09;
+  --graph-done-edge:#414868;
+}
+/* Catppuccin Mocha -- soft pastel dark theme with mauve accents.
+ * Most-installed theme on VS Code marketplace 2024. Lower contrast
+ * than tokyo-night, friendlier on tired eyes, peach + sky pastels. */
+:root[data-theme="catppuccin-mocha"] {
+  --bg:#1e1e2e;--sidebar-bg:#181825;--panel-bg:#181825;--card-bg:#313244;
+  --border:#45475a;--text:#cdd6f4;--text-dim:#a6adc8;--accent:#cba6f7;
+  --green:#a6e3a1;--yellow:#f9e2af;--blue:#89b4fa;--red:#f38ba8;--purple:#cba6f7;--orange:#fab387;
+  --text-faint:#585b70;--text-muted:#a6adc8;--text-subtle:#7f849c;
+  --input-bg:#11111b;--handle-bg:#585b70;--handle-border:#cba6f7;
+  --node-text:#cdd6f4;--node-badge-bg:#45475a;--node-badge-text:#a6adc8;
+  --ci-ring-bg:#45475a;--selection-bg:rgba(203,166,247,0.25);
+  --btn-accent-hover:#b48ddf;--shadow-color:rgba(17,17,27,0.55);
+  --toast-shadow:rgba(17,17,27,0.55);--scrollbar-hover:#585b70;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#585b70;
+}
+/* Gruvbox Dark -- beloved retro palette (vim/vscode top-installs).
+ * Warm browns + olive accents; orange hover. Distinct from every
+ * existing theme: no other palette uses this earthy ramp. */
+:root[data-theme="gruvbox-dark"] {
+  --bg:#282828;--sidebar-bg:#1d2021;--panel-bg:#32302f;--card-bg:#3c3836;
+  --border:#504945;--text:#ebdbb2;--text-dim:#a89984;--accent:#d79921;
+  --green:#98971a;--yellow:#d79921;--blue:#458588;--red:#cc241d;--purple:#b16286;--orange:#d65d0e;
+  --text-faint:#665c54;--text-muted:#a89984;--text-subtle:#7c6f64;
+  --input-bg:#1d2021;--handle-bg:#665c54;--handle-border:#a89984;
+  --node-text:#ebdbb2;--node-badge-bg:#504945;--node-badge-text:#a89984;
+  --ci-ring-bg:#504945;--selection-bg:rgba(215,153,33,0.25);
+  --btn-accent-hover:#b8860b;--shadow-color:rgba(0,0,0,0.5);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#665c54;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#665c54;
+}
+/* Everforest Dark -- modern forest-green palette popular in nvim
+ * community. Lower saturation than gruvbox, soft sage + warm cream
+ * text; the only "green-first" palette in the set so users with
+ * green-monitor habits get a real fit. */
+:root[data-theme="everforest-dark"] {
+  --bg:#2d353b;--sidebar-bg:#272e33;--panel-bg:#2c333a;--card-bg:#374145;
+  --border:#475258;--text:#d3c6aa;--text-dim:#9da9a0;--accent:#a7c080;
+  --green:#a7c080;--yellow:#dbbc7f;--blue:#7fbbb3;--red:#e67e80;--purple:#d699b6;--orange:#e69875;
+  --text-faint:#5a6664;--text-muted:#9da9a0;--text-subtle:#7a8478;
+  --input-bg:#232a2e;--handle-bg:#5a6664;--handle-border:#9da9a0;
+  --node-text:#d3c6aa;--node-badge-bg:#475258;--node-badge-text:#9da9a0;
+  --ci-ring-bg:#475258;--selection-bg:rgba(167,192,128,0.25);
+  --btn-accent-hover:#8fad6a;--shadow-color:rgba(0,0,0,0.45);
+  --toast-shadow:rgba(0,0,0,0.45);--scrollbar-hover:#5a6664;
+  --graph-dim-node:0.2;--graph-dim-edge:0.1;
+  --graph-done-edge:#5a6664;
+}
+/* Dracula -- the classic. Saturated pink + cyan + green on a deep
+ * blue-grey, lots of contrast. Polarising but iconic; ships everywhere
+ * so users coming from other tools feel at home immediately. */
+:root[data-theme="dracula"] {
+  --bg:#282a36;--sidebar-bg:#21222c;--panel-bg:#191a21;--card-bg:#343746;
+  --border:#44475a;--text:#f8f8f2;--text-dim:#bfbfbf;--accent:#bd93f9;
+  --green:#50fa7b;--yellow:#f1fa8c;--blue:#8be9fd;--red:#ff5555;--purple:#bd93f9;--orange:#ffb86c;
+  --text-faint:#6272a4;--text-muted:#bfbfbf;--text-subtle:#7b89c4;
+  --input-bg:#21222c;--handle-bg:#6272a4;--handle-border:#bd93f9;
+  --node-text:#f8f8f2;--node-badge-bg:#44475a;--node-badge-text:#bfbfbf;
+  --ci-ring-bg:#44475a;--selection-bg:rgba(189,147,249,0.28);
+  --btn-accent-hover:#a87ce8;--shadow-color:rgba(0,0,0,0.5);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#6272a4;
+  --graph-dim-node:0.18;--graph-dim-edge:0.09;
+  --graph-done-edge:#6272a4;
+}
+/* Crimson Dark -- a bright red accent on a polished dark blue-charcoal.
+ * FF3621 red as accent with clean neutral chrome. Aimed at users who
+ * want a serious-looking engineering dashboard without the typical
+ * hacker-purple vibe. */
+:root[data-theme="crimson-dark"] {
+  --bg:#0b0e13;--sidebar-bg:#13171f;--panel-bg:#0f131a;--card-bg:#1a1f2a;
+  --border:#262d3a;--text:#e6ebf2;--text-dim:#8a93a3;--accent:#ff3621;
+  --green:#1cb46e;--yellow:#f5b800;--blue:#3793ff;--red:#ff5050;--purple:#a26df0;--orange:#ff7a3a;
+  --text-faint:#5a6275;--text-muted:#9ba2af;--text-subtle:#6e7585;
+  --input-bg:#0a0d12;--handle-bg:#3a4252;--handle-border:#5a6275;
+  --node-text:#e6ebf2;--node-badge-bg:#262d3a;--node-badge-text:#9ba2af;
+  --ci-ring-bg:#262d3a;--selection-bg:rgba(255,54,33,0.22);
+  --btn-accent-hover:#e02d18;--shadow-color:rgba(0,0,0,0.55);
+  --toast-shadow:rgba(0,0,0,0.5);--scrollbar-hover:#3a4252;
+  --graph-dim-node:0.18;--graph-dim-edge:0.1;
+  --graph-done-edge:#3a4252;
+}
+/* Slate Pro -- a calm, modern light alternative for daytime work. Cool
+ * slate greys with a teal accent; high-contrast text and crisp panel
+ * separation without the warm yellow tones of Solarized Light. */
+:root[data-theme="slate-pro"] {
+  --bg:#f4f6fa;--sidebar-bg:#e8ecf3;--panel-bg:#eef1f6;--card-bg:#ffffff;
+  --border:#d0d7e2;--text:#1d2433;--text-dim:#5b6677;--accent:#0e9488;
+  --green:#15803d;--yellow:#b45309;--blue:#1d4ed8;--red:#b91c1c;--purple:#7e22ce;--orange:#c2410c;
+  --text-faint:#9aa3b2;--text-muted:#6b7585;--text-subtle:#8b95a4;
+  --input-bg:#ffffff;--handle-bg:#cbd2dd;--handle-border:#9aa3b2;
+  --node-text:#1d2433;--node-badge-bg:#dde3ec;--node-badge-text:#5b6677;
+  --ci-ring-bg:#dde3ec;--selection-bg:rgba(14,148,136,0.18);
+  --btn-accent-hover:#0c7e74;--shadow-color:rgba(15,23,42,0.08);
+  --toast-shadow:rgba(15,23,42,0.12);--scrollbar-hover:#b9c2d0;
+  --graph-dim-node:0.32;--graph-dim-edge:0.18;
+  --graph-done-edge:#9aa3b2;
+}
+/* Midnight Violet -- modern dark theme inspired by Linear / Vercel.
+ * Deep blue-black canvas with a vivid violet accent (matches the
+ * "indigo dye" family that's become the default for product
+ * dashboards in 2024-2025). Cooler and quieter than Tokyo Night /
+ * Catppuccin without sacrificing accent visibility. */
+:root[data-theme="midnight-violet"] {
+  --bg:#0a0a14;--sidebar-bg:#10101c;--panel-bg:#0d0d18;--card-bg:#161624;
+  --border:#23233a;--text:#e8e8f5;--text-dim:#8d8db0;--accent:#7c5cff;
+  --green:#22c55e;--yellow:#eab308;--blue:#3b82f6;--red:#ef4444;--purple:#a855f7;--orange:#fb923c;
+  --text-faint:#5a5a7a;--text-muted:#9c9cb8;--text-subtle:#6b6b8a;
+  --input-bg:#08080f;--handle-bg:#33334d;--handle-border:#55557a;
+  --node-text:#e8e8f5;--node-badge-bg:#23233a;--node-badge-text:#9c9cb8;
+  --ci-ring-bg:#23233a;--selection-bg:rgba(124,92,255,0.24);
+  --btn-accent-hover:#6a4ae6;--shadow-color:rgba(0,0,0,0.6);
+  --toast-shadow:rgba(0,0,0,0.55);--scrollbar-hover:#33334d;
+  --graph-dim-node:0.18;--graph-dim-edge:0.1;
+  --graph-done-edge:#3a3a5c;
+}
+/* Paper Warm -- modern light theme inspired by Notion / Bear.
+ * Soft cream-paper background with warm beige panels and an
+ * amber-orange accent. Easier on the eyes than pure-white themes
+ * during long daytime sessions; the warm palette also distinguishes
+ * it from the cool blue-grey of Slate Pro. */
+:root[data-theme="paper-warm"] {
+  --bg:#faf6ef;--sidebar-bg:#f3ede1;--panel-bg:#f7f1e6;--card-bg:#ffffff;
+  --border:#e3dccd;--text:#2b2520;--text-dim:#6b6358;--accent:#c2410c;
+  --green:#15803d;--yellow:#b45309;--blue:#1d4ed8;--red:#b91c1c;--purple:#7e22ce;--orange:#c2410c;
+  --text-faint:#a39c8d;--text-muted:#7a7266;--text-subtle:#8e8676;
+  --input-bg:#fffefa;--handle-bg:#dcd4c2;--handle-border:#a39c8d;
+  --node-text:#2b2520;--node-badge-bg:#ece5d4;--node-badge-text:#6b6358;
+  --ci-ring-bg:#ece5d4;--selection-bg:rgba(194,65,12,0.16);
+  --btn-accent-hover:#a8370a;--shadow-color:rgba(60,40,15,0.08);
+  --toast-shadow:rgba(60,40,15,0.12);--scrollbar-hover:#cbc2ad;
+  --graph-dim-node:0.32;--graph-dim-edge:0.18;
+  --graph-done-edge:#a39c8d;
+}
+body{font-family:var(--font-family);background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100vh;overflow:hidden;font-size:calc(13px * var(--font-scale));filter:brightness(var(--brightness, 1))}
+*::-webkit-scrollbar{width:6px;height:6px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+*::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-hover)}
+*{scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+/* PR description (and any other markdown body). 11px keeps long
+ * GitHub PR templates from forcing horizontal scroll in narrow PR
+ * Card panes (~35% viewport). `overflow-wrap: anywhere` is the
+ * stronger sibling of word-break:break-word -- it'll break inside
+ * unbreakable tokens too (long URLs / long branch names) so they
+ * wrap instead of stretching the column. */
+.md-body{font-size:11px;line-height:1.55;color:var(--text);word-break:break-word;overflow-wrap:anywhere}
+.md-body h1,.md-body h2,.md-body h3{margin:10px 0 4px;color:var(--text)}
+.md-body h1{font-size:14px}.md-body h2{font-size:13px}.md-body h3{font-size:12px}
+.md-body p{margin:4px 0}.md-body>:first-child{margin-top:0}
+.md-body code{background:var(--panel-bg);padding:0 3px;border-radius:3px;font-size:10px;font-family:monospace}
+.md-body pre{background:var(--panel-bg);padding:8px;border-radius:6px;overflow-x:auto;margin:6px 0;font-size:10px}
+.md-body pre code{background:none;padding:0;font-size:inherit}
+.md-body ul,.md-body ol{margin:4px 0;padding-left:18px}
+.md-body blockquote{border-left:3px solid var(--border);padding-left:8px;color:var(--text-dim);margin:4px 0}
+.md-body a{color:var(--accent);overflow-wrap:anywhere}
+.md-body table{border-collapse:collapse;margin:8px 0}
+.md-body th,.md-body td{border:1px solid var(--border);padding:4px 8px;font-size:12px}
+.md-body img{max-width:100%;border-radius:4px}
+.review-item{display:flex;gap:8px;align-items:center;margin-bottom:6px;font-size:12px}
+.review-avatar{width:24px;height:24px;border-radius:50%;flex-shrink:0}
+.comment-box{background:var(--card-bg);border-radius:6px;padding:10px;margin-bottom:8px;border-left:3px solid var(--border)}
+.comment-header{display:flex;gap:6px;align-items:center;margin-bottom:6px;font-size:11px}
+.comment-avatar{width:20px;height:20px;border-radius:50%}
+.reply-editor{margin-top:8px}
+.reply-editor textarea{width:100%;min-height:80px;background:var(--panel-bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-size:12px;font-family:inherit;resize:vertical}
+.reply-editor textarea:focus{outline:none;border-color:var(--accent)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Sidebar */
+.sidebar{width:280px;background:var(--sidebar-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-content{flex:1;overflow-y:auto;padding:16px 0}
+.forkable-bar{padding:8px 16px;border-top:1px solid var(--border);font-size:11px;flex-shrink:0}
+.forkable-bar .fk-top{display:flex;gap:8px;align-items:center;margin-bottom:4px}
+.forkable-bar .fk-img{width:40px;height:40px;border-radius:6px;object-fit:cover;flex-shrink:0}
+.forkable-bar .fk-meal{font-weight:600;color:var(--text);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;font-size:10px;line-height:1.3}
+.forkable-bar .fk-meta{display:flex;gap:8px;align-items:center;margin-top:3px}
+.forkable-bar .fk-bucket{font-weight:700;font-family:monospace;font-size:12px}
+.forkable-bar .fk-status{font-size:9px;padding:1px 6px;border-radius:3px;font-weight:600}
+.forkable-bar .fk-status.delivered{background:rgba(34,197,94,0.2);color:var(--green)}
+.forkable-bar .fk-status.preparing{background:rgba(245,158,11,0.2);color:var(--yellow)}
+.forkable-bar .fk-status.ordered{background:rgba(99,102,241,0.2);color:var(--accent)}
+.forkable-bar .fk-status.cancelled{background:rgba(239,68,68,0.2);color:var(--red)}
+.forkable-bar .fk-status.pending{background:rgba(136,136,136,0.15);color:var(--text-dim)}
+.fk-status.thinking{background:rgba(99,102,241,0.2);color:var(--accent);animation:pulse 1.5s infinite}
+.fk-status.needs_permission{background:rgba(239,68,68,0.2);color:var(--red);animation:pulse 1s infinite}
+.fk-status.pending_edits{background:rgba(245,158,11,0.2);color:var(--yellow)}
+.fk-status.idle{background:rgba(34,197,94,0.15);color:var(--green)}
+.fk-status.stopped{background:rgba(136,136,136,0.15);color:var(--text-dim)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+/* TaskNodeChip session-status indicators. Two distinct rhythms so
+ * "give me input" and "give me approval" stay visually separate.
+ *   needs_permission -- 0.8s strong blink + scale (urgent, security)
+ *   needs_input      -- 1.6s gentle opacity-only pulse (your turn) */
+.session-dot-blink{animation:sessionBlink 0.8s ease-in-out infinite}
+.session-dot-soft{animation:sessionSoft 1.6s ease-in-out infinite}
+@keyframes sessionBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.35;transform:scale(0.7)}}
+@keyframes sessionSoft{0%,100%{opacity:1}50%{opacity:0.55}}
+
+/* Draft-task-node creating state: triple-bounce spinner + bottom-edge
+ * shimmer. Both target the eye without dominating the canvas.        */
+.creating-spinner{display:inline-flex;gap:2px;align-items:center}
+.creating-spinner > span{
+  width:3px;height:3px;border-radius:50%;background:var(--accent);
+  animation:creatingBounce 0.9s ease-in-out infinite;
+}
+.creating-spinner > span:nth-child(2){animation-delay:0.15s}
+.creating-spinner > span:nth-child(3){animation-delay:0.30s}
+@keyframes creatingBounce{
+  0%,80%,100%{opacity:0.25;transform:translateY(0)}
+  40%{opacity:1;transform:translateY(-2px)}
+}
+/* Sweeping gradient stripe across the bottom border of the node. */
+.draft-node-creating{position:relative;overflow:hidden}
+.creating-shimmer{
+  position:absolute;left:0;right:0;bottom:0;height:2px;
+  background:linear-gradient(90deg,
+    transparent 0%,
+    var(--accent) 50%,
+    transparent 100%);
+  background-size:50% 100%;background-repeat:no-repeat;
+  animation:creatingShimmer 1.4s linear infinite;
+  pointer-events:none;opacity:0.85;
+}
+@keyframes creatingShimmer{
+  0%{background-position:-50% 0}
+  100%{background-position:150% 0}
+}
+
+/* Hover-to-link drop target: inset accent glow that lives ENTIRELY
+ * inside the node bounds, so the dragged node sitting on top of it
+ * isn't outlined by a halo that bleeds outward. The border color
+ * pulses too -- combined effect reads as "armed, hold".            */
+.task-node-drop-target{
+  animation:dropTargetPulse 0.9s ease-in-out infinite;
+}
+@keyframes dropTargetPulse{
+  0%,100%{
+    box-shadow:inset 0 0 0 1px var(--accent), inset 0 0 12px 1px rgba(99,102,241,0.35);
+  }
+  50%{
+    box-shadow:inset 0 0 0 2px var(--accent), inset 0 0 18px 3px rgba(99,102,241,0.55);
+  }
+}
+
+/* Top-edge "thinking" progress strip. A moving blue gradient slides
+ * across the top 2px of the task card whenever the session is in
+ * `thinking` state -- the dominant in-flight signal that used to be
+ * a static blue dot. Motion communicates "working right now" much
+ * faster than colour alone. Pure CSS animation, no JS. */
+.task-node-thinking-strip-fill{
+  width:40%;height:100%;
+  background:linear-gradient(90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--blue) 30%, transparent) 30%,
+    var(--blue) 50%,
+    color-mix(in srgb, var(--blue) 30%, transparent) 70%,
+    transparent 100%);
+  animation:taskNodeThinkingStrip 1.6s linear infinite;
+}
+@keyframes taskNodeThinkingStrip{
+  0%{transform:translateX(-100%)}
+  100%{transform:translateX(350%)}
+}
+
+/* Needs-attention backlight. The card sits in front of a soft red
+ * light source -- think LED strip behind a TV. Two layers do the
+ * work:
+ *   ::before: an ellipse-shaped radial-gradient pool of red light,
+ *             much larger than the card and BEHIND it (z-index:-1).
+ *             No `border-radius`, no card-shaped edges -- it's pure
+ *             ambient light. `filter:blur` softens the gradient
+ *             stops so there's no visible ring.
+ * `isolation:isolate` on the parent confines z-index:-1 to this
+ * card's stacking context so the light can't bleed under a sibling
+ * graph node.
+ *
+ * The card itself is opaque (var(--card-bg)) so the centre of the
+ * light is hidden -- you only see the halo spilling out from the
+ * edges, which is exactly the backlight illusion.
+ */
+/* Needs-attention backlight. Implemented as a stack of red box-
+ * shadows on a ::after pseudo-element that overlays the card. The
+ * pseudo has no background of its own, so the card content shows
+ * through; box-shadow only renders OUTSIDE the pseudo's box, so the
+ * red wash is physically incapable of touching the card silhouette
+ * -- it's only visible spilling out around the edges. That's the
+ * ambient-backlight illusion without any z-index gymnastics, which
+ * is critical because React Flow's node containers create their own
+ * stacking contexts and would eat a `z-index:-1` ::before.
+ *
+ * The shadow is layered to fake a light falloff:
+ *   tight inner ring (8px / 4px spread)  -- the brightest edge
+ *   middle wash      (24px / 10px)       -- the colour body
+ *   far halo         (60px / 18px)       -- the ambient tail
+ * Each layer's alpha drops so the eye reads it as one continuous
+ * gradient, not three rings.
+ *
+ * Animation only touches opacity + scale to avoid recomputing the
+ * shadow stack every frame.
+ */
+.task-node-attention::after{
+  content:'';position:absolute;inset:0;
+  border-radius:inherit;
+  pointer-events:none;
+  box-shadow:
+    0 0 6px 1px color-mix(in srgb, var(--red) 45%, transparent),
+    0 0 18px 4px color-mix(in srgb, var(--red) 22%, transparent),
+    0 0 40px 8px color-mix(in srgb, var(--red) 10%, transparent);
+  animation:nodeAttentionBacklight 2.6s ease-in-out infinite;
+}
+@keyframes nodeAttentionBacklight{
+  0%,100%{opacity:0.45;transform:scale(0.99)}
+  50%{opacity:0.85;transform:scale(1.015)}
+}
+
+/* Active task-node visual flair: subtle "breathing" backdrop so
+ * in-progress / in-review tasks read as alive on the canvas. Stays
+ * gentle so it doesn't compete with hover or drop-target animations.
+ *
+ * Uses two stacked layers (top-right glow + bottom-left fade) so the
+ * card has a soft directional sheen instead of a flat tint.
+ */
+.task-node-active::before{
+  content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:
+    radial-gradient(ellipse at top right, color-mix(in srgb, var(--accent) 16%, transparent), transparent 65%),
+    radial-gradient(ellipse at bottom left, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%);
+  animation:taskNodeBreath 3.2s ease-in-out infinite;
+}
+@keyframes taskNodeBreath{
+  0%,100%{opacity:0.45}
+  50%{opacity:1}
+}
+/* Lift on hover: depth + soft accent glow that picks up the status
+ * border-left color via currentColor inheritance. Disabled on mini
+ * (kept tight) and drop-target (already animating). */
+.react-flow__node-taskNode:hover > div:not(.task-node-drop-target){
+  box-shadow:
+    0 6px 18px var(--shadow-color),
+    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+    inset 0 0 0 9999px rgba(0,0,0,0) !important;
+  transform:translateY(-1.5px);
+}
+/* Modern: when the node is in-progress / in-review, hover gives a
+ * stronger color-on-color glow so the card feels "ready to act". */
+.react-flow__node-taskNode:hover > div.task-node-active{
+  box-shadow:
+    0 8px 22px var(--shadow-color),
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
+    0 0 18px color-mix(in srgb, var(--accent) 25%, transparent) !important;
+}
+
+/* Smooth snap-after-release: when a drag ends and the node had to
+ * move to resolve a collision, the position update animates instead
+ * of teleporting. Active drags keep `transition: none` so the user's
+ * own pointer never lags behind the cursor. */
+.react-flow__node{
+  transition:transform 0.22s cubic-bezier(0.2,0.8,0.2,1);
+}
+.react-flow__node.dragging,
+.react-flow__node[data-dragging='true']{
+  transition:none;
+}
+.forkable-bar .fk-time{font-size:9px;color:var(--text-dim)}
+.usage-bar{padding:8px 16px;border-top:1px solid var(--border);font-size:10px;color:var(--text-dim);flex-shrink:0}
+.usage-bar .usage-row{display:flex;justify-content:space-between;margin-bottom:2px}
+.usage-bar .usage-label{color:var(--text-dim)}
+.usage-bar .usage-val{color:var(--text);font-weight:600;font-family:monospace}
+.usage-bar .usage-tier{font-size:9px;color:var(--accent);margin-bottom:4px}
+.project-node{cursor:pointer}
+.project-name{padding:8px 16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px}
+.project-name:hover{background:rgba(99,102,241,0.1)}
+.project-name .arrow{font-size:10px;color:var(--text-dim);transition:transform 0.2s}
+.project-name .arrow.open{transform:rotate(90deg)}
+.project-children{display:none}
+.project-children.open{display:block}
+.child-node{padding:6px 16px 6px 40px;color:var(--text-dim);cursor:pointer;font-size:14px}
+.child-node:hover,.child-node.active{background:rgba(99,102,241,0.15);color:var(--accent)}
+
+/* Main */
+.main{flex:1;overflow-y:auto;padding:24px}
+
+/* Project header card */
+.project-header{background:var(--card-bg);border-radius:8px;padding:18px;margin-bottom:20px;border-left:4px solid var(--accent)}
+.project-header.compact{padding:8px 12px;margin-bottom:0}
+.project-header-top{display:flex;justify-content:space-between;align-items:center}
+.project-header h2{font-size:18px;margin:0}
+.project-header .desc{color:var(--text-dim);font-size:12px;margin-top:4px}
+.project-header .progress-big{font-size:28px;font-weight:700;color:var(--accent);text-align:right}
+.project-header .progress-label{font-size:10px;color:var(--text-dim);text-align:right}
+.progress-bar{height:6px;background:var(--border);border-radius:3px;margin-top:12px;overflow:hidden}
+.progress-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),#818cf8);transition:width 0.3s}
+
+/* Legend */
+.legend{display:flex;gap:18px;margin-bottom:16px;font-size:12px;color:var(--text-dim)}
+.legend span{display:flex;align-items:center;gap:4px}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot-done{background:var(--green)}
+.dot-needs_follow_up{background:var(--orange)}
+.dot-in_review{background:var(--yellow)}
+.dot-in_progress{background:var(--blue)}
+.dot-not_started{background:var(--purple)}
+.dot-blocked{background:var(--text-faint)}
+.dot-closed{background:var(--text-dim)}
+
+
+/* Task card. Transition lets the hover lift / shadow ease in
+ * smoothly; box-shadow stays at 0 0 0 transparent at rest so the
+ * gpu layer composites cleanly between states. */
+.task-card{background:var(--card-bg);border-radius:8px;padding:14px 16px;margin-bottom:10px;border-left:4px solid var(--border);display:flex;flex-direction:column;transition:transform 0.18s ease, box-shadow 0.18s ease, border-left-color 0.18s ease, background 0.18s ease;box-shadow:0 0 0 transparent}
+.task-card:hover{transform:translateY(-1px);box-shadow:0 4px 14px var(--shadow-color)}
+/* Subtle press feedback so the click registers as something tactile,
+   not a static color flip. Pairs with the lift-on-hover. */
+.task-card:active{transform:translateY(0);transition-duration:0.05s}
+.win-body>.task-card{flex:1;margin-bottom:0;overflow:hidden}
+.task-card.st-done{border-left-color:var(--green)}
+.task-card.st-need_followup{border-left-color:var(--orange)}
+.task-card.st-in_review{border-left-color:var(--yellow)}
+.task-card.st-in_progress{border-left-color:var(--blue)}
+.task-card.st-not_started{border-left-color:var(--purple)}
+.task-card.st-blocked{border-left-color:var(--text-faint)}
+.task-card.st-closed{border-left-color:var(--text-dim)}
+.task-card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.task-card-title{font-size:14px;font-weight:600;transition:color 0.18s ease}
+.task-card:hover .task-card-title{color:var(--accent)}
+/* Chip-shaped pill (rounded full) -- modern card UI convention.
+   The 1px border at the same accent colour gives more visual weight
+   without darkening the background, which kept the chip looking
+   washed out at lower-contrast palettes. */
+.task-card-type{font-size:10px;background:rgba(99,102,241,0.16);color:var(--accent);padding:2px 9px;border-radius:999px;text-transform:capitalize;font-weight:700;letter-spacing:0.3px;border:1px solid rgba(99,102,241,0.35);transition:background 0.18s ease, border-color 0.18s ease}
+.task-card:hover .task-card-type{background:rgba(99,102,241,0.24);border-color:var(--accent)}
+.task-card-group{font-size:11px;color:var(--text-dim);margin-bottom:6px;display:flex;align-items:center}
+.task-card-body{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.task-card-field{display:flex;flex-direction:column;gap:2px}
+.task-card-field .label{font-size:10px;color:var(--text-dim);text-transform:uppercase;font-weight:600}
+.task-card-field .value{font-size:12px}
+.task-card-prs{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+/* min-width:0 + overflow:hidden so the inner .pr-title flex:1 can
+   actually shrink. Otherwise its intrinsic width pushes .task-card-pr
+   past its parent's right edge — visually overlapping the sibling
+   Unpin button when this card sits inside the 25%-width Reviews
+   column in three-column mode. */
+.task-card-pr{background:var(--panel-bg);border-radius:4px;padding:6px 10px;font-size:11px;display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden}
+[data-testid="pr-overview"]{min-width:0}
+.task-card-pr .pr-num{color:var(--accent);font-weight:600;white-space:nowrap}
+.task-card-pr .pr-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.task-card-pr .pr-label{font-size:9px;padding:1px 6px;border-radius:3px;white-space:nowrap;font-weight:600}
+.task-card-pr .pr-label.merged{background:rgba(34,197,94,0.2);color:var(--green)}
+.task-card-pr .pr-label.open{background:rgba(59,130,246,0.2);color:var(--blue)}
+.task-card-pr .pr-label.closed{background:rgba(239,68,68,0.2);color:var(--red)}
+.task-card-pr .pr-label.note{background:rgba(136,136,136,0.15);color:var(--text-dim)}
+.task-card-actions{margin-top:8px;display:flex;gap:6px}
+
+/* Task card expanded detail */
+.task-card-detail{background:var(--panel-bg);border-radius:6px;padding:14px;margin-top:10px;border:1px solid var(--border);display:none}
+.task-card-detail.open{display:block}
+.detail-section{margin-bottom:12px}
+.detail-label{font-size:10px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px;font-weight:600}
+.detail-value{font-size:13px}
+
+/* PR card in expanded detail */
+.pr-card{background:var(--card-bg);border-radius:6px;padding:10px;margin-bottom:8px}
+.pr-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.pr-number{color:var(--accent);font-weight:600}
+.session-output{background:var(--input-bg);border-radius:4px;padding:6px;font-family:monospace;font-size:10px;color:var(--text-dim);white-space:pre-wrap;max-height:100px;overflow-y:auto;margin-bottom:6px}
+.terminal-container{border-radius:6px;overflow:auto;border:1px solid var(--border);display:flex;flex-direction:column;flex:1;height:0;resize:both;min-height:400px;min-width:300px}
+.terminal-header{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--sidebar-bg);font-size:11px;flex-shrink:0}
+.terminal-header .tname{color:var(--accent);font-family:monospace}
+.terminal-header .tactions{display:flex;gap:6px;align-items:center}
+.xterm-wrap{flex:1;position:relative;overflow:hidden}
+.xterm-wrap .xterm{height:100%!important}
+.xterm-wrap .xterm-viewport{overflow-y:hidden!important}
+.xterm-wrap .xterm-screen{height:100%!important}
+
+/* Action buttons */
+.action-bar{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.btn-action{padding:6px 14px;border-radius:5px;border:1px solid var(--border);cursor:pointer;font-size:11px;font-weight:600;background:var(--card-bg);color:var(--text);transition:all 0.15s}
+.btn-action:hover{border-color:var(--accent);color:var(--accent)}
+.btn-action.accent{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-action.accent:hover{background:var(--btn-accent-hover)}
+.btn-action.green{background:rgba(34,197,94,0.15);color:var(--green);border-color:var(--green)}
+.btn-action.green:hover{background:rgba(34,197,94,0.3)}
+
+/* Buttons */
+.btn{padding:5px 12px;border-radius:5px;border:none;cursor:pointer;font-size:11px;font-weight:600}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--btn-accent-hover)}
+.btn-sm{padding:3px 8px;font-size:10px}
+
+/* Session list */
+.session-list-card{background:var(--card-bg);border-radius:8px;padding:14px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:stretch}
+
+/* View tabs */
+.view-tabs{display:flex;gap:4px;margin-bottom:16px}
+.view-tab{padding:6px 16px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text-dim);background:transparent;border:1px solid var(--border)}
+.view-tab:hover{color:var(--text);border-color:var(--accent)}
+.view-tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+/* Task counts */
+.task-counts{display:flex;gap:12px;margin-top:8px}
+.count-badge{font-size:11px;display:flex;align-items:center;gap:4px}
+
+/* Dependency graph */
+.graph-group{margin-bottom:20px}
+.graph-group-title{font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text)}
+.graph-svg{display:block}
+
+/* Floating windows */
+.win{position:absolute;background:var(--sidebar-bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 32px var(--shadow-color);display:flex;flex-direction:column;min-width:300px;min-height:200px;overflow:hidden}
+.win-bar{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;background:var(--card-bg);cursor:move;user-select:none;flex-shrink:0;border-bottom:1px solid var(--border)}
+.win-bar .win-title{font-size:12px;font-weight:600;color:var(--accent)}
+.win-bar .win-btns{display:flex;gap:4px}
+.win-bar .win-btn{width:18px;height:18px;border-radius:4px;border:none;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;background:var(--border);color:var(--text-dim)}
+.win-bar .win-btn:hover{background:var(--accent);color:#fff}
+.win-bar .win-btn.close:hover{background:var(--red)}
+.win-body{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column}
+.win-body.no-scroll{overflow:hidden;padding:0}
+.win-body.has-terminal{overflow:hidden}
+.win-body.has-terminal>.task-card{overflow:hidden}
+.win-body.has-terminal .terminal-container{flex:1;height:0;min-height:0;resize:none}
+.win-resize{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize}
+.win-resize::after{content:'';position:absolute;right:3px;bottom:3px;width:8px;height:8px;border-right:2px solid var(--text-dim);border-bottom:2px solid var(--text-dim)}
+.win-canvas{position:relative;flex:1;overflow:hidden}
+
+/* Top bar */
+.top-bar{height:36px;background:var(--card-bg);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;flex-shrink:0;z-index:200}
+.top-bar-title{font-size:13px;font-weight:700;color:var(--accent)}
+.top-bar-right{display:flex;align-items:center;gap:8px}
+.menu-btn{background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:16px;padding:4px 8px;border-radius:4px}
+.menu-btn:hover{color:var(--text);background:rgba(99,102,241,0.1)}
+.menu-dropdown{display:none;position:absolute;top:32px;right:0;background:var(--sidebar-bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 20px var(--toast-shadow);min-width:160px;padding:4px 0;z-index:201}
+.menu-dropdown.open{display:block}
+.menu-item{padding:8px 16px;font-size:12px;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:8px}
+.menu-item:hover{background:rgba(99,102,241,0.15);color:var(--accent)}
+.app-body{display:flex;flex:1;overflow:hidden}
+.narrow .pr-meta{display:none !important}
+.narrow .session-list-card{padding:6px 8px !important;gap:2px !important}
+.narrow .fk-status{display:none !important}
+
+/* Toast notifications */
+.toast{pointer-events:auto;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;box-shadow:0 4px 20px var(--toast-shadow);animation:toastIn 0.3s ease-out;display:flex;gap:10px;align-items:flex-start;max-width:380px}
+.toast.removing{animation:toastOut 0.3s ease-in forwards}
+.toast-icon{font-size:14px;flex-shrink:0;margin-top:1px}
+.toast-body{flex:1;min-width:0}
+.toast-title{font-size:12px;font-weight:600;color:var(--text);margin-bottom:2px}
+.toast-msg{font-size:10px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.toast-close{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:14px;padding:0;line-height:1;flex-shrink:0}
+.toast-close:hover{color:var(--text)}
+.toast.info{border-left:3px solid var(--accent)}
+.toast.success{border-left:3px solid var(--green)}
+.toast.warning{border-left:3px solid var(--yellow)}
+.toast.error{border-left:3px solid var(--red)}
+@keyframes toastIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
+@keyframes toastOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(40px)}}

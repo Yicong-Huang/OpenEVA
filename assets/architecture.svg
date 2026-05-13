@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" font-family="system-ui, -apple-system, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .layer-label { font-weight: 700; font-size: 15px; }
+      .layer-sub { font-size: 10px; opacity: 0.7; }
+      .block-title { font-weight: 600; font-size: 11px; }
+      .block-desc { font-size: 9.5px; fill: #555; }
+      .edge-text { font-size: 10px; fill: #888; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <!-- UI Layer -->
+  <rect x="10" y="10" width="900" height="95" rx="8" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1"/>
+  <text x="25" y="35" class="layer-label" fill="#4338ca">UI</text>
+  <text x="25" y="50" class="layer-sub" fill="#4338ca">React + TypeScript</text>
+  <!-- UI blocks -->
+  <rect x="105" y="20" width="145" height="70" rx="5" fill="white" stroke="#c7d2fe"/>
+  <text x="115" y="40" class="block-title">AI Sessions</text>
+  <text x="115" y="55" class="block-desc">SessionsPage, SessionCard,</text>
+  <text x="115" y="67" class="block-desc">useTerminal</text>
+
+  <rect x="260" y="20" width="155" height="70" rx="5" fill="white" stroke="#c7d2fe"/>
+  <text x="270" y="40" class="block-title">Task Workflow</text>
+  <text x="270" y="55" class="block-desc">ProjectPage, TaskCard,</text>
+  <text x="270" y="67" class="block-desc">GraphView, smart-create</text>
+
+  <rect x="425" y="20" width="145" height="70" rx="5" fill="white" stroke="#c7d2fe"/>
+  <text x="435" y="40" class="block-title">GitHub UI</text>
+  <text x="435" y="55" class="block-desc">PRsPage, ReviewsPage,</text>
+  <text x="435" y="67" class="block-desc">PRDetail</text>
+
+  <rect x="580" y="20" width="145" height="70" rx="5" fill="white" stroke="#c7d2fe"/>
+  <text x="590" y="40" class="block-title">Tickets UI</text>
+  <text x="590" y="55" class="block-desc">TicketsPage, TicketLink,</text>
+  <text x="590" y="67" class="block-desc">multi-instance</text>
+
+  <rect x="735" y="20" width="160" height="70" rx="5" fill="white" stroke="#c7d2fe"/>
+  <text x="745" y="40" class="block-title">Plugins</text>
+  <text x="745" y="55" class="block-desc">Sidebar widgets, PR stats,</text>
+  <text x="745" y="67" class="block-desc">configurable per-user</text>
+
+  <!-- Edge 1 -->
+  <text x="460" y="122" class="edge-text">fetch / SSE  &#x21F5;  SSE push</text>
+  <line x1="200" y1="118" x2="720" y2="118" stroke="#ccc" stroke-dasharray="4"/>
+
+  <!-- Service Layer -->
+  <rect x="10" y="132" width="900" height="95" rx="8" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1"/>
+  <text x="25" y="157" class="layer-label" fill="#047857">Service</text>
+  <text x="25" y="172" class="layer-sub" fill="#047857">FastAPI + AsyncIOScheduler</text>
+
+  <rect x="105" y="142" width="145" height="70" rx="5" fill="white" stroke="#a7f3d0"/>
+  <text x="115" y="162" class="block-title">Routes</text>
+  <text x="115" y="177" class="block-desc">REST + SSE + /api/hook</text>
+  <text x="115" y="189" class="block-desc">(thin handlers)</text>
+
+  <rect x="260" y="142" width="155" height="70" rx="5" fill="white" stroke="#a7f3d0"/>
+  <text x="270" y="162" class="block-title">Core</text>
+  <text x="270" y="177" class="block-desc">business logic (tasks, prs,</text>
+  <text x="270" y="189" class="block-desc">audit, reviews, ...)</text>
+
+  <rect x="425" y="142" width="145" height="70" rx="5" fill="white" stroke="#a7f3d0"/>
+  <text x="435" y="162" class="block-title">Polling</text>
+  <text x="435" y="177" class="block-desc">github / jira / slack /</text>
+  <text x="435" y="189" class="block-desc">cert / cron</text>
+
+  <rect x="580" y="142" width="145" height="70" rx="5" fill="white" stroke="#a7f3d0"/>
+  <text x="590" y="162" class="block-title">Events</text>
+  <text x="590" y="177" class="block-desc">in-process bus +</text>
+  <text x="590" y="189" class="block-desc">events table</text>
+
+  <rect x="735" y="142" width="160" height="70" rx="5" fill="white" stroke="#a7f3d0"/>
+  <text x="745" y="162" class="block-title">Adapters</text>
+  <text x="745" y="177" class="block-desc">gh / jira / slack / tmux /</text>
+  <text x="745" y="189" class="block-desc">agent (only egress)</text>
+
+  <!-- Edge 2 -->
+  <text x="460" y="244" class="edge-text">adapters/tmux + agent  &#x21F5;  /api/hook + eva-cli</text>
+  <line x1="200" y1="240" x2="720" y2="240" stroke="#ccc" stroke-dasharray="4"/>
+
+  <!-- Agent Layer -->
+  <rect x="10" y="254" width="900" height="95" rx="8" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1"/>
+  <text x="25" y="279" class="layer-label" fill="#7c3aed">Agent</text>
+  <text x="25" y="294" class="layer-sub" fill="#7c3aed">Claude Code</text>
+
+  <rect x="105" y="264" width="185" height="70" rx="5" fill="white" stroke="#e9d5ff"/>
+  <text x="115" y="284" class="block-title">Claude Code CLI</text>
+  <text x="115" y="299" class="block-desc">one tmux pane per task</text>
+
+  <rect x="300" y="264" width="185" height="70" rx="5" fill="white" stroke="#e9d5ff"/>
+  <text x="310" y="284" class="block-title">Skills</text>
+  <text x="310" y="299" class="block-desc">superpowers, custom</text>
+  <text x="310" y="311" class="block-desc">slash commands, ...</text>
+
+  <rect x="495" y="264" width="200" height="70" rx="5" fill="white" stroke="#e9d5ff"/>
+  <text x="505" y="284" class="block-title">eva-cli</text>
+  <text x="505" y="299" class="block-desc">task ops + sessions +</text>
+  <text x="505" y="311" class="block-desc">worklog + bench</text>
+
+  <rect x="705" y="264" width="190" height="70" rx="5" fill="white" stroke="#e9d5ff"/>
+  <text x="715" y="284" class="block-title">Hook</text>
+  <text x="715" y="299" class="block-desc">forwards events to</text>
+  <text x="715" y="311" class="block-desc">/api/hook endpoint</text>
+
+  <!-- Edge 3 -->
+  <line x1="400" y1="362" x2="520" y2="362" stroke="#ccc" stroke-dasharray="4"/>
+  <text x="460" y="370" class="edge-text">&#x21F5;</text>
+
+  <!-- Persist Layer -->
+  <rect x="10" y="380" width="900" height="95" rx="8" fill="#fef2f2" stroke="#fecaca" stroke-width="1"/>
+  <text x="25" y="405" class="layer-label" fill="#dc2626">Persist</text>
+  <text x="25" y="420" class="layer-sub" fill="#dc2626">SQLite + filesystem</text>
+
+  <rect x="105" y="390" width="470" height="70" rx="5" fill="white" stroke="#fecaca"/>
+  <text x="115" y="410" class="block-title">EvaDB</text>
+  <text x="115" y="425" class="block-desc">data/eva.db — projects, tasks, prs, sessions, tickets,</text>
+  <text x="115" y="437" class="block-desc">events, bench, cron, settings, worklog</text>
+
+  <rect x="585" y="390" width="310" height="70" rx="5" fill="white" stroke="#fecaca"/>
+  <text x="595" y="410" class="block-title">Filesystem</text>
+  <text x="595" y="425" class="block-desc">tmux panes, transcripts,</text>
+  <text x="595" y="437" class="block-desc">config.yaml</text>
+</svg>

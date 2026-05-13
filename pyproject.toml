@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# importlib mode lets the test tree mirror the src tree without
+# pytest's default "unique-basename" requirement getting in the
+# way. Without it, e.g. `core/test/routes/test_system.py` and
+# `core/test/test_system_coverage.py` (or any two `test_plugin.py`
+# files in different plugin folders) collide at collection time.
+addopts = "--import-mode=importlib"

@@ -1,0 +1,31 @@
+# Eva runtime dependencies. Install with:
+#   python -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# Versions pinned to a major-or-minor floor that's known to work
+# against the codebase. Tighter pins are deliberately avoided so an
+# OSS user with newer point releases doesn't get blocked. See
+# `tests/conftest.py` for the test-only safety nets.
+
+# HTTP framework + ASGI server
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+# Pydantic v2 -- routes use BaseModel everywhere
+pydantic>=2.7,<3
+# Starlette ships pinned with FastAPI; explicit pin lets pip resolve
+# faster and surfaces incompatibility errors loudly.
+starlette>=0.40,<1
+
+# Background-job scheduler (services/scheduler.py)
+APScheduler>=3.10,<4
+
+# config.yaml + a few cron parsers under the hood
+PyYAML>=6,<7
+
+# Modern SQLite. The stdlib `sqlite3` module is linked against the
+# system libsqlite3 which on long-supported distros is older than
+# the 3.35+ Eva needs for DROP COLUMN, generated columns, etc. This
+# wheel ships its own recent SQLite so OSS installs don't have to
+# touch system packages. `eva_db.py` prefers it when available and
+# falls back to stdlib sqlite3 otherwise.
+pysqlite3-binary>=0.5,<1

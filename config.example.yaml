@@ -1,0 +1,59 @@
+# Eva config example. Copy this file to `config.yaml` (which is
+# gitignored) and fill in your own values. All sections are optional;
+# Eva starts with empty defaults and you can configure everything via
+# the in-app Settings UI instead.
+#
+# On first boot, values from `config.yaml` are seeded into the
+# settings DB. After that, Settings-UI edits are authoritative and
+# survive even if you change `config.yaml`.
+#
+# Plugin runtime config (cookies, tokens, channel ids, etc.) does
+# NOT live here -- each plugin ships a `plugin.conf` under its own
+# folder (`core/src/plugins/<id>/plugin.conf` for OSS plugins,
+# `<extension>/src/<id>/plugin.conf` for extensions). The plugin
+# framework seeds those into the settings DB on first boot under
+# `plugin.<id>.<key>`.
+
+# ---- github (repo allow-list, fork resolution, account routing) ----
+# Seeds three settings keys under `service.github.*`. Changes to these
+# after first boot must happen via the Settings UI -> Repos tab (or by
+# editing the settings DB) -- yaml is only consulted when the key is
+# unset.
+github:
+  # Repos Eva tracks PRs from. Supports `org/*` wildcards.
+  allowed_repos:
+    # - acme/widgets
+    # - acme-corp/*
+
+  # Map personal forks back to their upstream so allow-list checks
+  # pass for fork PRs and CI is read off the upstream.
+  fork_to_upstream:
+    # alice/widgets: acme/widgets
+
+  # gh CLI account routing. Each rule's `match` is a substring tested
+  # against the repo path; first match wins. An empty `match` is the
+  # catch-all and must be listed LAST.
+  account_rules:
+    # - match: acme-corp/
+    #   account: alice-work
+    # - match: ""
+    #   account: alice-personal
+
+# ---- jira (resolve ticket IDs on tasks to JIRA URLs) ----
+# Prefix -> JIRA base URL. When a task carries a ticket id like
+# "WID-123", Eva uses these prefixes to build the linked URL.
+# Empty defaults are fine; configure via the Settings UI instead.
+jira:
+  ticket_url_prefixes:
+    # TICKET_PREFIX: https://your-jira/browse/
+    # WID-: https://issues.example.org/jira/browse/
+    # INT-: https://acme-corp.atlassian.net/browse/
+
+# ---- Slack monitor (mentions/threads-of-interest -> events) ----
+# Each entry is a Slack channel id + display name. The poller raises
+# `slack.message.received` events when activity lands here so the
+# event bus can drive notifications.
+slack_monitor:
+  channels:
+    # - id: C0XXXXXXXX
+    #   name: alerts

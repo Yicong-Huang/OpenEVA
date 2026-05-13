@@ -1,0 +1,66 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# --- Test artefacts ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+<MagicMock*
+
+# --- Local data / databases ---
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+data/
+
+# --- Local config (per-user content; some folders self-ignore via
+#     `<dir>/.gitignore: /*`, see docs/.gitignore for the pattern) ---
+config.yaml
+CLAUDE.md
+
+
+# --- Frontend ---
+node_modules/
+frontend/node_modules/
+frontend/test-results/
+frontend/coverage/
+frontend/dist/
+core/node_modules
+
+# --- Misc python ---
+routes/__pycache__/
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Virtualenv ---
+.venv/
+venv/
+env/
+.venv
+
+tasks.bak/
+
+# Per-plugin runtime configs hold local values; ship the `.example`.
+core/src/plugins/*/plugin.conf
+
+# Extensions self-ignore via an in-folder `.gitignore` containing `/*`.

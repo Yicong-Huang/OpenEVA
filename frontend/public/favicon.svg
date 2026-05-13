@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+  <!-- Background: rounded square with dark indigo -->
+  <rect width="48" height="48" rx="10" fill="#1a1a2e"/>
+  <!-- Outer ring: accent glow -->
+  <circle cx="24" cy="24" r="18" stroke="#6366f1" stroke-width="2" fill="none" opacity="0.3"/>
+  <!-- Stylized "E" made of 3 horizontal bars with a vertical spine -->
+  <!-- Vertical spine -->
+  <rect x="14" y="12" width="3.5" height="24" rx="1.75" fill="#6366f1"/>
+  <!-- Top bar -->
+  <rect x="14" y="12" width="20" height="3.5" rx="1.75" fill="#6366f1"/>
+  <!-- Middle bar (slightly shorter, accent highlight) -->
+  <rect x="14" y="22.25" width="16" height="3.5" rx="1.75" fill="#818cf8"/>
+  <!-- Bottom bar -->
+  <rect x="14" y="32.5" width="20" height="3.5" rx="1.75" fill="#6366f1"/>
+  <!-- Small dot accent (like a status indicator) -->
+  <circle cx="37" cy="14" r="3" fill="#22c55e"/>
+</svg>

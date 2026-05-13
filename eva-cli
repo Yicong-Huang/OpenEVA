@@ -1,0 +1,1716 @@
+#!/usr/bin/env python3
+"""eva-cli -- comprehensive CLI for the Eva project dashboard.
+
+Runs against whichever `python3` is first on PATH. The Eva dependency
+set (FastAPI, etc.) must be importable from that interpreter. We probe
+known venv locations in this order so a fresh checkout just works:
+
+  1. `<repo>/.venv/lib/python*/site-packages` (the canonical layout
+     after `python -m venv .venv` from the repo root)
+  2. `$EVA_VENV/lib/python*/site-packages` if the env var is set
+
+If neither has the deps, the user gets a single clear error
+explaining the two options instead of a cryptic ImportError.
+
+The bootstrap stays restricted to stdlib up to the venv probe so the
+shebang's `python3` (which on some systems is 3.6/3.7) can at least
+get far enough to give a helpful error. PEP-585 generic syntax like
+`list[str]` would crash the script before we ever reach `_error()`,
+so this preamble uses old-style generics or untyped containers.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+
+# Bail early on Python <3.9. The Eva codebase uses PEP-585 generics
+# (`list[int]`) and PEP-604 unions (`int | None`) throughout
+# `eva_db.py`, so a 3.6 / 3.7 / 3.8 interpreter would crash with
+# cryptic SyntaxError on import. Print a one-line hint instead.
+if sys.version_info < (3, 9):
+    sys.stderr.write(
+        "eva-cli requires Python >= 3.9 (you have %d.%d). "
+        "Set up a venv with a newer interpreter and either point "
+        "EVA_VENV at it or activate it before invoking the CLI.\n"
+        % sys.version_info[:2]
+    )
+    sys.exit(1)
+
+# Add the OSS + every extension's `src/` tree to sys.path.
+# `core/src/` is always present; extensions are anything sibling-to-
+# core with an `extension.conf` marker (see extensions). The
+# scanner is imported AFTER `core/src/` is on the path because the
+# scanner itself lives at `core/src/core/extensions.py`.
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_ROOT, "core", "src"))
+try:
+    from common.extensions import discover as _disc_exts
+    for _ext in _disc_exts(_ROOT):
+        if _ext.src.is_dir():
+            sys.path.insert(0, str(_ext.src))
+except Exception:
+    # Extension discovery is best-effort; eva-cli core functionality
+    # (list-tasks, list-projects, etc.) doesn't depend on any extension,
+    # so a broken scanner mustn't crash the CLI before it even parses
+    # its argv.
+    pass
+
+# Activate venv site-packages if not already in a proper venv. This
+# lets the shebang line work with system python while still finding
+# fastapi, pydantic, etc. from a project-local or user-level venv.
+_CANDIDATE_VENVS = []  # plain list -- see module docstring re: PEP 585.
+_repo_venv = os.path.join(_ROOT, ".venv")
+if os.path.isdir(_repo_venv):
+    _CANDIDATE_VENVS.append(_repo_venv)
+_env_venv = os.environ.get("EVA_VENV")
+if _env_venv and os.path.isdir(_env_venv):
+    _CANDIDATE_VENVS.append(_env_venv)
+
+import glob as _glob  # noqa: E402 -- only loaded when probing venvs
+for _venv in _CANDIDATE_VENVS:
+    for _sp in _glob.glob(os.path.join(_venv, "lib", "python*/site-packages")):
+        if _sp not in sys.path:
+            sys.path.insert(0, _sp)
+
+# Lazy-load core modules (they depend on fastapi which requires Python 3.8+).
+# help/version commands work even if core/ cannot be imported.
+_core_loaded = False
+tasks = projects = prs = system = None
+
+
+def _ensure_core():
+    global _core_loaded, tasks, projects, prs, system
+    if _core_loaded:
+        return
+    try:
+        from common import tasks as _tasks, projects as _projects, prs as _prs, system as _system
+        tasks = _tasks
+        projects = _projects
+        prs = _prs
+        system = _system
+        _core_loaded = True
+        # Wire CLI-side emit_event to relay through the running server's
+        # SSE so the web UI sees `task.created` / `task.updated` / etc.
+        # in real time. Best-effort: if no server is running, the relay
+        # in app_state.emit_event silently fails and the CLI keeps
+        # working (offline use stays supported).
+        import app_state as _app_state
+        base = os.environ.get("EVA_BASE_URL", "http://localhost:8021").rstrip("/")
+        _app_state._event_relay_url = base + "/api/internal/emit-relay"
+        # Agents are registered via side-effect on import. Server boot
+        # does this in server.py; the CLI runs as a separate Python
+        # process so its registry starts empty -- `open-session` etc.
+        # would fail with "No agent registered". Mirror server.py:
+        # OSS `core/src/agents/` + every extension's `src/agents/`.
+        try:
+            from common import agent as _agent_registry
+            from common.extensions import discover as _discover_extensions
+            _agent_dirs = [_app_state.REPO_ROOT / "core" / "src" / "agents"]
+            for _ext in _discover_extensions(_app_state.REPO_ROOT):
+                if _ext.agents_dir.is_dir():
+                    _agent_dirs.append(_ext.agents_dir)
+            _agent_registry.discover_agents(*_agent_dirs)
+        except Exception as _e:
+            # Best-effort: commands that don't need an agent (list-tasks,
+            # get-task, ...) keep working even if discovery breaks.
+            print(f"[init] agent discovery skipped: {_e}", file=sys.stderr)
+        # Run each extension's `seed.py` so extension-side wiring
+        # (DB methods installed on EvaDB, plugin registrations, etc.)
+        # is in place before any CLI command runs. The server does
+        # the same at boot via `_run_seed_files`; CLI runs in its
+        # own process so it needs its own pass. Best-effort.
+        try:
+            from common.extensions import (
+                discover as _discover_exts2,
+                run_seed_files as _run_seed_files,
+            )
+            _run_seed_files(list(_discover_exts2(_app_state.REPO_ROOT)))
+        except Exception as _e:
+            print(f"[init] extension seed skipped: {_e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error: cannot load core modules: {e}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Eva needs FastAPI + Pydantic on the import path. Try one of:",
+              file=sys.stderr)
+        print("  - python -m venv .venv && .venv/bin/pip install -r requirements.txt",
+              file=sys.stderr)
+        print("  - EVA_VENV=/path/to/venv eva-cli ...", file=sys.stderr)
+        print("  - .venv/bin/python eva-cli ...   (run with the venv's python)",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+# ====================================================================
+# ANSI color helpers
+# ====================================================================
+
+_COLOR = sys.stdout.isatty()
+
+
+def _c(code, text):
+    if not _COLOR:
+        return str(text)
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def _bold(t):
+    return _c("1", t)
+
+
+def _green(t):
+    return _c("32", t)
+
+
+def _yellow(t):
+    return _c("33", t)
+
+
+def _red(t):
+    return _c("31", t)
+
+
+def _cyan(t):
+    return _c("36", t)
+
+
+def _dim(t):
+    return _c("2", t)
+
+
+def _error(msg, hint=None, code=1):
+    """Print a standardized error message and exit.
+
+    Format: "Error: <msg>" on stderr, always red. Optional dim hint on the
+    next line. Always exits with the given code (default 1).
+    """
+    prefix = "" if msg.lower().startswith("error") else "Error: "
+    print(_red(prefix + msg), file=sys.stderr)
+    if hint:
+        print(_dim(hint), file=sys.stderr)
+    sys.exit(code)
+
+
+# Shared hints reused by multiple "not found" error sites. Centralising them
+# keeps the wording consistent and makes it cheap to update the suggested
+# remediation command in one spot.
+_HINT_LIST_PROJECTS = "Run `eva-cli list-projects` to see valid project ids."
+
+
+# Canonical task status values sourced from the single source of truth
+# in eva_db.VALID_STATUSES (re-exported by tasks as
+# VALID_TASK_STATUSES). CLI, HTTP routes, MCP and the sqlite CHECK
+# constraint all agree on the same set -- touching one end auto-
+# propagates. Kept sorted so `--help` output is stable.
+# (eva_db is stdlib-only so importing at module scope doesn't break the
+# lazy-core-load contract above.)
+from eva_db import VALID_STATUSES as _VALID_STATUSES
+_TASK_STATUS_CHOICES = sorted(_VALID_STATUSES)
+
+# Accepted task types: 9 canonical spellings + 3 conventional-commit
+# aliases. The aliases (`feat` -> `feature`, `doc` -> `docs`,
+# `bug` -> `fix`) are normalised at the write boundary in
+# `tasks.canonicalize_task_type`, so the DB only ever stores
+# canonical values. Listing both forms in argparse means the CLI
+# accepts the short conventional-commit spellings out of the box.
+_TASK_TYPE_CANONICAL = [
+    "feature", "fix", "test", "refactor", "docs",
+    "chore", "perf", "benchmark", "cleanup",
+]
+_TASK_TYPE_ALIASES = ["feat", "doc", "bug"]
+_TASK_TYPE_CHOICES = _TASK_TYPE_CANONICAL + _TASK_TYPE_ALIASES
+
+
+def _hint_list_tasks(project):
+    return "Run `eva-cli list-tasks %s` to see valid task ids." % project
+
+
+def _err_project_not_found(project):
+    _error("project '%s' not found" % project, hint=_HINT_LIST_PROJECTS)
+
+
+def _err_task_not_found(project, task_id):
+    _error("task '%s' not found in project '%s'" % (task_id, project),
+           hint=_hint_list_tasks(project))
+
+
+def _emit_json_if_requested(args, obj):
+    """Emit obj as indented JSON when the caller asked for --json.
+
+    Returns True if the caller should early-return (i.e. JSON was printed),
+    False when the caller should continue rendering human output.
+    """
+    if getattr(args, "json", False):
+        print(json.dumps(obj, indent=2))
+        return True
+    return False
+
+
+def _emit_jsonl_event(args, event):
+    """In --json mode, emit one compact JSON object per line (JSONL).
+
+    Returns True if the caller should skip human rendering for this event.
+    Typical use for streaming commands like sync-prs: after each progress
+    event, call this first to short-circuit when JSON output was requested.
+    """
+    if getattr(args, "json", False):
+        print(json.dumps(event))
+        return True
+    return False
+
+
+def _status_color(status):
+    s = (status or "").lower()
+    if s in ("done", "merged", "ok"):
+        return _green(status)
+    if s in ("in_progress", "in_review", "warning", "open"):
+        return _yellow(status)
+    if s in ("closed", "expired", "error", "blocked"):
+        return _red(status)
+    return status or ""
+
+
+# ====================================================================
+# Table formatter
+# ====================================================================
+
+def _strip_ansi(s):
+    """Remove SGR escape sequences so we can measure visible width."""
+    plain = s
+    while "\033[" in plain:
+        start = plain.index("\033[")
+        end = plain.index("m", start) + 1
+        plain = plain[:start] + plain[end:]
+    return plain
+
+
+def _table(headers, rows, min_widths=None):
+    """Print a simple table with padding. Strips ANSI when measuring widths."""
+    widths = list(min_widths or [0] * len(headers))
+    for i, h in enumerate(headers):
+        if i < len(widths):
+            widths[i] = max(widths[i], len(h))
+    for row in rows:
+        for i, cell in enumerate(row):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(_strip_ansi(cell)))
+
+    def _fmt_row(cells):
+        parts = []
+        for i, cell in enumerate(cells):
+            w = widths[i] if i < len(widths) else 0
+            pad = w - len(_strip_ansi(cell))
+            parts.append(cell + " " * max(pad, 0))
+        return "  ".join(parts)
+
+    lines = [_fmt_row([_bold(h) for h in headers])]
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append(_fmt_row(list(row)))
+    return "\n".join(lines)
+
+
+# ====================================================================
+# HTTP helper (for session commands that need tmux on server side)
+# ====================================================================
+
+
+
+# ====================================================================
+# Command implementations
+# ====================================================================
+
+# -- Task commands --
+
+def cmd_list_projects(args):
+    proj_list = projects.list_projects()
+    if _emit_json_if_requested(args, proj_list): return
+    if not proj_list:
+        print(_dim("No projects found."))
+        return
+    rows = []
+    for p in proj_list:
+        rows.append((
+            _bold(p["id"]),
+            p.get("name", ""),
+            _status_color("%d%%" % p.get("progress", 0)),
+            str(p.get("total_tasks", 0)),
+            "%s/%s/%s" % (
+                p.get("task_counts", {}).get("done", 0),
+                p.get("task_counts", {}).get("in_progress", 0),
+                p.get("task_counts", {}).get("not_started", 0),
+            ),
+        ))
+    print(_table(["ID", "Name", "Progress", "Tasks", "Done/WIP/Todo"], rows))
+
+
+def cmd_update_project(args):
+    import app_state
+    fields = {}
+    if args.name is not None: fields["name"] = args.name
+    if args.description is not None: fields["description"] = args.description
+    if args.repo is not None: fields["repo"] = args.repo
+    if args.jira is not None: fields["jira"] = args.jira
+    if args.has_tickets is not None: fields["has_tickets"] = args.has_tickets.lower() in ("true", "1", "yes")
+    if args.design_doc is not None: fields["design_doc"] = args.design_doc
+    if not fields:
+        _error("no fields to update")
+    result = app_state._db.update_project(args.project, **fields)
+    if not result:
+        _err_project_not_found(args.project)
+    if _emit_json_if_requested(args, result): return
+    print(_green("Updated project '%s'" % args.project))
+
+
+def cmd_list_tasks(args):
+    proj = projects.get_project(args.project)
+    if not proj:
+        _err_project_not_found(args.project)
+    task_dict = proj.get("tasks", {})
+    if _emit_json_if_requested(args, task_dict): return
+    if not task_dict:
+        print(_dim("No tasks in project '%s'." % args.project))
+        return
+    rows = []
+    for tid, t in sorted(task_dict.items()):
+        rows.append((
+            _status_color(t.get("status", "?")),
+            tid,
+            (t.get("description", "") or "")[:60],
+        ))
+    print(_table(["Status", "Task ID", "Description"], rows,
+                 min_widths=[12, 30, 40]))
+
+
+def _print_task_detail(t, title_line=None, show_effective=False,
+                       show_priority_group=False, show_ci_review=False,
+                       pr_title_width=60):
+    """Print a single task's fields in the batch/get detail format.
+
+    Unified between `cmd_fetch_tasks` and `cmd_get_task` -- callers choose
+    which optional fields to surface via the flags.
+    """
+    if title_line is not None:
+        print(title_line)
+    print("  status: %s" % _status_color(t.get("status", "?")))
+    if show_effective and t.get("effective_status") != t.get("status"):
+        print("  effective: %s" % _status_color(t.get("effective_status", "")))
+    print("  description: %s" % (t.get("description", "") or ""))
+    if t.get("type"):
+        print("  type: %s" % t["type"])
+    if show_priority_group:
+        if t.get("priority", 5) != 5:
+            print("  priority: %s" % t["priority"])
+        grp = t.get("group_name") or t.get("group")
+        if grp:
+            print("  group: %s" % grp)
+    ticket = t.get("ticket") or {}
+    if ticket.get("id"):
+        print("  ticket: %s (%s)" % (ticket["id"], ticket.get("url", "")))
+    if show_priority_group:
+        deps = t.get("dependencies", [])
+        if deps:
+            print("  dependencies: %s" % ", ".join(deps))
+    if t.get("notes"):
+        print("  notes: %s" % t["notes"])
+    for pr in t.get("prs", []):
+        title = (pr.get("title", "") or "")[:pr_title_width]
+        if show_ci_review:
+            ci = pr.get("ci_status", "")
+            rv = pr.get("review_status", "")
+            print("  PR #%s [%s] %s  ci=%s review=%s" % (
+                pr["number"], pr.get("status", "?"), title, ci, rv))
+        else:
+            print("  PR #%s [%s] %s" % (
+                pr["number"], pr.get("status", "?"), title))
+
+
+def cmd_fetch_tasks(args):
+    proj = projects.get_project(args.project)
+    if not proj:
+        _err_project_not_found(args.project)
+    task_dict = proj.get("tasks", {})
+    if _emit_json_if_requested(args, task_dict): return
+    for tid, t in sorted(task_dict.items()):
+        _print_task_detail(
+            t,
+            title_line=_bold("--- %s ---" % tid),
+            show_priority_group=True,
+            show_ci_review=True,
+            pr_title_width=60,
+        )
+        print()
+
+
+def cmd_get_task(args):
+    result = tasks.get_task(args.project, args.task_id)
+    if not result:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, result): return
+    _print_task_detail(
+        result,
+        title_line=_bold(result.get("id", args.task_id)),
+        show_effective=True,
+        pr_title_width=50,
+    )
+
+
+def cmd_create_task(args):
+    try:
+        result = tasks.create_task(
+            args.project, args.task_id,
+            description=args.description or "",
+            type=args.type or "feature",
+            status=args.status or "not_started",
+            group=args.group or "",
+        )
+    except KeyError:
+        _err_project_not_found(args.project)
+    except ValueError as e:
+        _error(str(e))
+    if _emit_json_if_requested(args, result): return
+    print(_green("Created task '%s' in project '%s'" % (
+        args.task_id, args.project)))
+
+
+def cmd_update_task(args):
+    # Use `is not None` so explicit --notes '' can clear a field (matches the
+    # HTTP PUT semantics). Truthy checks would drop empty-string values.
+    fields = {}
+    if args.status is not None:
+        fields["status"] = args.status
+    if args.description is not None:
+        fields["description"] = args.description
+    if args.notes is not None:
+        fields["notes"] = args.notes
+    if args.priority is not None:
+        fields["priority"] = args.priority
+    if args.ticket_id is not None:
+        fields["ticket_id"] = args.ticket_id
+    if args.ticket_url is not None:
+        fields["ticket_url"] = args.ticket_url
+    if args.type is not None:
+        fields["type"] = args.type
+    if args.group is not None:
+        fields["group_name"] = args.group
+    if args.follow_ups is not None:
+        fields["follow_ups"] = args.follow_ups
+    if not fields:
+        _error("no fields to update")
+    result = tasks.update_task(args.project, args.task_id, **fields)
+    if not result:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, result): return
+    print(_green("Updated task '%s'" % args.task_id))
+
+
+def cmd_add_dep(args):
+    _ensure_core()
+    try:
+        tasks.add_dependency(args.project, args.task_id, args.depends_on)
+    except ValueError as e:
+        # `add_dependency` raises ValueError with a "Task '<id>' not found"
+        # or "Dependency target '<id>' not found" message. Surface the
+        # list-tasks hint so the user can find the right id without a
+        # second round-trip.
+        _error(str(e), hint=_hint_list_tasks(args.project))
+    print(_green("Added dependency: %s depends on %s" % (args.task_id, args.depends_on)))
+
+
+def cmd_remove_dep(args):
+    _ensure_core()
+    try:
+        tasks.remove_dependency(args.project, args.task_id, args.depends_on)
+    except ValueError as e:
+        _error(str(e), hint=_hint_list_tasks(args.project))
+    print(_green("Removed dependency: %s no longer depends on %s" % (args.task_id, args.depends_on)))
+
+
+def cmd_close_task(args):
+    result = tasks.close_task(args.project, args.task_id,
+                              reason=args.reason or "")
+    if not result:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, result): return
+    print(_green("Closed task '%s'" % args.task_id))
+
+
+def cmd_check_status(args):
+    result = tasks.check_status(args.project, args.task_id)
+    if not result:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, result): return
+    if result.get("changed"):
+        print(_yellow("Status changed: %s -> %s" % (
+            result["old_status"], result["new_status"])))
+    else:
+        print(_dim("Status unchanged: %s" % result["old_status"]))
+
+
+def cmd_append_history(args):
+    """Append one terse line to a task's history timeline (<=100 chars)."""
+    text = (args.text or "").strip()
+    if not text:
+        _error("history text is empty",
+               hint='Example: eva-cli append-history proj-x task-y "finished tests, all green"')
+    try:
+        entry = tasks.append_history(args.project, args.task_id, text)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            _error(msg, hint=_hint_list_tasks(args.project))
+        if "chars" in msg:
+            _error(msg,
+                   hint="Trim to one terse line; longer context belongs in PR description / design doc.")
+        _error(msg)
+    if _emit_json_if_requested(args, entry): return
+    print(_green("history+ ") + _dim("[%s]" % entry["ts"]) + " " + entry["text"])
+
+
+def cmd_list_history(args):
+    """Print a task's recent history timeline."""
+    entries = tasks.list_history(args.project, args.task_id,
+                                 limit=getattr(args, "limit", 50))
+    if _emit_json_if_requested(args, {"history": entries}): return
+    if not entries:
+        print(_dim("(no history yet)"))
+        return
+    for e in entries:
+        print(_dim("[%s]" % e["ts"]) + " " + e["text"])
+
+
+def cmd_delete_task(args):
+    _error("delete-task is disabled in eva-cli.",
+           hint="Use the Eva UI (right-click task node in Task Tracker) to delete tasks.")
+
+
+def cmd_rename_task(args):
+    try:
+        result = tasks.rename_task(args.project, args.old_id, args.new_id)
+    except ValueError as e:
+        _error(str(e))
+    if not result:
+        _err_task_not_found(args.project, args.old_id)
+    if _emit_json_if_requested(args, result): return
+    print(_green("Renamed '%s' -> '%s'" % (args.old_id, args.new_id)))
+
+
+# -- PR commands --
+
+def cmd_list_prs(args):
+    result = prs.list_all_prs(status=args.status or "",
+                              search=args.search or "")
+    groups = result.get("groups", {})
+    # Optional --project filter: applied client-side so we don't have to
+    # change the core API. Unknown project -> empty result, not an error
+    # (matches how --status / --search behave when no match).
+    project_filter = getattr(args, "project", "") or ""
+    if project_filter:
+        groups = {k: v for k, v in groups.items() if k == project_filter}
+        result = {"groups": groups}
+    if _emit_json_if_requested(args, result): return
+    if not groups:
+        print(_dim("No PRs found."))
+        return
+    for pid, group in groups.items():
+        print(_bold("\n%s" % group.get("name", pid)))
+        for pr in group.get("prs", []):
+            status = pr.get("status", "?")
+            ci = pr.get("ci_status", "")
+            rv = pr.get("review_status", "")
+            print("  #%-6s %s  %s  ci=%s review=%s" % (
+                pr["number"],
+                _status_color(status),
+                (pr.get("title", "") or "")[:50],
+                ci or "-", rv or "-"))
+
+
+def cmd_add_pr(args):
+    try:
+        result = prs.add_pr(
+            args.project, args.task_id,
+            number=args.number, url=args.url,
+            status=args.status or "open",
+            title=args.title or "",
+        )
+    except ValueError as e:
+        # `prs.add_pr` raises ValueError when `title` is empty. Bubble
+        # up as a clean error + hint instead of a traceback; `--title` is
+        # optional at the argparse layer so the user wouldn't otherwise
+        # learn it's effectively required.
+        _error(str(e),
+               hint="Pass `--title \"<PR title>\"` or fetch it first with "
+                    "`eva-cli pr-detail <repo> %d`." % args.number)
+    if result is None:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, {"added": True, "number": args.number}): return
+    print(_green("Added PR #%d to task '%s'" % (args.number, args.task_id)))
+
+
+def cmd_remove_pr(args):
+    result = prs.remove_pr(args.project, args.task_id, args.number)
+    if result is None:
+        _err_task_not_found(args.project, args.task_id)
+    if result is False:
+        _error("PR #%d not found on task '%s'" % (args.number, args.task_id),
+               hint="Run `eva-cli get-task %s %s` to see attached PRs." % (args.project, args.task_id))
+    if _emit_json_if_requested(args, {"removed": True, "number": args.number}): return
+    print(_green("Removed PR #%d" % args.number))
+
+
+def cmd_sync_prs(args):
+    gen = prs.sync_prs_generator(full=args.full)
+    total_discovered = 0
+    total_updated = 0
+    for progress in gen:
+        phase = progress.get("phase", "")
+        if _emit_jsonl_event(args, progress):
+            if phase == "done":
+                return
+            continue
+        if phase == "start":
+            print(_bold("Syncing PRs...") + (
+                " (full)" if progress.get("full") else ""))
+        elif phase == "dirty":
+            cnt = progress.get("count", 0)
+            if cnt:
+                print("  Updating %d dirty PRs..." % cnt)
+        elif phase == "dirty_update":
+            cur = progress.get("current", 0)
+            tot = progress.get("total", 0)
+            _print_progress("  Dirty PRs", cur, tot)
+        elif phase == "discover":
+            total_discovered = progress.get("discovered", 0)
+            print("  Discovered %d new PRs" % total_discovered)
+        elif phase == "update":
+            cur = progress.get("current", 0)
+            tot = progress.get("total", 0)
+            total_updated = progress.get("updated", 0)
+            _print_progress("  Updating", cur, tot)
+        elif phase == "done":
+            total_updated = progress.get("updated", 0)
+            total = progress.get("total", 0)
+            print(_green("\nDone: %d discovered, %d updated, %d total"
+                         % (total_discovered, total_updated, total)))
+
+
+def _print_progress(label, current, total):
+    """Print a simple progress bar."""
+    if total == 0:
+        return
+    pct = current * 100 // total
+    bar_width = 30
+    filled = bar_width * current // total
+    bar = "#" * filled + "-" * (bar_width - filled)
+    sys.stdout.write("\r%s [%s] %d/%d (%d%%)" % (label, bar, current, total, pct))
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+
+
+def cmd_pr_detail(args):
+    result = prs.get_pr_detail(args.repo, args.number)
+    if not result:
+        _error("PR #%d not found in %s" % (args.number, args.repo))
+    if _emit_json_if_requested(args, result): return
+    print(_bold("#%s %s" % (result.get("number", ""), result.get("title", ""))))
+    print("  state: %s" % _status_color(result.get("state", "")))
+    print("  author: %s" % (result.get("author", {}) or {}).get("login", "?"))
+    print("  branch: %s -> %s" % (
+        result.get("headRefName", ""), result.get("baseRefName", "")))
+    print("  +%s -%s, %s files" % (
+        result.get("additions", 0), result.get("deletions", 0),
+        len(result.get("files", []) or [])))
+    review = result.get("reviewDecision", "")
+    if review:
+        print("  review: %s" % _status_color(review))
+    checks = result.get("statusCheckRollup", []) or []
+    if checks:
+        print("  checks:")
+        for ck in checks[:10]:
+            conclusion = (ck.get("conclusion") or ck.get("status") or "?")
+            print("    %s %s" % (
+                _status_color(conclusion), ck.get("name", "")))
+
+
+# -- Session commands (direct tmux + config_db, no server needed) --
+
+def cmd_list_sessions(args):
+    from common.sessions import list_all_sessions
+    grouped = list_all_sessions()
+    if _emit_json_if_requested(args, grouped): return
+    if not grouped:
+        print(_dim("No sessions found."))
+        return
+    for pid, group in grouped.items():
+        print(_bold(group["name"]) + " " + _dim("(%d)" % len(group["sessions"])))
+        for s in group["sessions"]:
+            running = _green("running") if s.get("running") else _dim("stopped")
+            print("  %s  %s  %s" % (s.get("task_id", "").ljust(35), running, _dim(s.get("status", ""))))
+        print()
+
+
+def cmd_open_session(args):
+    from common.sessions import open_session
+    from adapters.tmux import paste_text, wait_until_ready
+    try:
+        data = open_session(
+            args.task_id, args.project,
+            action_id=args.action or "open",
+            custom_prompt=args.prompt,
+            pr_number=args.pr_number,
+            pr_repo=args.pr_repo,
+        )
+    except ValueError as e:
+        _error(str(e))
+    if _emit_json_if_requested(args, data): return
+    session = data.get("session", "")
+    if data.get("new"):
+        print(_green("Opened new session: %s" % session))
+    else:
+        print(_yellow("Resumed session: %s" % session))
+    prompt_text = data.get("prompt")
+    if prompt_text:
+        if wait_until_ready(session):
+            paste_text(session, prompt_text)
+            print(_dim("Prompt sent (%d chars)" % len(prompt_text)))
+        else:
+            print(_yellow("Prompt ready (%d chars) but agent TUI not responsive; "
+                          "use the web UI or paste manually." % len(prompt_text)))
+
+
+def cmd_open_review_session(args):
+    """Mirror of cmd_open_session for review-context actions. Equivalent
+    to clicking a button on the Review Card in the web UI."""
+    from common.reviews import open_review_session
+    from adapters.tmux import paste_text, wait_until_ready
+    try:
+        data = open_review_session(
+            args.url,
+            action_id=args.action or "review-pr",
+            custom_prompt=args.prompt,
+        )
+    except ValueError as e:
+        _error(str(e))
+    if _emit_json_if_requested(args, data): return
+    session = data.get("session", "")
+    if data.get("new"):
+        print(_green("Opened new review session: %s" % session))
+    else:
+        print(_yellow("Resumed review session: %s" % session))
+    prompt_text = data.get("prompt")
+    if prompt_text:
+        if wait_until_ready(session):
+            paste_text(session, prompt_text)
+            print(_dim("Prompt sent (%d chars)" % len(prompt_text)))
+        else:
+            print(_yellow("Prompt ready (%d chars) but agent TUI not responsive; "
+                          "use the web UI or paste manually." % len(prompt_text)))
+
+
+def cmd_send_message(args):
+    """Paste a one-off message into an active agent session and submit
+    it. Same delivery path as `open-session --prompt` -- waits for the
+    TUI to be ready (unless --no-wait), then writes the message via a
+    bracketed-paste sequence + Enter so agent sees one atomic input."""
+    from adapters.tmux import paste_text, wait_until_ready, session_exists
+    name = args.session_name
+    if not session_exists(name):
+        _error("Session not found: %s" % name,
+               hint="Run `eva-cli list-sessions` to see active sessions.")
+    text = args.message
+    if args.no_wait:
+        paste_text(name, text)
+        if _emit_json_if_requested(args, {"session": name, "sent": len(text)}):
+            return
+        print(_dim("Message sent (%d chars)" % len(text)))
+        return
+    if wait_until_ready(name, args.timeout):
+        paste_text(name, text)
+        if _emit_json_if_requested(args, {"session": name, "sent": len(text)}):
+            return
+        print(_dim("Message sent (%d chars)" % len(text)))
+    else:
+        _error("Session %s did not become ready within %ds" % (name, args.timeout),
+               hint="Pass --no-wait to skip the readiness check.")
+
+
+def cmd_kill_session(args):
+    from common.sessions import kill_session
+    data = kill_session(args.session_name)
+    if _emit_json_if_requested(args, data): return
+    print(_green("Killed session: %s" % args.session_name))
+
+
+def cmd_resume_session(args):
+    """Re-open tmux for an existing session row and resume agent by UUID.
+
+    Use case: host recovery reboot killed every tmux, but the agent session files
+    on disk are intact. This reopens tmux under the same name and runs
+    `agent resume <uuid>` inside so the conversation history is
+    restored. Falls back to a fresh `agent -n <name>` launch when no
+    UUID is recorded for the session (legacy rows written before the
+    `sessions.agent_session_id` column existed).
+    """
+    from common.sessions import resume_session
+    try:
+        data = resume_session(args.session_name)
+    except ValueError as e:
+        _error(str(e), hint="Run `eva-cli list-sessions` to see known sessions.")
+    if _emit_json_if_requested(args, data): return
+    action = data.get("action", "")
+    if action == "noop":
+        print(_yellow("Session already running: %s" % args.session_name))
+    elif action == "resumed":
+        uuid = data.get("agent_session_id", "")
+        print(_green("Resumed session: %s (agent %s)" % (args.session_name, uuid)))
+    elif action == "relaunched":
+        print(_yellow(
+            "Relaunched %s without conversation history "
+            "(no agent_session_id on record)" % args.session_name))
+    else:
+        print(_dim("Session %s: %s" % (args.session_name, action or "done")))
+
+
+def cmd_session_status(args):
+    from common.sessions import get_session_status
+    data = get_session_status(args.session_name)
+    if _emit_json_if_requested(args, data): return
+    print("Session: %s" % _bold(args.session_name))
+    print("  running: %s" % (_green("yes") if data.get("running") else _red("no")))
+    print("  status: %s" % _status_color(data.get("status", "unknown")))
+    print("  in DB: %s" % ("yes" if data.get("exists_in_db") else "no"))
+
+
+# -- Stats commands --
+
+def cmd_stats(args):
+    proj = projects.get_project(args.project)
+    if not proj:
+        _err_project_not_found(args.project)
+    stats_data = {
+        "project": args.project,
+        "name": proj.get("name", ""),
+        "progress": proj.get("progress", 0),
+        "task_counts": proj.get("task_counts", {}),
+        "total_tasks": len(proj.get("tasks", {})),
+    }
+    if _emit_json_if_requested(args, stats_data): return
+    counts = proj.get("task_counts", {})
+    print(_bold(proj.get("name", args.project)))
+    print("  progress: %s" % _status_color("%d%%" % proj.get("progress", 0)))
+    print("  total tasks: %d" % len(proj.get("tasks", {})))
+    for status_name, count in sorted(counts.items()):
+        print("    %s: %d" % (_status_color(status_name), count))
+
+
+def cmd_usage(args):
+    data = system.get_usage()
+    if _emit_json_if_requested(args, data): return
+    if not data:
+        print(_dim("No usage data available."))
+        return
+    print(_bold("AI Usage (Agent)"))
+    print("  daily:   $%s" % (data.get("daily") or "?"))
+    print("  weekly:  $%s" % (data.get("weekly") or "?"))
+    print("  monthly: $%s" % (data.get("monthly") or "?"))
+    tier = data.get("tier")
+    if tier:
+        print("  tier: %s" % _cyan(tier))
+
+
+def cmd_pr_stats(args):
+    data = system.get_workstats()
+    if _emit_json_if_requested(args, data): return
+    if not data:
+        print(_dim("No PR stats available."))
+        return
+    quarters = data.get("quarters", [])
+    if quarters:
+        print(_bold("PR Stats by Quarter"))
+        rows = []
+        for q in quarters:
+            rows.append((
+                q.get("period", ""),
+                str(q.get("monorepo", 0)),
+                str(q.get("services", 0)),
+                str(q.get("widgets", 0)),
+                _bold(str(q.get("total", 0))),
+            ))
+        print(_table(["Period", "Monorepo", "Services", "Widgets", "Total"],
+                     rows))
+    at = data.get("all_time", {})
+    if at:
+        print("\n%s  monorepo=%d  services=%d  widgets=%d  total=%s" % (
+            _bold("All-time:"),
+            at.get("monorepo", 0), at.get("services", 0),
+            at.get("widgets", 0), _bold(str(at.get("total", 0)))))
+    weekly = data.get("weekly", [])
+    if weekly:
+        recent = weekly[-8:]
+        print("\n%s %s" % (_bold("Weekly (recent 8):"),
+                           " ".join(str(w) for w in recent)))
+
+
+def cmd_events(args):
+    import app_state
+    limit = args.limit or 20
+    with sqlite3.connect(str(app_state._NOTIF_DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM events ORDER BY ts DESC, rowid DESC LIMIT ?",
+            [limit],
+        ).fetchall()
+        unread = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE read = 0"
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    events_list = [dict(r) for r in rows]
+    if _emit_json_if_requested(args, {"events": events_list, "unread": unread, "total": total}):
+        return
+    print(_bold("Events") + " (%d unread / %d total)" % (unread, total))
+    if not events_list:
+        print(_dim("  No events."))
+        return
+    for ev in events_list:
+        severity = ev.get("severity", "info")
+        if severity == "error":
+            icon = _red("!")
+        elif severity == "warning":
+            icon = _yellow("*")
+        else:
+            icon = _dim("-")
+        ts = (ev.get("ts") or "")[:19]
+        print("  %s %s  %s  %s" % (
+            icon, _dim(ts), ev.get("source", ""),
+            ev.get("title", "")))
+        msg = ev.get("message", "")
+        if msg:
+            print("    %s" % _dim(msg[:80]))
+
+
+# -- System commands --
+
+def cmd_auth_status(args):
+    certs = system.get_certs()
+    if _emit_json_if_requested(args, certs): return
+    print(_bold("Authentication Status"))
+    for key, cert in certs.items():
+        name = cert.get("name", key)
+        status = cert.get("status", "unknown")
+        remaining = cert.get("remaining_seconds", -1)
+        note = cert.get("note", "")
+        if remaining > 0:
+            hours = remaining // 3600
+            mins = (remaining % 3600) // 60
+            time_str = "%dh %dm" % (hours, mins)
+        else:
+            time_str = "-"
+        print("  %s: %s  remaining=%s%s" % (
+            _bold(name), _status_color(status), time_str,
+            "  (%s)" % note if note else ""))
+
+
+def cmd_audit(args):
+    """Run the data-integrity audit and print findings.
+
+    Default: human-readable summary + per-finding lines, exit 0 when
+    nothing was found, exit 2 when any finding is severity 'error'.
+    `--fix` applies the registered repairs (orphans get deleted) then
+    re-runs the audit so the user sees the post-fix state.
+
+    Filtering: `--kind <k>` can be repeated to keep multiple kinds.
+    `--severity <s>` keeps only that severity. Both are validated
+    against the registered enum so a typo errors loudly instead of
+    silently filtering to zero findings.
+    """
+    from common import audit as _audit
+
+    # `--list-kinds` is a quick lookup: print the enum, exit 0.
+    if getattr(args, "list_kinds", False):
+        if _emit_json_if_requested(args, {
+            "kinds": list(_audit.KNOWN_KINDS),
+            "severities": list(_audit.KNOWN_SEVERITIES),
+        }):
+            return
+        print(_bold("audit kinds:"))
+        for k in _audit.KNOWN_KINDS:
+            print("  %s" % k)
+        print(_bold("severities:"))
+        for s in _audit.KNOWN_SEVERITIES:
+            print("  %s" % s)
+        return
+
+    # Validate filters before running so a typo errors immediately
+    # rather than after the (potentially slow) full audit scan.
+    kinds: list[str] = []
+    if args.kind:
+        # `args.kind` may be a list (action="append") or a single
+        # string (legacy callers); normalise.
+        raw_kinds = args.kind if isinstance(args.kind, list) else [args.kind]
+        for k in raw_kinds:
+            if k not in _audit.KNOWN_KINDS:
+                _error(
+                    "unknown audit kind: %r" % k,
+                    hint="Run `eva-cli audit --list-kinds` to see valid kinds.",
+                )
+            kinds.append(k)
+    if getattr(args, "severity", None):
+        if args.severity not in _audit.KNOWN_SEVERITIES:
+            _error(
+                "unknown audit severity: %r" % args.severity,
+                hint="Valid severities: %s"
+                     % ", ".join(_audit.KNOWN_SEVERITIES),
+            )
+
+    def _apply_filters(findings_list: list[dict]) -> list[dict]:
+        out = findings_list
+        if kinds:
+            kset = set(kinds)
+            out = [f for f in out if f.get("kind") in kset]
+        if getattr(args, "severity", None):
+            out = [f for f in out if f.get("severity") == args.severity]
+        return out
+
+    result = _audit.run_audit()
+    findings = _apply_filters(result["findings"])
+
+    fixed_summary = None
+    if args.fix and findings:
+        fixed_summary = _audit.fix_all(findings)
+        # Re-scan so the displayed list reflects post-fix state.
+        result = _audit.run_audit()
+        findings = _apply_filters(result["findings"])
+
+    if _emit_json_if_requested(args, {
+        "findings": findings,
+        "summary": result["summary"],
+        "fixed": fixed_summary,
+    }):
+        return
+
+    by_sev = result["summary"].get("by_severity", {})
+    filter_parts = []
+    if kinds:
+        filter_parts.append("kind=" + "|".join(kinds))
+    if getattr(args, "severity", None):
+        filter_parts.append("severity=" + args.severity)
+    if filter_parts:
+        # Filter active: show "N of TOTAL matching <filters>" so the
+        # mismatch between the displayed list and the global summary
+        # doesn't look like a bug.
+        headline = "%d of %d finding(s) match %s" % (
+            len(findings), result["summary"]["total"],
+            "  ".join(filter_parts),
+        )
+    else:
+        headline = (
+            "%d finding(s)  errors=%d  warns=%d  infos=%d" % (
+                result["summary"]["total"],
+                by_sev.get("error", 0), by_sev.get("warn", 0), by_sev.get("info", 0),
+            )
+        )
+    if fixed_summary:
+        headline += "  (fixed=%d skipped=%d)" % (
+            fixed_summary["fixed"], fixed_summary["skipped"])
+    print(_bold(headline))
+
+    if not findings:
+        print(_dim("No data-integrity issues found."))
+        return
+
+    sev_color = {"error": _red, "warn": _cyan, "info": _dim}
+    for f in findings:
+        col = sev_color.get(f["severity"], _dim)
+        tag = col("[%s]" % f["severity"])
+        kind = _bold(f["kind"])
+        fixable = _dim(" (fixable)") if f.get("fixable") else ""
+        print("%s %s%s  %s" % (tag, kind, fixable, f["message"]))
+
+    # Exit non-zero if any error-severity finding remains so the user
+    # can wire this into CI / git hooks.
+    if by_sev.get("error", 0) > 0:
+        sys.exit(2)
+
+
+def cmd_renew_cert(args):
+    result = system.renew_cert(args.cert_id)
+    if result is None:
+        # Build the hint from whatever cert providers are registered
+        # so it stays accurate regardless of which extension shipped them.
+        try:
+            registered = ", ".join(sorted(system.get_certs() or {}))
+        except Exception:
+            registered = ""
+        _error("unknown cert '%s'" % args.cert_id,
+               hint=(f"Valid certs: {registered}" if registered
+                     else "No cert providers registered."))
+    if _emit_json_if_requested(args, result): return
+    if result.get("ok"):
+        print(_green("Renewed '%s' successfully" % args.cert_id))
+    else:
+        print(_red("Renewal failed: %s" % result.get("output", "")))
+
+
+# -- Review commands (keyed off a PR URL rather than project/task). ---
+
+def cmd_append_review_history(args):
+    """Append one terse line to a review's history timeline (<=100 chars).
+
+    Primary caller is the agent itself -- the `review-pr` action prompt
+    ends with a note to call this command when the pass is finished.
+    That way even if the agent-hook integration missed events, the user
+    still sees "what I did last time on this PR" when they reopen the queue.
+    """
+    _ensure_core()
+    import app_state
+    text = (args.text or "").strip()
+    if not text:
+        _error("history text is empty",
+               hint='Example: eva-cli append-review-history '
+                    '"https://github.com/acme/widgets/pull/42" '
+                    '"approved after a skim"')
+    try:
+        entry = app_state._db.append_review_history(
+            args.url, text, source=(args.source or "manual"))
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            _error(msg,
+                   hint="Check the URL is exact; only PRs already in the "
+                        "review queue (review_prs) accept history.")
+        if "chars" in msg:
+            _error(msg,
+                   hint="Trim to one terse line; longer context belongs in "
+                        "the PR review comment itself.")
+        _error(msg)
+    if _emit_json_if_requested(args, entry): return
+    print(_green("review-history+ ")
+          + _dim("[%s]" % entry["ts"]) + " " + entry["text"])
+
+
+def cmd_list_review_history(args):
+    """Print a review's recent history timeline."""
+    _ensure_core()
+    import app_state
+    entries = app_state._db.list_review_history(
+        args.url, limit=getattr(args, "limit", 50))
+    if _emit_json_if_requested(args, {"history": entries}): return
+    if not entries:
+        print(_dim("(no review history yet)"))
+        return
+    for e in entries:
+        src = e.get("source") or "manual"
+        tag = _dim("[%s]" % src) if src != "manual" else ""
+        print(_dim("[%s]" % e["ts"]) + " " + e["text"] + (" " + tag if tag else ""))
+
+
+def cmd_update_review(args):
+    """Update a review's workflow state (queued/active/done/dismissed).
+
+    Common from agent: after `sync-status` it calls this to mark done.
+    Also useful manually when the user wants to skip a review
+    (`--state dismissed`) without unpinning the PR from the queue.
+    """
+    _ensure_core()
+    from common.reviews import update_review as _update
+    try:
+        row = _update(args.url, my_workflow_state=args.state)
+    except ValueError as e:
+        _error(str(e),
+               hint="Valid states: queued, active, done, dismissed")
+    if _emit_json_if_requested(args, row): return
+    print(_green("Review %s -> %s" % (args.url, row["my_workflow_state"])))
+
+
+
+# ====================================================================
+# Argument parser
+# ====================================================================
+
+def _add_project_arg(p):
+    """Add the positional `project` argument -- same help text on every
+    subcommand, factored out so the wording can't drift."""
+    p.add_argument("project", help="project ID")
+    return p
+
+
+def _add_task_arg(p):
+    """Add the positional `task_id` argument -- paired with `project` on
+    almost every task-scoped subcommand."""
+    p.add_argument("task_id", help="task ID")
+    return p
+
+
+def _add_project_task_args(p):
+    """Shorthand for the `project + task_id` pair used by most task /
+    session / history / PR subcommands."""
+    _add_project_arg(p)
+    _add_task_arg(p)
+    return p
+
+
+def build_parser():
+    parser = _EvaCLIParser(
+        prog="eva-cli",
+        description=(
+            "Eva project dashboard CLI. Every command supports --json for "
+            "machine-readable output. Errors go to stderr with 'Error: <msg>' "
+            "and a non-zero exit code; hints (when present) follow on the next "
+            "line. See `eva-cli help` for the full command list."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", default=False,
+                        help="output as JSON")
+
+    sub = parser.add_subparsers(dest="command", help="command")
+
+    # -- Task commands --
+    sub.add_parser("list-projects", help="list all projects with stats")
+
+    p = sub.add_parser("update-project", help="update project fields")
+    _add_project_arg(p)
+    p.add_argument("--name")
+    p.add_argument("--description")
+    p.add_argument("--repo")
+    p.add_argument("--jira")
+    p.add_argument("--has-tickets")
+    p.add_argument("--design-doc")
+
+    p = sub.add_parser(
+        "list-tasks",
+        help="list tasks in a project (compact, one row per task)",
+    )
+    _add_project_arg(p)
+
+    p = sub.add_parser(
+        "fetch-tasks",
+        help="dump full task detail for a project (multi-line per task)",
+    )
+    _add_project_arg(p)
+
+    _add_project_task_args(sub.add_parser("get-task", help="get single task details"))
+
+    p = sub.add_parser("create-task", help="create a new task")
+    _add_project_task_args(p)
+    p.add_argument("--description", default="")
+    p.add_argument("--type", default="feature", choices=_TASK_TYPE_CHOICES)
+    p.add_argument("--status", default="not_started", choices=_TASK_STATUS_CHOICES)
+    p.add_argument("--group", default="")
+
+    p = sub.add_parser("update-task", help="update task fields")
+    _add_project_task_args(p)
+    p.add_argument("--status", choices=_TASK_STATUS_CHOICES)
+    p.add_argument("--description")
+    p.add_argument("--notes")
+    p.add_argument("--priority", type=int)
+    p.add_argument("--ticket-id")
+    p.add_argument("--ticket-url")
+    p.add_argument("--type", choices=_TASK_TYPE_CHOICES)
+    p.add_argument("--group")
+    p.add_argument("--follow-up", dest="follow_ups", action="append",
+                   help="natural language description of a minor fix needed after task is done "
+                        "(e.g. 'rebase on latest master'). NOT a task ID -- use add-dep for "
+                        "task-to-task relationships. Repeatable.")
+
+    p = sub.add_parser("add-dep",
+                       help="add a dependency: task A must wait for task B to finish. "
+                            "This creates a graph edge. Use for task-to-task ordering.")
+    _add_project_arg(p)
+    p.add_argument("task_id", help="task that must wait (downstream)")
+    p.add_argument("depends_on", help="task that must finish first (upstream)")
+
+    p = sub.add_parser("remove-dep", help="remove a dependency between two tasks")
+    _add_project_arg(p)
+    p.add_argument("task_id", help="task to remove dependency from")
+    p.add_argument("depends_on", help="upstream task to unlink")
+
+    p = sub.add_parser("close-task", help="close a task with reason")
+    _add_project_task_args(p)
+    p.add_argument("--reason", default="")
+
+    _add_project_task_args(sub.add_parser(
+        "check-status", help="auto-detect and update task status"))
+
+    p = sub.add_parser("append-history",
+                       help="append one terse line (<=100 chars) to a task's history timeline")
+    _add_project_task_args(p)
+    p.add_argument("text",
+                   help="one-line description of what just happened (<=100 chars)")
+
+    p = sub.add_parser("list-history",
+                       help="show a task's recent history (newest first)")
+    _add_project_task_args(p)
+    p.add_argument("--limit", type=int, default=50)
+
+    p = sub.add_parser("delete-task", help="delete a task")
+    _add_project_task_args(p)
+    p.add_argument("--force", action="store_true",
+                   help="skip confirmation")
+
+    p = sub.add_parser("rename-task", help="rename a task")
+    _add_project_arg(p)
+    p.add_argument("old_id", help="current task ID")
+    p.add_argument("new_id", help="new task ID")
+
+    # -- PR commands --
+    p = sub.add_parser("list-prs", help="list all PRs grouped by project")
+    p.add_argument("--project", default="",
+                   help="scope to one project (matches project_id)")
+    p.add_argument("--status", default="",
+                   help="filter by status (open/closed/merged)")
+    p.add_argument("--search", default="", help="search in title")
+
+    p = sub.add_parser("add-pr", help="add a PR to a task")
+    _add_project_task_args(p)
+    p.add_argument("number", type=int, help="PR number")
+    p.add_argument("url", help="PR URL")
+    p.add_argument("--status", default="open")
+    p.add_argument("--title", default="")
+
+    p = sub.add_parser("remove-pr", help="remove a PR from a task")
+    _add_project_task_args(p)
+    p.add_argument("number", type=int, help="PR number")
+
+    p = sub.add_parser("sync-prs",
+                       help="sync PRs from GitHub (discover + update)")
+    p.add_argument("--full", action="store_true",
+                   help="full sync (update all PRs, not just new)")
+
+    p = sub.add_parser("pr-detail",
+                       help="fetch full PR detail from GitHub")
+    p.add_argument("repo", help="repo (e.g. acme/widgets)")
+    p.add_argument("number", type=int, help="PR number")
+
+    # -- Session commands (HTTP) --
+    sub.add_parser("list-sessions", help="list all sessions")
+
+    p = sub.add_parser("open-session", help="open/resume agent session")
+    _add_project_task_args(p)
+    p.add_argument("--action", default="open")
+    p.add_argument("--prompt", default=None,
+                   help="custom prompt sent on session start; overrides the action template")
+    p.add_argument("--pr-number", type=int, default=None, dest="pr_number",
+                   help="PR number for pr-context actions (fix-ci / address-comments / auto-pr-tend / ...)")
+    p.add_argument("--pr-repo", default=None, dest="pr_repo",
+                   help="PR repo (org/repo) for pr-context actions; required together with --pr-number")
+
+    p = sub.add_parser(
+        "open-review-session",
+        help="open/resume agent session for a review PR (equivalent to "
+             "Review Card buttons in the web UI)",
+    )
+    p.add_argument("url", help="GitHub PR URL in the review queue")
+    p.add_argument("--action", default="review-pr",
+                   help="action id (review-pr / review-reply / review-sync)")
+    p.add_argument("--prompt", default=None,
+                   help="custom prompt sent on session start; overrides the action template")
+
+    p = sub.add_parser(
+        "send-message",
+        help="paste a message into an active agent session and submit it "
+             "(bracketed-paste + Enter)",
+    )
+    p.add_argument("session_name", help="tmux session name")
+    p.add_argument("message", help="text to send")
+    p.add_argument("--no-wait", action="store_true", dest="no_wait",
+                   help="skip waiting for agent TUI ready before pasting")
+    p.add_argument("--timeout", type=int, default=30,
+                   help="seconds to wait for agent TUI ready (default 30)")
+
+    p = sub.add_parser("kill-session", help="kill a session")
+    p.add_argument("session_name", help="session name")
+
+    p = sub.add_parser(
+        "resume-session",
+        help="relaunch tmux + resume agent by UUID (use after host recovery reboot)",
+    )
+    p.add_argument("session_name", help="session name (== task_id)")
+
+    p = sub.add_parser("session-status", help="get session status")
+    p.add_argument("session_name", help="session name")
+
+    # -- Stats commands --
+    _add_project_arg(sub.add_parser(
+        "stats",
+        help="single-project progress stats (task counts by status)",
+    ))
+
+    sub.add_parser(
+        "usage",
+        help="Claude/agent spend: daily/weekly/monthly totals",
+    )
+
+    sub.add_parser(
+        "pr-stats",
+        help="cross-project PR throughput grouped by quarter",
+    )
+
+    p = sub.add_parser("events", help="show system events")
+    p.add_argument("--limit", type=int, default=20)
+
+    # -- System commands --
+    sub.add_parser("auth-status",
+                   help="show authentication/cert status")
+
+    p = sub.add_parser("renew-cert", help="renew a certificate")
+    p.add_argument("cert_id",
+                   help="cert provider id (run `auth-status` to list)")
+
+    # -- Review commands (PR-URL scoped) --
+    p = sub.add_parser(
+        "append-review-history",
+        help="append one terse line (<=100 chars) to a review PR's history "
+             "timeline (called by agent after a review pass)",
+    )
+    p.add_argument("url", help="GitHub PR URL in the review queue")
+    p.add_argument("text",
+                   help="one-line description of what happened (<=100 chars)")
+    p.add_argument("--source", default="manual",
+                   help="who wrote this entry (manual/agent/system/github)")
+
+    p = sub.add_parser(
+        "list-review-history",
+        help="show a review PR's recent history (newest first)",
+    )
+    p.add_argument("url", help="GitHub PR URL")
+    p.add_argument("--limit", type=int, default=50)
+
+    p = sub.add_parser(
+        "update-review",
+        help="update workflow state of a review PR",
+    )
+    p.add_argument("url", help="GitHub PR URL")
+    p.add_argument("--state", required=True,
+                   choices=["queued", "active", "done", "dismissed"],
+                   help="new workflow state")
+    p = sub.add_parser(
+        "audit",
+        help="scan the DB for stale / inconsistent rows",
+        description=(
+            "Scan tasks / PRs / history for data drift. Reports orphans, "
+            "stale ticket fields, all-PRs-merged-but-task-open candidates, "
+            "duplicate PR URLs, and more. Read-only by default; pass --fix "
+            "to auto-clean orphan rows (other findings need manual review). "
+            "Use --list-kinds to enumerate the kinds you can filter on."
+        ),
+    )
+    # `default=argparse.SUPPRESS` so omitting `--json` here doesn't
+    # clobber the top-level value (top-level `--json audit` was
+    # silently ignored before this fix because the subparser's
+    # `default=False` overrode it).
+    p.add_argument("--json", action="store_true",
+                   default=argparse.SUPPRESS,
+                   help="emit findings as JSON (full structured output)")
+    p.add_argument("--fix", action="store_true",
+                   help="apply registered fixers (orphan rows only)")
+    p.add_argument("--kind", action="append", default=None,
+                   help="filter findings to a kind; repeat to keep multiple "
+                        "(e.g. --kind orphan_pr --kind orphan_history)")
+    p.add_argument("--severity", default=None,
+                   choices=("info", "warn", "error"),
+                   help="filter findings to one severity")
+    p.add_argument("--list-kinds", action="store_true",
+                   help="list every kind / severity the audit can emit "
+                        "and exit (no scan performed)")
+
+    sub.add_parser("help", help="show this help message")
+
+    # Extension addons can contribute more subcommands. Each
+    # `<extension>/src/cli.py` is loaded by file path (so two extensions
+    # both shipping a `cli.py` don't collide on the module name) and
+    # its `register(subparsers, dispatch)` is called to add entries to
+    # both argparse + the flat dispatch dict.
+    _load_cli_addons(sub, _DISPATCH)
+
+    return parser
+
+
+def _load_cli_addons(subparsers, dispatch):
+    """Discover and load `<ext>/src/cli.py` from every sibling-of-core
+    folder bearing an `extension.conf` marker. Each addon's
+    `register(subparsers, dispatch)` runs once at parser build time.
+
+    Failures log to stderr and are otherwise swallowed: a broken addon
+    must not prevent eva-cli from running its core commands.
+    """
+    import importlib.util
+    from pathlib import Path as _Path
+    repo_root = _Path(_ROOT)
+    for marker in sorted(repo_root.glob("*/extension.conf")):
+        ext_dir = marker.parent
+        if ext_dir.name == "core":
+            continue
+        cli_path = ext_dir / "src" / "cli.py"
+        if not cli_path.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"_eva_cli_addon_{ext_dir.name}", str(cli_path),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "register"):
+                # Pass the running eva-cli module so the addon can
+                # call internal helpers (_error, _green, _dim,
+                # _emit_json_if_requested, _ensure_core, ...) without
+                # re-implementing them.
+                mod.register(subparsers, dispatch, sys.modules[__name__])
+        except Exception as e:
+            print(
+                f"[cli-addon] {ext_dir.name}: {e}", file=sys.stderr,
+            )
+
+
+# ====================================================================
+# Main
+# ====================================================================
+
+_DISPATCH = {
+    "list-projects": cmd_list_projects,
+    "update-project": cmd_update_project,
+    "list-tasks": cmd_list_tasks,
+    "fetch-tasks": cmd_fetch_tasks,
+    "get-task": cmd_get_task,
+    "create-task": cmd_create_task,
+    "update-task": cmd_update_task,
+    "add-dep": cmd_add_dep,
+    "remove-dep": cmd_remove_dep,
+    "close-task": cmd_close_task,
+    "check-status": cmd_check_status,
+    "append-history": cmd_append_history,
+    "list-history": cmd_list_history,
+    "delete-task": cmd_delete_task,
+    "rename-task": cmd_rename_task,
+    "list-prs": cmd_list_prs,
+    "add-pr": cmd_add_pr,
+    "remove-pr": cmd_remove_pr,
+    "sync-prs": cmd_sync_prs,
+    "pr-detail": cmd_pr_detail,
+    "list-sessions": cmd_list_sessions,
+    "open-session": cmd_open_session,
+    "open-review-session": cmd_open_review_session,
+    "send-message": cmd_send_message,
+    "kill-session": cmd_kill_session,
+    "resume-session": cmd_resume_session,
+    "session-status": cmd_session_status,
+    "stats": cmd_stats,
+    "usage": cmd_usage,
+    "pr-stats": cmd_pr_stats,
+    "events": cmd_events,
+    "auth-status": cmd_auth_status,
+    "append-review-history": cmd_append_review_history,
+    "list-review-history": cmd_list_review_history,
+    "update-review": cmd_update_review,
+    "renew-cert": cmd_renew_cert,
+    "audit": cmd_audit,
+}
+
+
+class _EvaCLIParser(argparse.ArgumentParser):
+    """Custom parser with friendlier error messages.
+
+    1. Top-level invalid subcommand prints 'Unknown command' rather
+       than argparse's verbose `invalid choice` listing every command.
+    2. `unrecognized arguments` for project/task flags hints that
+       those are positionals on this CLI -- common confusion because
+       `--project` is conventional in many tools.
+    Argument-level `choices=` failures (e.g. `--status bogus`) are
+    left to argparse's default handler so the user sees the full list
+    of valid choices."""
+
+    # Flags that callers commonly try, expecting them to be optional.
+    _POSITIONAL_FLAG_HINTS = {
+        "--project": "the project id is the FIRST positional arg",
+        "--task-id": "the task id is the SECOND positional arg",
+        "--task_id": "the task id is the SECOND positional arg",
+    }
+
+    def error(self, message):
+        import re
+        # argparse formats the top-level invalid command as
+        # `argument command: invalid choice: 'X' (...)`. Only intercept
+        # when the offending argument IS `command` -- any other
+        # `invalid choice` (e.g. `--status`, `--type`) falls through to
+        # argparse's own error path which prints the valid choices list.
+        if "argument command:" in message and "invalid choice" in message:
+            m = re.search(r"invalid choice: '([^']*)'", message)
+            cmd = m.group(1) if m else "?"
+            print("Unknown command: %s. Run 'eva-cli help' for usage."
+                  % cmd, file=sys.stderr)
+            sys.exit(1)
+        if "unrecognized arguments" in message:
+            tokens = message.split("unrecognized arguments:", 1)[-1].split()
+            hits = [t for t in tokens if t in self._POSITIONAL_FLAG_HINTS]
+            if hits:
+                hint = "; ".join(self._POSITIONAL_FLAG_HINTS[t] for t in hits)
+                print(f"Error: {message}", file=sys.stderr)
+                print(f"Hint: {hint}. Try `<cmd> <project> <task_id> ...` "
+                      f"-- run `eva-cli <cmd> --help` for the exact "
+                      f"argument order.", file=sys.stderr)
+                sys.exit(2)
+            # Bare positional tokens (no leading dash) typically mean
+            # the user expected a third positional like `description`
+            # but the CLI takes those as flags. Surface the flag form
+            # rather than just echoing argparse's terse 'unrecognized
+            # arguments: foo'.
+            bare = [t for t in tokens if not t.startswith("-")]
+            if bare:
+                preview = " ".join(bare[:3])
+                print(f"Error: {message}", file=sys.stderr)
+                print(
+                    f"Hint: extra positional value(s) {preview!r} -- did "
+                    f"you mean to pass them as flags? Common ones are "
+                    f"`--description`, `--notes`, `--ticket-id`, "
+                    f"`--status`. Run `eva-cli <cmd> --help` for the "
+                    f"full flag list.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        super().error(message)
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Hoist a trailing `--json` (or `-h` / `--help`) to the front so
+    both placements work identically.
+
+    Without this, `eva-cli list-projects --json` fails with
+    "unrecognized arguments: --json" because argparse only honours
+    `--json` on the top-level parser, not the subcommand. Memo item
+    #7 from architecture-discussion.md. Keeps `audit --json` working
+    too because the audit subparser also accepts `--json` (its own
+    declaration) -- argparse merges duplicate `store_true` flags
+    cleanly.
+
+    Subcommand `audit` is a special-case exception: it has rich
+    per-flag args (`--fix`, `--kind`) that need to STAY positioned
+    after the subcommand name. We only hoist `--json`."""
+    out = list(argv)
+    # Idempotent: no-op when already at the front.
+    if out and out[0] == "--json":
+        return out
+    if "--json" in out:
+        out = ["--json"] + [a for a in out if a != "--json"]
+    return out
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args(_normalize_argv(sys.argv[1:]))
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+    if args.command == "help":
+        parser.print_help()
+        sys.exit(0)
+    handler = _DISPATCH.get(args.command)
+    if not handler:
+        print("Unknown command: %s. Run 'eva-cli help' for usage."
+              % args.command, file=sys.stderr)
+        sys.exit(1)
+    _ensure_core()
+    handler(args)
+
+
+if __name__ == "__main__":
+    main()
