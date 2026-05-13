@@ -15,12 +15,36 @@ if _FRONTEND_DIR.exists():
         StaticFiles(directory=str(_FRONTEND_DIR / "assets")),
         name="frontend-assets",
     )
+    # Anything Vite copies from `frontend/public/static/` (e.g. the
+    # Claude favicon used inline in `SessionCard`/`ProjectSessionCard`
+    # via `<img src="/static/...">`). Mount only when the directory
+    # actually exists so a fresh checkout without bundled assets
+    # doesn't crash startup.
+    _static_dir = _FRONTEND_DIR / "static"
+    if _static_dir.is_dir():
+        app_state.app.mount(
+            "/static",
+            StaticFiles(directory=str(_static_dir)),
+            name="frontend-static",
+        )
     for _f in ["favicon.svg", "icons.svg"]:
         _fp = _FRONTEND_DIR / _f
         if _fp.exists():
             @app_state.app.get(f"/{_f}")
             def _serve_static_file(f=str(_fp)):
                 return FileResponse(f)
+
+# Optional `docs/deck/` static mount: opt-in via the local-only docs/
+# tree (self-ignored via `docs/.gitignore: /*`). If the directory
+# exists, the slide deck is served at `/deck/`. No-op otherwise so a
+# fresh OSS checkout doesn't 404 noisily.
+_DECK_DIR = app_state.REPO_ROOT / "docs" / "deck"
+if _DECK_DIR.is_dir():
+    app_state.app.mount(
+        "/deck",
+        StaticFiles(directory=str(_DECK_DIR), html=True),
+        name="deck",
+    )
 
 
 @app_state.app.get("/")

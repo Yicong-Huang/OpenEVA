@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { api, type JiraInstance } from '../api'
 import {
   useTheme,
@@ -75,7 +75,7 @@ const KEYS = {
 } as const
 
 type SettingsBag = Record<string, unknown>
-type RootTab = 'setup' | 'repos' | 'themes' | 'plugins' | 'intervals'
+type RootTab = 'setup' | 'repos' | 'appearance' | 'layout' | 'plugins' | 'intervals'
 
 interface PluginDef {
   id: string
@@ -107,6 +107,7 @@ export function SettingsModal({
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<RootTab>(initialTab)
   const [pluginsExpanded, setPluginsExpanded] = useState(true)
+  const [search, setSearch] = useState('')
   // Per-key save status so the user gets immediate feedback on save.
   const [saving, setSaving] = useState<Record<string, 'pending' | 'ok' | 'error'>>({})
   // The Plugins tab body is the scrolling region for sub-item links.
@@ -185,20 +186,33 @@ export function SettingsModal({
           color: 'var(--text)', fontFamily: 'inherit',
         }}
       >
-        {/* Header */}
+        {/* Header: title + search + close */}
         <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '12px 16px', borderBottom: '1px solid var(--border)',
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '10px 16px', borderBottom: '1px solid var(--border)',
         }}>
-          <span style={{ fontSize: 13, fontWeight: 600 }}>Settings</span>
+          <span style={{ fontSize: 13, fontWeight: 600, flexShrink: 0 }}>Settings</span>
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search settings..."
+            data-testid="settings-search"
+            style={{
+              flex: 1, padding: '4px 8px', fontSize: 11,
+              background: 'var(--panel-bg)', color: 'var(--text)',
+              border: '1px solid var(--border)', borderRadius: 4,
+            }}
+          />
           <button
             className="btn-action"
             onClick={onClose}
-            style={{ fontSize: 11 }}
+            style={{ fontSize: 11, flexShrink: 0 }}
           >Close</button>
         </div>
 
         {/* Body: sidebar + content */}
+        <SearchFilterContext.Provider value={search}>
         <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
           <Sidebar
             tab={tab}
@@ -217,8 +231,11 @@ export function SettingsModal({
             {bag && tab === 'repos' && (
               <ReposTab bag={bag} save={save} saving={saving} />
             )}
-            {bag && tab === 'themes' && (
-              <ThemesTab bag={bag} save={save} saving={saving} />
+            {bag && tab === 'appearance' && (
+              <AppearanceTab bag={bag} save={save} saving={saving} />
+            )}
+            {bag && tab === 'layout' && (
+              <LayoutTab bag={bag} save={save} saving={saving} />
             )}
             {bag && tab === 'plugins' && (
               <PluginsTab bag={bag} save={save} saving={saving} />
@@ -228,6 +245,7 @@ export function SettingsModal({
             )}
           </div>
         </div>
+        </SearchFilterContext.Provider>
       </div>
     </div>
   )
@@ -268,9 +286,14 @@ function Sidebar({
         testId="sidebar-repos"
       />
       <SidebarItem
-        label="Themes" active={tab === 'themes'}
-        onClick={() => onSelectTab('themes')}
-        testId="sidebar-themes"
+        label="Appearance" active={tab === 'appearance'}
+        onClick={() => onSelectTab('appearance')}
+        testId="sidebar-appearance"
+      />
+      <SidebarItem
+        label="Layout" active={tab === 'layout'}
+        onClick={() => onSelectTab('layout')}
+        testId="sidebar-layout"
       />
       <SidebarItem
         label="Plugins" active={tab === 'plugins'}
@@ -917,7 +940,7 @@ function ResolvedReposSection({
   )
 }
 
-function ThemesTab({ bag, save, saving }: {
+function AppearanceTab({ bag, save, saving }: {
   bag: SettingsBag
   save: (key: string, value: unknown) => Promise<void>
   saving: Record<string, 'pending' | 'ok' | 'error'>
@@ -1016,6 +1039,19 @@ function ThemesTab({ bag, save, saving }: {
           testIdPrefix="settings-brightness"
         />
       </Section>
+    </>
+  )
+}
+
+
+/** Layout: pane ratios + fetch horizons across the various pages. */
+function LayoutTab({ bag, save, saving }: {
+  bag: SettingsBag
+  save: (key: string, value: unknown) => Promise<void>
+  saving: Record<string, 'pending' | 'ok' | 'error'>
+}) {
+  return (
+    <>
       <Section title="Reviews 3-pane ratios">
         <Note>
           Width percentages for the queue / card / detail panes on the
@@ -1854,7 +1890,15 @@ function InlineSelect({
 
 // ---- Layout primitives ----
 
+// Search filter: a parent `SettingsModal` puts the current query in
+// context; every `<Section>` self-hides when its title doesn't match.
+// Empty query = show all, so the context is also the disable flag.
+const SearchFilterContext = React.createContext<string>('')
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  const filter = React.useContext(SearchFilterContext).trim().toLowerCase()
+  const match = !filter || title.toLowerCase().includes(filter)
+  if (!match) return null
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{

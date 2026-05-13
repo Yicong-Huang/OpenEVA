@@ -6,7 +6,7 @@ import { SessionCard } from './SessionCard'
 import { PRNode } from './PRNode'
 import { TicketLink } from './TicketLink'
 import { api } from '../api'
-import { taskStatusSummary, isTaskBlocked, isTerminalTaskStatus, evalActionCondition, classifyHistoryEntry, historyKindColor } from '../utils/taskHelpers'
+import { isTaskBlocked, isTerminalTaskStatus, evalActionCondition, classifyHistoryEntry, historyKindColor } from '../utils/taskHelpers'
 import { formatLocalShort } from '../utils'
 import { useAlert } from './Alert'
 import { useSessionLauncher } from '../hooks/useSessionLauncher'
@@ -241,7 +241,6 @@ export function TaskCard({
     }
   }, [project.id, taskId, hasTickets, ticketId, handleAction, prompt, promptWithCheckbox, alert])
 
-  const summary = taskStatusSummary(status, prs, deps, tasks, { id: ticketId }, hasTickets)
 
   // Filter action buttons
   const actionData = { prs, has_ticket: !!ticketId, ci_status: undefined as string | undefined }
@@ -488,11 +487,6 @@ export function TaskCard({
           Stopping session...
         </div>
       )}
-
-      {/* Status summary */}
-      <div data-testid="status-summary" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 6, marginBottom: 4 }}>
-        {summary}
-      </div>
 
       {/* Action buttons bar */}
       <div className="action-bar">

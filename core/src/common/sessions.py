@@ -26,11 +26,18 @@ def list_sessions(project=None):
 
 
 def list_all_sessions():
-    """List all sessions grouped by project. Returns dict of {project_id: {name, sessions}}."""
+    """List all sessions grouped by project. Returns dict of
+    {project_id: {name, sessions}}. Hidden projects (per
+    `ui.hidden_projects`) are skipped so the Live-Tasks view stays
+    consistent with the sidebar."""
+    from . import settings as _settings
+    hidden = _settings.get_hidden_projects()
     all_sessions = app_state._db.list_sessions()
     result = {}
     for s in all_sessions:
         pid = s["project"]
+        if pid in hidden:
+            continue
         if pid not in result:
             proj = app_state._db.get_project(pid)
             proj_name = proj.get("name", pid) if proj else pid

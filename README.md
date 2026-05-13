@@ -159,22 +159,6 @@ cd frontend && npm test -- --run
 `conftest.py` redirect notification/event DBs to `tmp_path` and stub
 every adapter that talks to tmux / GitHub / Slack.
 
-## Contributing
-
-Open an issue describing the proposed change before sending a PR. The
-codebase is small enough that one well-scoped change per PR is the
-norm. Conventions:
-
-- One component per `.tsx` file. Helpers split into `<name>Helpers.ts`.
-- Routes stay thin (parse body -> call `common.X` -> map exceptions).
-  Business logic in `core/src/common/`.
-- Adapters (`core/src/adapters/`) are the only place that shells out
-  or hits external APIs. Core never imports `subprocess` directly.
-- Conventional Commits, single line, no body, no ticket tag, no
-  Co-Authored-By: `<type>: <description>` where type is one of
-  `feat`, `fix`, `test`, `refactor`, `docs`, `chore`.
-- ASCII only in code, comments, docstrings. No emoji, no Unicode arrows.
-
 ## License
 
 Apache License 2.0 -- see [LICENSE](LICENSE).

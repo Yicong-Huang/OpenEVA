@@ -101,7 +101,7 @@ export function TopBar({
     <div className="top-bar" data-testid="top-bar">
       <span className="top-bar-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <img src="/favicon.svg" width={18} height={18} alt="" style={{ borderRadius: 3 }} />
-        Eva
+        OpenEVA
       </span>
       {onNavigate && (
         <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>

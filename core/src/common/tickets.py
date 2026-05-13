@@ -407,11 +407,26 @@ def list_tickets(limit: int = 100) -> list[dict]:
     its own assignee identity (email vs username). The JQL on the
     instance is what scopes "my tickets" -- we trust it and return
     everything that's currently cached for any configured instance.
+
+    Tickets ALL of whose `linked_tasks` belong to hidden projects
+    (per `ui.hidden_projects`) get filtered out. Free-floating
+    tickets (no linked tasks at all) are always shown -- they aren't
+    tied to any project's visibility.
     """
     if not list_instances():
         return []
     rows = app_state._db.list_tickets(limit=limit)
-    return [enrich_for_view(r) for r in rows]
+    enriched = [enrich_for_view(r) for r in rows]
+    hidden = _settings.get_hidden_projects()
+    if not hidden:
+        return enriched
+    out = []
+    for t in enriched:
+        links = t.get("linked_tasks") or []
+        if links and all(lk.get("project") in hidden for lk in links):
+            continue
+        out.append(t)
+    return out
 
 
 def get_one(key: str, *, instance_name: str = "") -> dict | None:

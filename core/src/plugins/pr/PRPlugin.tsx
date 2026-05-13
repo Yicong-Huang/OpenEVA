@@ -79,11 +79,28 @@ function buildTrendlineSvg(weekly: number[], weeklyPrimary: number[], primaryCol
   )
 }
 
+// localStorage key for per-browser visibility of the "Open" row.
+// Backend doesn't know about this -- the toggle is purely a UI knob.
+const HIDE_OPEN_KEY = 'pr-plugin.hide-open'
+
+function loadHideOpen(): boolean {
+  try { return localStorage.getItem(HIDE_OPEN_KEY) === '1' } catch { return false }
+}
+
 export function PRPlugin() {
   const enabled = usePluginEnabled('pr')
   const [data, setData] = useState<PRPluginData | null>(null)
   const [error, setError] = useState(false)
   const { collapsed, toggle } = usePluginCollapse()
+  const [hideOpen, setHideOpen] = useState(loadHideOpen)
+
+  const toggleHideOpen = useCallback(() => {
+    setHideOpen((prev) => {
+      const next = !prev
+      try { localStorage.setItem(HIDE_OPEN_KEY, next ? '1' : '0') } catch { /* ignore */ }
+      return next
+    })
+  }, [])
 
   const load = useCallback(async (refresh = false) => {
     try {
@@ -158,15 +175,29 @@ export function PRPlugin() {
       </div>
       {!collapsed && <>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2 }}>
-        <span className="usage-label">Open</span>
-        <span style={{ fontSize: 10, fontFamily: 'monospace', display: 'flex', gap: 6 }}>
-          {repos.map((r) =>
-            (openPrs[r] || 0) > 0 && (
-              <span key={r} style={{ color: repoColor(r) }}>{r}:{openPrs[r]}</span>
-            ),
-          )}
-          <span style={{ color: 'var(--text)' }}><b>{total}</b></span>
+        <span
+          className="usage-label"
+          onClick={toggleHideOpen}
+          title={hideOpen ? 'Show open PR counts' : 'Hide open PR counts (per browser, localStorage)'}
+          data-testid="pr-plugin-toggle-open"
+          style={{ cursor: 'pointer', userSelect: 'none' }}
+        >
+          Open
         </span>
+        {hideOpen ? (
+          <span style={{ fontSize: 9, color: 'var(--text-dim)', fontStyle: 'italic' }}>
+            hidden
+          </span>
+        ) : (
+          <span style={{ fontSize: 10, fontFamily: 'monospace', display: 'flex', gap: 6 }}>
+            {repos.map((r) =>
+              (openPrs[r] || 0) > 0 && (
+                <span key={r} style={{ color: repoColor(r) }}>{r}:{openPrs[r]}</span>
+              ),
+            )}
+            <span style={{ color: 'var(--text)' }}><b>{total}</b></span>
+          </span>
+        )}
       </div>
       {quarters.map((q) => {
         const entries = Object.entries(q.by_repo || {}).filter(([, n]) => n > 0)

@@ -79,6 +79,11 @@ export function ProjectTree({ activeProject, activeView, onNavigate }: ProjectTr
     try {
       await api.setProjectVisibility(pid, nextHidden)
       refresh()
+      // Tell other panels (Live Tasks, All PRs, Tickets) to refetch
+      // -- they filter by visibility too, but cache their list response.
+      window.dispatchEvent(new CustomEvent('eva:project-visibility-changed', {
+        detail: { project_id: pid, hidden: nextHidden },
+      }))
     } catch {
       /* best-effort: UI stays unchanged on failure */
     }
@@ -180,10 +185,11 @@ export function ProjectTree({ activeProject, activeView, onNavigate }: ProjectTr
                 data-testid={`project-hide-${p.id}`}
                 style={{
                   background: 'transparent', border: 'none', cursor: 'pointer',
-                  color: 'var(--text-dim)', fontSize: 12, padding: '0 8px',
+                  color: 'var(--text-dim)', fontSize: 14, lineHeight: 1,
+                  padding: '0 8px', fontFamily: 'inherit',
                 }}
               >
-                {p.hidden ? '\u{1F441}' : '\u{2A2F}'}
+                {p.hidden ? '+' : '×'}
               </button>
             </div>
           )

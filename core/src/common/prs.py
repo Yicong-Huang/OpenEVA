@@ -14,7 +14,11 @@ _pr_info_cache = {}
 
 
 def list_all_prs(status="", search=""):
-    """Return all PRs grouped by project."""
+    """Return all PRs grouped by project. Hidden projects (per
+    `ui.hidden_projects`) are skipped so the All-PRs view stays
+    consistent with the sidebar."""
+    from . import settings as _settings
+    hidden = _settings.get_hidden_projects()
     prs = app_state._db.list_all_prs(status=status, search=search)
 
     proj_names = app_state.project_name_map()
@@ -22,6 +26,8 @@ def list_all_prs(status="", search=""):
     grouped = {}
     for pr in prs:
         pid = pr.get("project", "other")
+        if pid in hidden:
+            continue
         if pid not in grouped:
             grouped[pid] = {"name": proj_names.get(pid, pid), "prs": []}
         grouped[pid]["prs"].append(pr)

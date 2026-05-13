@@ -1,4 +1,4 @@
-import { useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useApi } from './useApi'
 import { useEventBus } from './useEventBus'
 import type { CronJob, Ticket } from '../api'
@@ -128,6 +128,20 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   useEventBus('task.*', useCallback(() => refetchSessions(), [refetchSessions]))
   useEventBus('github.*', useCallback(() => refetchReviews(), [refetchReviews]))
   useEventBus('ticket.*', useCallback(() => refetchTickets(), [refetchTickets]))
+
+  // Project visibility toggles change which rows the backend
+  // includes in each per-project bundle. Refetch the lists that
+  // group by project so hidden-project content drops out without
+  // a manual page reload.
+  useEffect(() => {
+    const handler = () => {
+      refetchSessions()
+      refetchReviews()
+      refetchTickets()
+    }
+    window.addEventListener('eva:project-visibility-changed', handler)
+    return () => window.removeEventListener('eva:project-visibility-changed', handler)
+  }, [refetchSessions, refetchReviews, refetchTickets])
 
   // Memoized derived views. Each `live*` filter is by snapshot state
   // (NOT by any per-row `session_alive` -- those fields are gone).

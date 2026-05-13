@@ -60,10 +60,14 @@ def list_all_project_sessions():
     follow up with `/api/projects/{pid}` per project -- see SessionsPage
     for the consumer.
     """
+    from common import settings as _settings
+    hidden = _settings.get_hidden_projects()
     result: dict = {}
     all_sessions = app_state._db.list_sessions()
     for s in all_sessions:
         pid = s["project"]
+        if pid in hidden:
+            continue
         if pid not in result:
             proj = app_state._db.get_project(pid) or {}
             result[pid] = {

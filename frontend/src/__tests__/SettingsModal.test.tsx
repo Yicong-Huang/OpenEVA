@@ -70,7 +70,7 @@ describe('SettingsModal', () => {
     await screen.findByTestId('settings-modal')
     // Sidebar shows the four root entries.
     expect(screen.getByTestId('sidebar-repos')).toBeInTheDocument()
-    expect(screen.getByTestId('sidebar-themes')).toBeInTheDocument()
+    expect(screen.getByTestId('sidebar-appearance')).toBeInTheDocument()
     expect(screen.getByTestId('sidebar-plugins')).toBeInTheDocument()
     expect(screen.getByTestId('sidebar-intervals')).toBeInTheDocument()
     // Repos content is rendered by default.
@@ -83,7 +83,7 @@ describe('SettingsModal', () => {
   it('clicking a root sidebar item switches the tab', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     expect(await screen.findByTestId('settings-theme-toggle')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('sidebar-plugins'))
     // Plugins tab shows the quick-toggles section.
@@ -314,7 +314,7 @@ describe('SettingsModal', () => {
   it('Themes tab shows all 16 palette swatches', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const t of ['dark', 'light', 'solarized-dark', 'solarized-light',
                      'high-contrast', 'nord',
                      'rose-pine-moon', 'github-dimmed', 'cobalt',
@@ -329,7 +329,7 @@ describe('SettingsModal', () => {
   it('engineering-dashboard themes (crimson-dark / slate-pro) apply', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const t of ['crimson-dark', 'slate-pro']) {
       fireEvent.click(await screen.findByTestId(`settings-theme-${t}`))
       expect(document.documentElement.getAttribute('data-theme')).toBe(t)
@@ -339,7 +339,7 @@ describe('SettingsModal', () => {
   it('clicking a palette swatch applies that theme to <html>', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     fireEvent.click(await screen.findByTestId('settings-theme-nord'))
     expect(document.documentElement.getAttribute('data-theme')).toBe('nord')
   })
@@ -347,7 +347,7 @@ describe('SettingsModal', () => {
   it('new modern themes (rose-pine-moon / github-dimmed / cobalt) apply', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const t of ['rose-pine-moon', 'github-dimmed', 'cobalt']) {
       fireEvent.click(await screen.findByTestId(`settings-theme-${t}`))
       expect(document.documentElement.getAttribute('data-theme')).toBe(t)
@@ -360,7 +360,7 @@ describe('SettingsModal', () => {
     // as the existing ones -- no special-casing.
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const t of ['tokyo-night', 'catppuccin-mocha', 'dracula']) {
       fireEvent.click(await screen.findByTestId(`settings-theme-${t}`))
       expect(document.documentElement.getAttribute('data-theme')).toBe(t)
@@ -375,7 +375,7 @@ describe('SettingsModal', () => {
     // path as the others.
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const t of ['gruvbox-dark', 'everforest-dark']) {
       fireEvent.click(await screen.findByTestId(`settings-theme-${t}`))
       expect(document.documentElement.getAttribute('data-theme')).toBe(t)
@@ -385,7 +385,7 @@ describe('SettingsModal', () => {
   it('font scale picker offers 4 sizes and applies the selection', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     expect(await screen.findByTestId('settings-font-scale-0.85'))
       .toBeInTheDocument()
     expect(screen.getByTestId('settings-font-scale-1.3')).toBeInTheDocument()
@@ -397,7 +397,7 @@ describe('SettingsModal', () => {
   it('density picker writes data-density and --gap', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     fireEvent.click(await screen.findByTestId('settings-density-spacious'))
     expect(document.documentElement.getAttribute('data-density'))
       .toBe('spacious')
@@ -413,7 +413,7 @@ describe('SettingsModal', () => {
     // round-trip through --font-family + data-font-family on :root.
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     for (const f of ['system', 'sans', 'serif', 'mono', 'rounded']) {
       expect(await screen.findByTestId(`settings-font-family-${f}`))
         .toBeInTheDocument()
@@ -432,13 +432,13 @@ describe('SettingsModal', () => {
     // (which re-imports the module) re-reads the user's choice.
     const { unmount } = render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     fireEvent.click(await screen.findByTestId('settings-font-family-mono'))
     expect(localStorage.getItem('eva-font-family')).toBe('mono')
     unmount()
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-appearance'))
     // Active selection still reads from storage.
     expect(document.documentElement.getAttribute('data-font-family'))
       .toBe('mono')
@@ -593,7 +593,7 @@ describe('SettingsModal', () => {
     }
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-layout'))
     const queue = await screen.findByTestId('settings-reviews-ratio-queue') as HTMLInputElement
     expect(queue.value).toBe('40')
     expect((screen.getByTestId('settings-reviews-ratio-card') as HTMLInputElement).value).toBe('30')
@@ -603,7 +603,7 @@ describe('SettingsModal', () => {
   it('Reviews ratios editor PUTs the new triple on Save', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-layout'))
     const queue = await screen.findByTestId('settings-reviews-ratio-queue')
     fireEvent.change(queue, { target: { value: '50' } })
     fireEvent.click(screen.getByTestId('settings-reviews-ratios-save'))
@@ -619,7 +619,7 @@ describe('SettingsModal', () => {
   it('Reviews ratios Save is disabled until a field changes', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')
-    fireEvent.click(screen.getByTestId('sidebar-themes'))
+    fireEvent.click(screen.getByTestId('sidebar-layout'))
     const saveBtn = await screen.findByTestId('settings-reviews-ratios-save') as HTMLButtonElement
     expect(saveBtn.disabled).toBe(true)
     // Change a field -> button enables.
