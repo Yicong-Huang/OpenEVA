@@ -12,6 +12,8 @@ coding sessions every day. It collapses the "spreadsheet of browser
 tabs" problem into one local app with a SQLite store, a React UI, and
 a plug-in surface for letting AI agents take over the busywork.
 
+![Dashboard](assets/dashboard.png)
+
 ## Why
 
 The default tools assume one process, one task, one person at a
