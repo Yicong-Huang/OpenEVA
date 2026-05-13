@@ -458,7 +458,10 @@ def test_rename_task_reverse_deps(db):
 
 def test_create_task_duplicate(db):
     """create_task with duplicate (project, task_id) should raise IntegrityError."""
-    from pysqlite3 import dbapi2 as sqlite3
+    try:
+        from pysqlite3 import dbapi2 as sqlite3
+    except ImportError:
+        import sqlite3  # type: ignore[no-redef]
     db.create_task("proj-a", "task-dup", description="First")
     with pytest.raises(sqlite3.IntegrityError):
         db.create_task("proj-a", "task-dup", description="Second")

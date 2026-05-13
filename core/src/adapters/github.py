@@ -73,20 +73,59 @@ def is_repo_allowed(full_repo: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _load_gh_tokens() -> dict:
-    """Load GitHub tokens from gh CLI config."""
+    """Load GitHub login -> token map from gh CLI config.
+
+    Modern gh (>=2.40) stores OAuth tokens in the OS keyring and leaves
+    each user entry in `~/.config/gh/hosts.yml` empty (YAML null). Older
+    gh wrote the token inline as `oauth_token`. We support both:
+
+      - Keyring storage: the value is None / {}, we record the login
+        with an empty-string token. Callers that need an actual bearer
+        token must fall back to `gh auth token --user <login>` or to
+        the `GITHUB_TOKEN` env var.
+      - Inline storage: read `oauth_token` straight off the user info.
+    """
     try:
         with open(Path.home() / ".config" / "gh" / "hosts.yml") as f:
-            data = yaml.safe_load(f)
-        users = data.get("github.com", {}).get("users", {})
-        return {u: info.get("oauth_token", "") for u, info in users.items()}
+            data = yaml.safe_load(f) or {}
+        users = (data.get("github.com") or {}).get("users") or {}
+        result: dict[str, str] = {}
+        for u, info in users.items():
+            if not u:
+                continue
+            if isinstance(info, dict):
+                result[u] = info.get("oauth_token", "") or ""
+            else:
+                # `info` is None (keyring storage) or some unexpected
+                # shape -- still record the login so multi-account
+                # routing and the setup-status check can see it.
+                result[u] = ""
+        return result
+    except FileNotFoundError:
+        return {}
     except Exception:
         return {}
 
 
-# Loaded once at import time. Tests can monkeypatch either the dict
-# contents (`_gh_tokens.clear(); _gh_tokens.update(...)`) or the binding
-# via `monkeypatch.setattr(adapters.github, "_gh_tokens", {...})`.
+# Loaded once at import time so hot-path callers (every PR sync, every
+# notification) don't re-parse the YAML. Tests can monkeypatch either
+# the dict contents (`_gh_tokens.clear(); _gh_tokens.update(...)`) or
+# the binding (`monkeypatch.setattr(adapters.github, "_gh_tokens",
+# {...})`). For UI flows that must observe live `gh auth login` /
+# `gh auth logout` results without a server restart -- typically the
+# setup-status route -- call `refresh_gh_tokens()` first.
 _gh_tokens = _load_gh_tokens()
+
+
+def refresh_gh_tokens() -> dict:
+    """Re-read `~/.config/gh/hosts.yml` and mutate `_gh_tokens` in
+    place. Returns the refreshed dict so callers can introspect what
+    changed. Mutation (vs. rebinding) keeps existing `from
+    adapters.github import _gh_tokens` references valid."""
+    fresh = _load_gh_tokens()
+    _gh_tokens.clear()
+    _gh_tokens.update(fresh)
+    return _gh_tokens
 
 
 # Account-rules are loaded once at startup (same pattern as

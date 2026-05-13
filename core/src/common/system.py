@@ -557,8 +557,40 @@ def get_setup_status() -> dict:
         ),
     })
 
-    # 2. At least one authenticated gh account.
-    tokens = _gh._gh_tokens
+    # 2. tmux on PATH. Project Manager + every task/review session
+    # runs inside a tmux pane (see core/src/adapters/tmux.py), so the
+    # entire AI-session surface is broken without it.
+    try:
+        r = subprocess.run(["tmux", "-V"], capture_output=True,
+                           text=True, timeout=5)
+        tmux_ok = r.returncode == 0
+        tmux_detail = (r.stdout or r.stderr).strip()[:200] if tmux_ok \
+            else (r.stderr or "tmux exited non-zero").strip()[:200]
+    except FileNotFoundError:
+        tmux_ok = False
+        tmux_detail = "tmux binary not found on PATH"
+    except Exception as e:  # noqa: BLE001
+        tmux_ok = False
+        tmux_detail = f"failed to invoke tmux: {e}"
+    checks.append({
+        "id": "tmux_binary",
+        "label": "tmux installed",
+        "ok": tmux_ok,
+        "detail": tmux_detail,
+        "hint": (
+            "Install tmux: `brew install tmux` (macOS) or "
+            "`apt install tmux` (Debian/Ubuntu). Eva runs every AI "
+            "session in a tmux pane -- Project Manager, task sessions, "
+            "and review sessions all need it."
+            if not tmux_ok else ""
+        ),
+    })
+
+    # 3. At least one authenticated gh account.
+    # Re-read hosts.yml on every status call so the user can run
+    # `gh auth login` while the server is up and see the check go
+    # green on next refresh (no restart needed).
+    tokens = _gh.refresh_gh_tokens()
     accounts = sorted(tokens.keys())
     accounts_ok = bool(accounts)
     checks.append({
@@ -574,7 +606,7 @@ def get_setup_status() -> dict:
         ),
     })
 
-    # 3. allowed_repos configured (yaml seed or Settings UI).
+    # 4. allowed_repos configured (yaml seed or Settings UI).
     raw_repos = _settings.get_value(
         _settings.KEY_GITHUB_ALLOWED_REPOS, default=None)
     repos_list = raw_repos if isinstance(raw_repos, list) else []
@@ -593,7 +625,7 @@ def get_setup_status() -> dict:
         ),
     })
 
-    # 4. account_rules required only when 2+ tokens are loaded.
+    # 5. account_rules required only when 2+ tokens are loaded.
     if len(accounts) >= 2:
         raw_rules = _settings.get_value(
             _settings.KEY_GITHUB_ACCOUNT_RULES, default=None)
@@ -616,7 +648,7 @@ def get_setup_status() -> dict:
             ),
         })
 
-    # 5. Channels (slack, etc.). Each registered channel contributes
+    # 6. Channels (slack, etc.). Each registered channel contributes
     # one check via `is_ready()`. Empty registry adds zero checks --
     # an OSS install without any channel impls still passes setup.
     from . import channels as _channel_registry

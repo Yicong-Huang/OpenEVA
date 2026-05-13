@@ -60,7 +60,10 @@ env/
 
 tasks.bak/
 
-# Per-plugin runtime configs hold local values; ship the `.example`.
-core/src/plugins/*/plugin.conf
+# `plugin.conf` is the plugin manifest (id/name/enabled defaults) that
+# `common.plugins.discover_dir` requires for discovery. Seeding is
+# idempotent (manual Settings UI edits win), so we ship the file
+# instead of gitignoring it. Users that want a local-only override
+# can `git update-index --skip-worktree core/src/plugins/<id>/plugin.conf`.
 
 # Extensions self-ignore via an in-folder `.gitignore` containing `/*`.

@@ -2,7 +2,14 @@
 
 import asyncio
 import json as _json
-from pysqlite3 import dbapi2 as sqlite3
+try:
+    # `pysqlite3-binary` ships a recent SQLite (3.45+) so OSS installs
+    # don't depend on whatever SQLite ships with the host Python. Falls
+    # back to stdlib when the wheel is unavailable (notably: no macOS
+    # arm64 wheel as of 2026; stdlib 3.43+ already meets our needs).
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[assignment]
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel

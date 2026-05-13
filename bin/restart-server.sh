@@ -49,12 +49,49 @@ fi
 
 # 4. Confirm the listen port is free before we re-bind. Avoids a
 # silent "address in use" failure on the new process.
+#
+# `ss` is Linux-only; on macOS / BSD it isn't installed and the loop
+# was effectively a no-op (we never noticed a busy port and the new
+# uvicorn died with "address in use"). Probe in priority order:
+# ss -> lsof -> python3 socket. Whichever the host has, we get a
+# real check.
+port_busy() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -q ":${PORT} "
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >/dev/null 2>&1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - <<PY
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sys.exit(0 if s.connect_ex(("127.0.0.1", ${PORT})) == 0 else 1)
+PY
+    else
+        return 1
+    fi
+}
 for _ in $(seq 1 10); do
-    if ! ss -tln 2>/dev/null | grep -q ":${PORT} "; then
+    if ! port_busy; then
         break
     fi
     sleep 0.5
 done
+
+# 4b. If the port is STILL busy after the grace window it's almost
+# certainly a foreign process (different user / different parent --
+# our own server already died in step 3). Fail loudly with the actual
+# culprit instead of letting uvicorn die with an unhelpful "address
+# in use" error.
+if port_busy; then
+    echo "[restart-server] ERROR: port ${PORT} is still in use by a foreign process." >&2
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >&2 || true
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep ":${PORT} " >&2 || true
+    fi
+    echo "[restart-server] Free that port or pick another via EVA_PORT=<n>." >&2
+    exit 2
+fi
 
 # 5. Start the new server detached. server.py lives under
 #    `core/src/`. PYTHONPATH starts with `core/src` (always present)

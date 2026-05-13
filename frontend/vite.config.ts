@@ -62,11 +62,30 @@ export default defineConfig({
   //                     surprises when devs flip between `npm run dev`
   //                     and `npm run build`).
   resolve: {
+    // Force every cross-tree consumer (plugin .tsx files under
+    // `core/src/plugins/`, extension .tsx files under `<ext>/src/`)
+    // to resolve `react` / `react-dom` to the SAME copy installed in
+    // `frontend/node_modules`. Vite 8 / Rolldown otherwise walks the
+    // importer's parent chain looking for `node_modules/react` and
+    // fails because the importer lives outside `frontend/`. Mapping
+    // the bare specifier here also eliminates the "duplicate React"
+    // class of bugs (separate copies break hooks).
     alias: {
+      react: path.join(__dirname, 'node_modules', 'react'),
+      'react-dom': path.join(__dirname, 'node_modules', 'react-dom'),
+      'react/jsx-runtime': path.join(
+        __dirname, 'node_modules', 'react', 'jsx-runtime',
+      ),
+      'react/jsx-dev-runtime': path.join(
+        __dirname, 'node_modules', 'react', 'jsx-dev-runtime',
+      ),
       '@core/plugins': corePlugins,
       '@app': frontendSrc,
       ...Object.fromEntries(extensions.map(e => [`@${e.id}`, e.src])),
     },
+    // Deduplicate explicitly so any transitive dep that pulls in
+    // its own React (rare but happens) is collapsed onto our copy.
+    dedupe: ['react', 'react-dom'],
   },
   server: {
     port: 3000,

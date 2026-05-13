@@ -193,6 +193,18 @@ class EvaDB:
     """Unified SQLite database for Eva: tasks, config, events, and usage."""
 
     def __init__(self, db_path: str):
+        # Ensure the parent directory exists. A fresh OSS clone has no
+        # `data/` -- without this `sqlite3.connect` raises `unable to
+        # open database file` and the server fails to start with no
+        # actionable hint.
+        from pathlib import Path as _Path
+        _parent = _Path(db_path).expanduser().resolve().parent
+        try:
+            _parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Disk full / permission denied -- let sqlite3.connect
+            # raise the real error below; nothing useful to do here.
+            pass
         raw_conn = sqlite3.connect(
             db_path,
             check_same_thread=False,

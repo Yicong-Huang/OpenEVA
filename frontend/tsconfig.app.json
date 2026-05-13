@@ -27,7 +27,19 @@
     "baseUrl": ".",
     "paths": {
       "@core/plugins/*": ["../core/src/plugins/*"],
-      "@app/*": ["./src/*"]
+      "@app/*": ["./src/*"],
+      // Pin bare `react` / `react-dom` to THIS frontend's
+      // node_modules. Without these mappings tsc walks from each
+      // importer's location looking for `node_modules/react`; plugin
+      // .tsx files under `core/src/plugins/` live outside `frontend/`,
+      // so the walk misses our react install and the build fails with
+      // "Cannot find module 'react' or its corresponding type
+      // declarations." Mirrors `resolve.alias` in vite.config.ts so
+      // tsc and the Vite bundler agree.
+      "react": ["./node_modules/react"],
+      "react-dom": ["./node_modules/react-dom"],
+      "react/jsx-runtime": ["./node_modules/react/jsx-runtime"],
+      "react/jsx-dev-runtime": ["./node_modules/react/jsx-dev-runtime"]
     }
   },
   "include": [

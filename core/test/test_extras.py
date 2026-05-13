@@ -91,9 +91,15 @@ class TestListAllProjectSessions:
 class TestStaticRoutes:
     def test_index_route(self, client):
         resp = client.get("/")
-        # Should return the index.html file (200 if it exists, or 500 if not)
-        # Since we are using the real static dir, it should exist
-        assert resp.status_code == 200
+        # 200 when `frontend/dist/index.html` is present (a prior
+        # `npm run build` left a tree); 503 with a "Frontend not
+        # built" hint otherwise. OSS test environments commonly skip
+        # the npm build to keep the Python suite cheap, so both
+        # outcomes are valid -- we just want to confirm the route
+        # is registered and doesn't 500.
+        assert resp.status_code in (200, 503)
+        if resp.status_code == 503:
+            assert "Frontend not built" in resp.text
 
 
 # ---- usage history ----

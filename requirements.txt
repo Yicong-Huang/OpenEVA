@@ -28,4 +28,9 @@ PyYAML>=6,<7
 # wheel ships its own recent SQLite so OSS installs don't have to
 # touch system packages. `eva_db.py` prefers it when available and
 # falls back to stdlib sqlite3 otherwise.
-pysqlite3-binary>=0.5,<1
+#
+# No wheel ships for macOS arm64 as of 2026; pip would fall back to a
+# sdist build that fails for most users. Stdlib sqlite3 on recent
+# macOS (3.43+) already meets Eva's needs, so we just skip the wheel
+# there. Linux x86_64/aarch64 + macOS x86_64 still get the wheel.
+pysqlite3-binary>=0.5,<1 ; sys_platform != "darwin" or platform_machine != "arm64"
