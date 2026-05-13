@@ -352,6 +352,16 @@ def kill_session(session_name: str):
             }, persist=False)
             return {"status": "killed", "session": session_name}
     app_state._db.delete_session(session_name)
+    # Broadcast `session.killed` so frontend views that aren't subscribed
+    # to per-state patches (e.g. SessionsPage / All Live Tasks) know to
+    # refetch their `/api/all-sessions` cache and drop the now-deleted
+    # row. Mirrors what `kill_sessions_by_status` already does.
+    app_state.emit_event("session.killed", {
+        "title": f"Session killed: {session_name}",
+        "message": project,
+        "severity": "info",
+        "session": session_name,
+    }, persist=False)
     return {"status": "killed", "session": session_name}
 
 

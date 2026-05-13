@@ -104,7 +104,7 @@ def get_usage():
 def get_usage_history(days=7):
     """Return usage history from SQLite. Returns {history, total_records}."""
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    with sqlite3.connect(str(_USAGE_DB_PATH)) as conn:
+    with sqlite3.connect(str(app_state._USAGE_DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM usage_history WHERE ts >= ? ORDER BY ts ASC",

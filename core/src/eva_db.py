@@ -217,6 +217,12 @@ class EvaDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Wait up to 5s for a busy writer instead of failing immediately
+        # with `database is locked`. Other connections to this same file
+        # (routes/events.py, services/github_poller.py, etc.) are not
+        # serialised by `_LockedConnection`, so cross-connection lock
+        # contention is real -- the busy timeout lets sqlite handle it.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._create_schema()
 
     def _create_schema(self):

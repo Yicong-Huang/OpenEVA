@@ -49,7 +49,7 @@ _SEEN_IDS_MAX = 3000
 def _load_seen_ids():
     """Load seen notification IDs as {source_id: ts} from the events table."""
     try:
-        with sqlite3.connect(str(app_state._NOTIF_DB_PATH)) as conn:
+        with app_state._notif_db() as conn:
             rows = conn.execute(
                 "SELECT source_id, ts FROM events WHERE source = 'github' AND source_id IS NOT NULL ORDER BY ts DESC LIMIT 2000"
             ).fetchall()
@@ -61,7 +61,7 @@ def _load_seen_ids():
 def _load_since_watermarks():
     """Load since watermark from the max ts of github events."""
     try:
-        with sqlite3.connect(str(app_state._NOTIF_DB_PATH)) as conn:
+        with app_state._notif_db() as conn:
             row = conn.execute("SELECT MAX(ts) FROM events WHERE source = 'github'").fetchone()
             if row and row[0]:
                 return row[0]

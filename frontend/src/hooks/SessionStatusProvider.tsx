@@ -128,6 +128,12 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   useEventBus('task.*', useCallback(() => refetchSessions(), [refetchSessions]))
   useEventBus('github.*', useCallback(() => refetchReviews(), [refetchReviews]))
   useEventBus('ticket.*', useCallback(() => refetchTickets(), [refetchTickets]))
+  // Kill flows delete the session row from the DB. The snapshot already
+  // gets the `session.state -> stopped` patch, but `/api/all-sessions`
+  // (which carries the per-row business metadata + the `running` flag)
+  // is a separate cache -- without an explicit refetch the killed
+  // row keeps rendering until the next task/github/ticket event fires.
+  useEventBus('session.killed', useCallback(() => refetchSessions(), [refetchSessions]))
 
   // Project visibility toggles change which rows the backend
   // includes in each per-project bundle. Refetch the lists that

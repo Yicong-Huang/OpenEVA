@@ -209,7 +209,7 @@ def _replay_since(last_event_id: str) -> "list[dict]":
 @app_state.app.get("/api/events")
 def get_notifications(limit: int = 30, unread_only: bool = False):
     """Get system events, newest first."""
-    with sqlite3.connect(str(app_state._NOTIF_DB_PATH)) as conn:
+    with app_state._notif_db() as conn:
         conn.row_factory = sqlite3.Row
         where = "WHERE read = 0" if unread_only else "WHERE 1=1"
         rows = conn.execute(
@@ -230,7 +230,7 @@ class MarkReadBody(BaseModel):
 @app_state.app.post("/api/events/read")
 def mark_notifications_read(body: MarkReadBody = MarkReadBody()):
     """Mark events as read. Supports: ids (list), url (PR URL), session (name), or all."""
-    with sqlite3.connect(str(app_state._NOTIF_DB_PATH)) as conn:
+    with app_state._notif_db() as conn:
         if body.ids:
             conn.executemany("UPDATE events SET read = 1 WHERE id = ?", [(i,) for i in body.ids])
         elif body.url:

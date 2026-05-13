@@ -106,7 +106,7 @@ _WORKLOG_TASK_COLS = (
 def _collect_active_task_ids(start: str, end: str) -> set:
     """Read the events table for `task.*` events in the window and
     extract the task_ids referenced by each event title."""
-    conn = sqlite3.connect(str(app_state._NOTIF_DB_PATH))
+    conn = app_state._notif_db()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT type, title, ts FROM events "

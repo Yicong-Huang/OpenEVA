@@ -323,7 +323,18 @@ def _init_notif_db():
 
 
 def _notif_db():
-    return sqlite3.connect(str(_NOTIF_DB_PATH))
+    """Open a fresh connection to eva.db with a generous busy_timeout.
+
+    Other code paths (EvaDB, the github poller, the worklog route) hold
+    their own connection to this same file. Without a busy timeout we
+    would immediately get `database is locked` whenever any of them was
+    mid-write. 5s is well over typical write durations, and the WAL
+    journal mode means readers don't block writers anyway -- this only
+    matters for the writer-vs-writer case.
+    """
+    conn = sqlite3.connect(str(_NOTIF_DB_PATH))
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 _VALID_SEVERITIES = ("info", "warning", "error")
@@ -383,7 +394,7 @@ def emit_event(event_type, data, persist=True):
     # Persist to events DB (dedup by source_id for github events)
     if persist:
         try:
-            with sqlite3.connect(str(_NOTIF_DB_PATH)) as conn:
+            with _notif_db() as conn:
                 source_id = n["source_id"]
                 if source_id and source == "github":
                     existing = conn.execute(

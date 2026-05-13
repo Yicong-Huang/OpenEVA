@@ -540,6 +540,30 @@ function CronSessionPanel({
   const sessionRow = useSessionState(job.session_name)
   const state = sessionRow?.state ?? ''
   const alive = isLive(state)
+  // A never-fired job has no row in the snapshot at all -- mounting
+  // a SessionCard against a non-existent tmux name just produces a
+  // chain of 404s from /resize + /subscribe. Render a stub instead;
+  // 'Run now' will create the session and the panel will swap in
+  // automatically once the snapshot picks it up.
+  if (!sessionRow) {
+    return (
+      <div style={{ marginTop: 16 }} data-testid="cron-job-session-card">
+        <div style={{
+          fontSize: 11, fontWeight: 700, color: 'var(--accent)',
+          textTransform: 'uppercase', letterSpacing: 0.5,
+          marginBottom: 6,
+        }}>Live session</div>
+        <div style={{
+          fontSize: 11, color: 'var(--text-dim)',
+          border: '1px dashed var(--border)', borderRadius: 6,
+          padding: '12px 14px',
+        }}>
+          No session yet. Click <strong>Run now</strong> to launch
+          <code style={{ marginLeft: 4 }}>{job.session_name}</code>.
+        </div>
+      </div>
+    )
+  }
   return (
     <div style={{ marginTop: 16 }} data-testid="cron-job-session-card">
       <div style={{
