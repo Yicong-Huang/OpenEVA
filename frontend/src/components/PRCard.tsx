@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import type { PRDetail as PRDetailType, ActionDef, PR } from '../types'
+import type { PRDetail as PRDetailType, ActionDef, PR, PendingReviewComment } from '../types'
 import { api } from '../api'
 import { ghAvatar, renderMarkdown } from '../utils'
 import { useLiveClock } from '../hooks/useLiveClock'
@@ -257,19 +257,26 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
   const [submittingReview, setSubmittingReview] = useState(false)
   const reviewPopoverRef = useRef<HTMLDivElement>(null)
   useClickOutside(reviewPopoverRef, () => setReviewOpen(false))
+  // My current pending (draft) review on this PR -- lines accumulate
+  // here as the user clicks Comment in the diff; submitting the review
+  // popover sends them all to GitHub as one finalized review. The
+  // review_id is intentionally not held here: the backend finds my
+  // pending review server-side on every add / submit / delete, so the
+  // frontend would only have a stale copy to throw away.
+  const [pendingComments, setPendingComments] = useState<PendingReviewComment[]>([])
 
   // Show "has update" badge when github events arrive
   useEventBus('github.*', useCallback(() => { setHasUpdate(true) }, []))
 
   // Load the action-button set for the current context. Review mode
-  // shows a slim review-only set (context='review'); task-linked PRs
-  // show the full PR action set (fix-ci, address-comments, ...).
+  // pulls the review-only set (Review PR / Draft Reply / Sync Status);
+  // task-linked PRs show the full PR action set (fix-ci, address-
+  // comments, ...).
   useEffect(() => {
-    // Review-mode action buttons live on the Review Card now -- skip
-    // the fetch entirely when in review mode so we don't spend a
-    // request on data the UI will never render.
     if (reviewUrl) {
-      setPrActions([])
+      api.getActions('review')
+        .then((data) => setPrActions(data.actions || []))
+        .catch(() => setPrActions([]))
       return
     }
     if (projectId && taskId) {
@@ -280,6 +287,12 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
       setPrActions([])
     }
   }, [projectId, taskId, reviewUrl])
+
+  const fetchPending = useCallback(() => {
+    api.getPRPendingReview(repo, number)
+      .then((data) => setPendingComments(data.comments || []))
+      .catch(() => setPendingComments([]))
+  }, [repo, number])
 
   const fetchDetail = useCallback(() => {
     setLoading(true)
@@ -294,7 +307,10 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
         setError(e.message || 'Failed to load PR detail')
         setLoading(false)
       })
-  }, [repo, number])
+    // Pending review state lives separately on GitHub; fetch in
+    // parallel so the inline diff knows which comments to badge.
+    fetchPending()
+  }, [repo, number, fetchPending])
 
   useEffect(() => {
     fetchDetail()
@@ -344,9 +360,15 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
     }
     setSubmittingReview(true)
     try {
-      await api.submitPRReview(repo, number, reviewEvent, body)
+      // Always go through the pending-review submit endpoint: when a
+      // draft exists, it finalizes it together with any inline lines;
+      // when no draft exists, the backend short-circuits to the
+      // immediate `submit_pr_review` path so body-only reviews still
+      // work through the same call.
+      await api.submitPendingReview(repo, number, reviewEvent, body)
       setReviewBody('')
       setReviewOpen(false)
+      setPendingComments([])
       // Local optimistic reflection: bump reviewDecision so the header
       // pill updates without waiting for the next poll.
       const optimisticDecision =
@@ -361,6 +383,10 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
           { author: { login: myLoginForRepo || 'me' }, state: reviewEvent },
         ],
       })
+      // Refresh inline comments so the freshly-finalized review's
+      // lines lose the "Pending" badge and show up as standard
+      // review comments.
+      fetchDetail()
     } catch (e) {
       await alert({
         title: 'Failed to submit review',
@@ -370,7 +396,7 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
     } finally {
       setSubmittingReview(false)
     }
-  }, [pr, reviewEvent, reviewBody, repo, number, myLoginForRepo, alert])
+  }, [pr, reviewEvent, reviewBody, repo, number, myLoginForRepo, alert, fetchDetail])
 
   if (loading) {
     return (
@@ -500,6 +526,19 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
                   onClick={(e) => { e.stopPropagation(); setReviewOpen((v) => !v) }}
                 >
                   Review changes
+                  {pendingComments.length > 0 && (
+                    <span
+                      data-testid="pending-review-count"
+                      title={`${pendingComments.length} pending inline comment(s)`}
+                      style={{
+                        fontSize: 9, fontWeight: 700, padding: '0 5px',
+                        borderRadius: 8, background: 'rgba(0,0,0,0.25)',
+                        color: 'var(--bg)',
+                      }}
+                    >
+                      {pendingComments.length}
+                    </span>
+                  )}
                   <span style={{ fontSize: 8, opacity: 0.7 }}>{reviewOpen ? '▲' : '▼'}</span>
                 </button>
                 {reviewOpen && (
@@ -626,10 +665,14 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
         </div>
       </div>
 
-      {/* Action buttons -- task-mode only. In review mode the action
-          buttons live on the Review Card (middle pane); duplicating
-          them here just confused the user about which entry to click. */}
-      {!reviewUrl && (
+      {/* Action buttons. Two surfaces:
+            * task-mode (no reviewUrl): Open Agent + filtered PR-context
+              actions (fix-ci, address-comments, ...).
+            * review-mode (reviewUrl set): the review-context set
+              (Review PR / Draft Reply / Sync Status) so the user
+              doesn't have to bounce back to the middle pane just to
+              fire another action while a session is already live. */}
+      {!reviewUrl ? (
         <div data-testid="pr-actions" style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
           {hasTask && (
             <button className="btn-action accent" onClick={() => handleActionClick('open')}>
@@ -657,6 +700,47 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
               </button>
             ))}
         </div>
+      ) : prActions.length > 0 ? (
+        <div data-testid="pr-actions-review" style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
+          {prActions.map((a) => (
+            <button
+              key={a.id}
+              data-testid={`pr-review-action-${a.id}`}
+              className={a.id === 'review-pr' ? 'btn-action accent' : 'btn-action'}
+              onClick={() => handleActionClick(a.id)}
+              title={a.prompt_template?.slice(0, 200) || a.label}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {/* Pending (draft) review one-line summary. The individual draft
+          comments render inline inside each FileItem's diff -- this
+          banner is just a top-of-page hint pointing at the count + the
+          finalize affordance. */}
+      {pendingComments.length > 0 && (
+        <div
+          data-testid="pending-review-banner"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            border: '1px solid rgba(251, 191, 36, 0.45)',
+            background: 'rgba(251, 191, 36, 0.08)',
+            borderRadius: 6, padding: '6px 10px', marginBottom: 12,
+            fontSize: 11,
+          }}
+        >
+          <span style={{
+            fontSize: 9, fontWeight: 800, letterSpacing: 0.5,
+            padding: '2px 6px', borderRadius: 3,
+            background: 'rgba(251, 191, 36, 0.25)', color: '#f59e0b',
+          }}>PENDING</span>
+          <span style={{ color: 'var(--text-dim)' }}>
+            {pendingComments.length} draft inline comment{pendingComments.length > 1 ? 's' : ''}.
+            Each appears under its line in the file diff below. Use <strong>Review changes</strong> above to finalize.
+          </span>
+        </div>
       )}
 
       {/* Labels */}
@@ -683,11 +767,80 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
         files={pr.files}
         repo={repo}
         prNumber={number}
+        pendingComments={pendingComments}
+        onDeletePending={async (commentId: number) => {
+          try {
+            await api.deletePendingComment(repo, commentId)
+            // Local state update only -- skip the full `fetchDetail`
+            // round-trip so the diff doesn't blink + the file stays
+            // exactly where the user is scrolled. The pending list is
+            // the source of truth for the badge + inline render, so
+            // mutating it locally is enough.
+            setPendingComments((prev) => prev.filter((c) => c.id !== commentId))
+          } catch (err) {
+            await alert({
+              title: 'Delete failed',
+              message: err instanceof Error ? err.message : String(err),
+              kind: 'error',
+            })
+          }
+        }}
+        onEditPending={async (commentId: number, body: string) => {
+          // Pending comments are review comments under the hood --
+          // the same PATCH endpoint that edits finalized inline
+          // comments updates them too.
+          try {
+            await api.editComment(repo, commentId, body, true)
+            // Same local-only update as delete: patch the body in
+            // place so the row re-renders without a full PR refetch.
+            setPendingComments((prev) =>
+              prev.map((c) => c.id === commentId ? { ...c, body } : c),
+            )
+          } catch (err) {
+            await alert({
+              title: 'Edit failed',
+              message: err instanceof Error ? err.message : String(err),
+              kind: 'error',
+            })
+          }
+        }}
+        // Ask Agent: route through the existing action launcher so we
+        // get the right agent surface for whichever pane we're on --
+        // the review session (review-pr) when on All Reviews, or the
+        // task session (open) when this PR is attached to a task.
+        // The custom prompt carries the draft body + file:line so the
+        // agent has just enough context to refine or answer questions
+        // about it without us re-shipping the entire diff.
+        onAskAgentPending={(reviewUrl || hasTask) ? (pc) => {
+          const customPrompt = (
+            `I have a PENDING review comment I'm drafting on this PR.\n` +
+            `File: ${pc.path}\n` +
+            `Line: ${pc.line ?? '?'}\n\n` +
+            `Current draft:\n"""\n${pc.body}\n"""\n\n` +
+            `Help me refine this comment. Suggest a clearer / shorter / more accurate version. ` +
+            `Do NOT post anything to GitHub -- I'll edit the pending comment myself.`
+          )
+          handleActionClick(reviewUrl ? 'review-pr' : 'open', customPrompt)
+        } : undefined}
         onComment={async (path, line, body) => {
           try {
-            await api.replyToComment(repo, number, 0, `**${path}:${line}**\n${body}`, false)
+            // Adds the line to my pending (draft) review on this PR.
+            // Creates the review on the first call, appends on
+            // subsequent ones. The line stays in PENDING state on
+            // GitHub until the user finalizes via "Review changes".
+            await api.addPendingComment({
+              repo, number, path, line, body, side: 'RIGHT',
+            })
+            // PR detail's inlineComments include the pending row; the
+            // pending-state fetch tells us which IDs to badge.
             fetchDetail()
-          } catch { /* ignore */ }
+          } catch (err) {
+            await alert({
+              title: 'Failed to add pending comment',
+              message: err instanceof Error ? err.message : String(err),
+              kind: 'error',
+            })
+          }
         }}
         onAskAgent={hasTask ? (context) => {
           // Ask Agent = conversational Q&A about the selected code.

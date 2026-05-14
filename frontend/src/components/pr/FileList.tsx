@@ -1,5 +1,5 @@
-import { useState, useCallback, useRef, useEffect } from 'react'
-import type { PRDetail } from '../../types'
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
+import type { PRDetail, PendingReviewComment } from '../../types'
 import { api } from '../../api'
 import { highlightLine } from '../../utils/syntaxHighlight'
 
@@ -9,18 +9,39 @@ interface FileListProps {
   prNumber: number
   onComment?: (path: string, line: number, body: string) => void
   onAskAgent?: (context: string) => void
+  /** Pending-review comments on this PR. The file row displays an icon
+   * + count when any pending comment matches the file's path so the
+   * user can see at a glance which files still have unsubmitted drafts
+   * without expanding every diff. */
+  pendingComments?: PendingReviewComment[]
+  /** Called when the user hits the remove button on an inline pending
+   *  comment. The parent owns the API call + state refresh. */
+  onDeletePending?: (commentId: number) => void
+  /** Save a new body for an existing pending comment. */
+  onEditPending?: (commentId: number, body: string) => Promise<void>
+  /** Forward a pending comment to the review agent session (one-off
+   *  "refine this" prompt). Only wired in review mode where the
+   *  agent session is the review session itself. */
+  onAskAgentPending?: (pc: PendingReviewComment) => void
 }
 
-/** Parse a unified diff string into renderable lines with line numbers. */
+/** Parse a unified diff string into renderable lines with line numbers
+ *  AND the GitHub-style `position` for each row. `position` is the
+ *  1-based offset from the first `@@` header (everything below it
+ *  counts, including subsequent hunk headers) -- this is the key
+ *  GitHub uses to anchor draft review comments while `line` is still
+ *  null on the draft. */
 function parseDiff(raw: string): Array<{
   type: 'header' | 'add' | 'remove' | 'context' | 'info'
   text: string
   oldLine: number | null
   newLine: number | null
+  position: number | null
 }> {
   const lines: ReturnType<typeof parseDiff> = []
   let oldLine = 0
   let newLine = 0
+  let position: number | null = null  // null until first @@ seen
 
   for (const line of raw.split('\n')) {
     if (line.startsWith('@@')) {
@@ -30,17 +51,25 @@ function parseDiff(raw: string): Array<{
         oldLine = parseInt(match[1], 10)
         newLine = parseInt(match[2], 10)
       }
-      lines.push({ type: 'info', text: line, oldLine: null, newLine: null })
+      // First @@ -> position 0 (the header itself is position 0 per
+      // GitHub's convention); subsequent @@ headers are part of the
+      // running diff body and bump the counter normally.
+      position = position === null ? 0 : position + 1
+      lines.push({ type: 'info', text: line, oldLine: null, newLine: null, position })
     } else if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) {
-      lines.push({ type: 'header', text: line, oldLine: null, newLine: null })
+      // File header rows precede the first @@ -- they don't take a position.
+      lines.push({ type: 'header', text: line, oldLine: null, newLine: null, position: null })
     } else if (line.startsWith('+')) {
-      lines.push({ type: 'add', text: line, oldLine: null, newLine: newLine })
+      position = position === null ? null : position + 1
+      lines.push({ type: 'add', text: line, oldLine: null, newLine: newLine, position })
       newLine++
     } else if (line.startsWith('-')) {
-      lines.push({ type: 'remove', text: line, oldLine: oldLine, newLine: null })
+      position = position === null ? null : position + 1
+      lines.push({ type: 'remove', text: line, oldLine: oldLine, newLine: null, position })
       oldLine++
     } else {
-      lines.push({ type: 'context', text: line, oldLine: oldLine, newLine: newLine })
+      position = position === null ? null : position + 1
+      lines.push({ type: 'context', text: line, oldLine: oldLine, newLine: newLine, position })
       oldLine++
       newLine++
     }
@@ -168,8 +197,163 @@ function SelectionBubble({ x, y, containerRef, codeRef, onComment, onAskAgent, o
   )
 }
 
+/**
+ * One pending (draft) review comment, rendered inline under its diff row.
+ * Three actions in the header: Ask Agent (forwards the body to the
+ * review agent session as a refine-prompt), Edit (in-place textarea
+ * toggle), Remove (delete the draft line on GitHub).
+ *
+ * The remove + ask-agent buttons are pure pass-throughs; edit owns its
+ * own draft + saving state so the parent doesn't have to track per-row
+ * UI mode.
+ */
+function PendingCommentRow({ pc, onDelete, onEdit, onAskAgent }: {
+  pc: PendingReviewComment
+  onDelete?: (commentId: number) => void
+  onEdit?: (commentId: number, body: string) => Promise<void>
+  onAskAgent?: (pc: PendingReviewComment) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(pc.body)
+  const [saving, setSaving] = useState(false)
+
+  const startEdit = useCallback(() => {
+    // Re-seed from the latest server body whenever we open the editor
+    // so stale local drafts can't shadow an external edit.
+    setDraft(pc.body)
+    setEditing(true)
+  }, [pc.body])
+
+  const save = useCallback(async () => {
+    if (!onEdit) return
+    if (draft.trim() === pc.body.trim()) {
+      setEditing(false)
+      return
+    }
+    setSaving(true)
+    try {
+      await onEdit(pc.id, draft.trim())
+      setEditing(false)
+    } finally {
+      setSaving(false)
+    }
+  }, [onEdit, pc.id, pc.body, draft])
+
+  return (
+    <div
+      data-testid={`pending-inline-${pc.id}`}
+      style={{
+        // Indent under the diff row's code column so the comment
+        // visually anchors to the line above without overflowing
+        // the line-number gutter.
+        margin: '4px 8px 6px 64px',
+        padding: '6px 8px',
+        background: 'var(--card-bg)',
+        border: '1px solid rgba(251, 191, 36, 0.55)',
+        borderRadius: 4,
+        // Comment text is regular UI font, not monospace, so prose
+        // renders normally instead of inheriting the diff's tight
+        // code styling.
+        fontFamily: 'inherit', fontSize: 11, lineHeight: 1.4,
+        color: 'var(--text)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <span style={{
+          fontSize: 9, fontWeight: 800, letterSpacing: 0.5,
+          padding: '1px 5px', borderRadius: 3,
+          background: 'rgba(251, 191, 36, 0.22)', color: '#f59e0b',
+        }}>PENDING</span>
+        <span style={{ flex: 1 }} />
+        {!editing && onAskAgent && (
+          <button
+            className="btn-action accent"
+            data-testid={`pending-comment-ask-${pc.id}`}
+            title="Forward this draft to the review agent (refine / question)"
+            onClick={(e) => { e.stopPropagation(); onAskAgent(pc) }}
+            style={{ fontSize: 9, padding: '1px 6px' }}
+          >
+            <img src="/static/claude-favicon.ico" width={9} height={9}
+              style={{ verticalAlign: 'middle', marginRight: 3 }} alt="" />
+            ask
+          </button>
+        )}
+        {!editing && onEdit && (
+          <button
+            className="btn-action"
+            data-testid={`pending-comment-edit-${pc.id}`}
+            title="Edit this pending comment"
+            onClick={(e) => { e.stopPropagation(); startEdit() }}
+            style={{ fontSize: 9, padding: '1px 6px' }}
+          >
+            edit
+          </button>
+        )}
+        {!editing && onDelete && (
+          <button
+            className="btn-action"
+            data-testid={`pending-comment-delete-${pc.id}`}
+            title="Delete this pending comment"
+            onClick={(e) => { e.stopPropagation(); onDelete(pc.id) }}
+            style={{ fontSize: 9, padding: '1px 6px', color: 'var(--red)' }}
+          >
+            remove
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <>
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            disabled={saving}
+            // Cmd/Ctrl+Enter to save, Esc to cancel -- standard editor
+            // keymaps so the user doesn't have to reach for the mouse.
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault()
+                save()
+              } else if (e.key === 'Escape') {
+                setEditing(false)
+              }
+            }}
+            style={{
+              width: '100%', minHeight: 60, padding: '4px 6px',
+              background: 'var(--panel-bg)', border: '1px solid var(--border)',
+              borderRadius: 4, color: 'var(--text)',
+              fontSize: 11, fontFamily: 'inherit',
+              resize: 'vertical', boxSizing: 'border-box',
+            }}
+          />
+          <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end', marginTop: 4 }}>
+            <button
+              className="btn-action"
+              onClick={(e) => { e.stopPropagation(); setEditing(false) }}
+              disabled={saving}
+              style={{ fontSize: 9, padding: '1px 6px' }}
+            >cancel</button>
+            <button
+              className="btn-action accent"
+              data-testid={`pending-comment-save-${pc.id}`}
+              onClick={(e) => { e.stopPropagation(); save() }}
+              disabled={saving || !draft.trim()}
+              style={{ fontSize: 9, padding: '1px 6px' }}
+            >{saving ? 'saving...' : 'save'}</button>
+          </div>
+        </>
+      ) : (
+        <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+          {pc.body}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 /** Single expandable file with diff */
-function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAskAgent }: {
+function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAskAgent, pendingCount, pendingForFile, onDeletePending, onEditPending, onAskAgentPending }: {
   file: PRDetail['files'][number]
   repo: string
   prNumber: number
@@ -177,15 +361,52 @@ function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAsk
   onLoadDiff: () => void
   onComment?: (path: string, line: number, body: string) => void
   onAskAgent?: (context: string) => void
+  pendingCount?: number
+  /** Pending review comments anchored to this file (already filtered
+   *  by path upstream). Rendered inline under the matching diff row. */
+  pendingForFile?: PendingReviewComment[]
+  onDeletePending?: (commentId: number) => void
+  /** Save a new body for an existing pending comment. Returns a promise
+   *  so the row can stay in 'saving' state until it resolves. */
+  onEditPending?: (commentId: number, body: string) => Promise<void>
+  /** Hand the pending comment off to the agent session as a one-off
+   *  prompt -- typically "refine this draft" -- without losing the
+   *  draft itself. Wired by PRCard when an agent surface exists. */
+  onAskAgentPending?: (pc: PendingReviewComment) => void
 }) {
-  const [expanded, setExpanded] = useState(false)
+  // Auto-expand files that carry a draft so the user lands on their
+  // pending comments without an extra click. The state is initialized
+  // once -- toggling collapse/expand still works normally afterward.
+  const hasPending = (pendingForFile?.length ?? 0) > 0
+  const [expanded, setExpanded] = useState(hasPending)
   const [popup, setPopup] = useState<{ x: number; y: number; text: string; lineFrom: number; lineTo: number } | null>(null)
   const diffRef = useRef<HTMLDivElement>(null)
+
+  // Auto-load the diff when this file mounts already-expanded (pending
+  // present); otherwise the user sees an empty pane with no spinner.
+  useEffect(() => {
+    if (expanded && !diffData) onLoadDiff()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleToggle = () => {
     if (!expanded && !diffData) onLoadDiff()
     setExpanded(!expanded)
   }
+
+  // Group pending comments by GitHub diff `position` so each diff row
+  // can render its attached comments in one O(1) lookup instead of
+  // scanning the array on every line.
+  const pendingByPosition = useMemo(() => {
+    const m: Record<number, PendingReviewComment[]> = {}
+    for (const c of pendingForFile || []) {
+      const p = c.position
+      if (p == null) continue
+      if (!m[p]) m[p] = []
+      m[p].push(c)
+    }
+    return m
+  }, [pendingForFile])
 
   const handleMouseUp = useCallback(() => {
     const sel = window.getSelection()
@@ -231,6 +452,23 @@ function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAsk
         <span style={{ color: 'var(--green)', width: 30, textAlign: 'right', flexShrink: 0 }}>+{file.additions || 0}</span>
         <span style={{ color: 'var(--red)', width: 30, textAlign: 'right', flexShrink: 0 }}>-{file.deletions || 0}</span>
         <span style={{ color: 'var(--text)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.path}</span>
+        {pendingCount && pendingCount > 0 ? (
+          <span
+            data-testid={`file-pending-badge-${file.path}`}
+            title={`${pendingCount} pending review comment${pendingCount > 1 ? 's' : ''} on this file`}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 3,
+              fontSize: 10, padding: '1px 6px', borderRadius: 10,
+              color: '#f59e0b',
+              background: 'rgba(251, 191, 36, 0.12)',
+              border: '1px solid rgba(251, 191, 36, 0.4)',
+              flexShrink: 0,
+            }}
+          >
+            {'\u{1F4AC}'}
+            {pendingCount}
+          </span>
+        ) : null}
       </div>
 
       {/* Diff content */}
@@ -258,37 +496,48 @@ function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAsk
             let displayText = line.text
             if (line.type === 'add' && displayText.startsWith('+')) displayText = ' ' + displayText.slice(1)
             if (line.type === 'remove' && displayText.startsWith('-')) displayText = ' ' + displayText.slice(1)
+            const inlinePending = line.position != null ? pendingByPosition[line.position] : undefined
             return (
-              <div
-                key={i}
-                data-line-idx={i}
-                data-new-line={line.newLine ?? ''}
-                style={{
-                  display: 'flex', color: style.color, background: style.bg,
-                  borderLeft: style.borderLeft || '3px solid transparent',
-                  // pre-wrap (was 'pre') so very long lines wrap
-                  // inside the column instead of forcing a horizontal
-                  // scrollbar on the whole diff. line-number gutters
-                  // are flexShrink:0 so they stay aligned.
-                  whiteSpace: 'pre-wrap', minHeight: 18,
-                }}
-              >
-                <span style={{ width: 28, textAlign: 'right', color: 'var(--text-faint)', fontSize: 9, flexShrink: 0, userSelect: 'none', paddingRight: 3 }}>
-                  {line.oldLine ?? ''}
-                </span>
-                <span style={{ width: 28, textAlign: 'right', color: 'var(--text-faint)', fontSize: 9, flexShrink: 0, userSelect: 'none', paddingRight: 6, borderRight: '1px solid var(--border)' }}>
-                  {line.newLine ?? ''}
-                </span>
-                <span style={{ paddingLeft: 6, flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>
-                  {(line.type === 'add' || line.type === 'remove' || line.type === 'context')
-                    ? highlightLine(displayText).map((span, si) =>
-                        span.color
-                          ? <span key={si} style={{ color: span.color }}>{span.text}</span>
-                          : <span key={si}>{span.text}</span>
-                      )
-                    : displayText
-                  }
-                </span>
+              <div key={i}>
+                <div
+                  data-line-idx={i}
+                  data-new-line={line.newLine ?? ''}
+                  style={{
+                    display: 'flex', color: style.color, background: style.bg,
+                    borderLeft: style.borderLeft || '3px solid transparent',
+                    // pre-wrap (was 'pre') so very long lines wrap
+                    // inside the column instead of forcing a horizontal
+                    // scrollbar on the whole diff. line-number gutters
+                    // are flexShrink:0 so they stay aligned.
+                    whiteSpace: 'pre-wrap', minHeight: 18,
+                  }}
+                >
+                  <span style={{ width: 28, textAlign: 'right', color: 'var(--text-faint)', fontSize: 9, flexShrink: 0, userSelect: 'none', paddingRight: 3 }}>
+                    {line.oldLine ?? ''}
+                  </span>
+                  <span style={{ width: 28, textAlign: 'right', color: 'var(--text-faint)', fontSize: 9, flexShrink: 0, userSelect: 'none', paddingRight: 6, borderRight: '1px solid var(--border)' }}>
+                    {line.newLine ?? ''}
+                  </span>
+                  <span style={{ paddingLeft: 6, flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>
+                    {(line.type === 'add' || line.type === 'remove' || line.type === 'context')
+                      ? highlightLine(displayText).map((span, si) =>
+                          span.color
+                            ? <span key={si} style={{ color: span.color }}>{span.text}</span>
+                            : <span key={si}>{span.text}</span>
+                        )
+                      : displayText
+                    }
+                  </span>
+                </div>
+                {inlinePending && inlinePending.map((pc) => (
+                  <PendingCommentRow
+                    key={pc.id}
+                    pc={pc}
+                    onDelete={onDeletePending}
+                    onEdit={onEditPending}
+                    onAskAgent={onAskAgentPending}
+                  />
+                ))}
               </div>
             )
           })}
@@ -321,7 +570,7 @@ function FileItem({ file, repo, prNumber, diffData, onLoadDiff, onComment, onAsk
   )
 }
 
-export function FileList({ files, repo, prNumber, onComment, onAskAgent }: FileListProps) {
+export function FileList({ files, repo, prNumber, onComment, onAskAgent, pendingComments, onDeletePending, onEditPending, onAskAgentPending }: FileListProps) {
   // Hooks must run unconditionally on every render -- the empty-list early
   // return below must come AFTER all hook declarations.
   const [diffs, setDiffs] = useState<Record<string, string>>({})
@@ -340,6 +589,18 @@ export function FileList({ files, repo, prNumber, onComment, onAskAgent }: FileL
     }
   }, [repo, prNumber, loadingDiff, diffs])
 
+  // One pass over pendingComments per render rather than O(files * pending)
+  // inside the map -- groups comments by file so each FileItem only
+  // sees its own slice (and the badge can derive .length from it).
+  const pendingByPath = useMemo(() => {
+    const m: Record<string, PendingReviewComment[]> = {}
+    for (const c of pendingComments || []) {
+      if (!m[c.path]) m[c.path] = []
+      m[c.path].push(c)
+    }
+    return m
+  }, [pendingComments])
+
   if (!files || files.length === 0) return null
 
   return (
@@ -347,18 +608,26 @@ export function FileList({ files, repo, prNumber, onComment, onAskAgent }: FileL
       <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4, fontWeight: 600 }}>
         Files ({files.length})
       </div>
-      {files.map((f) => (
-        <FileItem
-          key={f.path}
-          file={f}
-          repo={repo}
-          prNumber={prNumber}
-          diffData={diffs[f.path] || null}
-          onLoadDiff={loadAllDiffs}
-          onComment={onComment}
-          onAskAgent={onAskAgent}
-        />
-      ))}
+      {files.map((f) => {
+        const forFile = pendingByPath[f.path]
+        return (
+          <FileItem
+            key={f.path}
+            file={f}
+            repo={repo}
+            prNumber={prNumber}
+            diffData={diffs[f.path] || null}
+            onLoadDiff={loadAllDiffs}
+            onComment={onComment}
+            onAskAgent={onAskAgent}
+            pendingCount={forFile?.length}
+            pendingForFile={forFile}
+            onDeletePending={onDeletePending}
+            onEditPending={onEditPending}
+            onAskAgentPending={onAskAgentPending}
+          />
+        )
+      })}
     </div>
   )
 }

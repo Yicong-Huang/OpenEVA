@@ -700,15 +700,16 @@ class EvaDB:
              "3. Comments must be SHORT. State the issue and propose a "
              "fix in 1-2 sentences. No prose. No restating the diff.\n\n"
              "After the pending comments are in, write a SUMMARY in "
-             "this chat IN CHINESE (中文) with these sections:\n"
-             "  - 一句话 TL;DR\n"
-             "  - 我加了哪些 pending comments（每条: file:line + 一行说明）\n"
-             "  - 跨文件的高层级问题（不适合做 inline 的）\n"
-             "  - 给作者的关键问题\n"
-             "  - 建议: 是否 approve（是 / 否 / 需要更多信息）+ 一句理由\n"
-             "  - 还有谁可能有 context（参考 `gh pr view ... "
-             "--json reviews,comments,assignees`，CODEOWNERS，相关文件的"
-             "近期 git blame；列 1-3 个名字 + 为什么）",
+             "this chat IN ENGLISH with these sections:\n"
+             "  - One-line TL;DR\n"
+             "  - Pending comments I added (each: file:line + one-line note)\n"
+             "  - Cross-file / high-level issues (not suitable for inline)\n"
+             "  - Key questions for the author\n"
+             "  - Recommendation: approve? (yes / no / need more info) "
+             "plus one-line reason\n"
+             "  - Who else may have context (check `gh pr view ... "
+             "--json reviews,comments,assignees`, CODEOWNERS, recent "
+             "git blame on the touched files; list 1-3 handles + why)",
              "review", "", 20),
             ("review-reply", "Draft Reply",
              "IMPORTANT: DO NOT post anything to GitHub by default. "

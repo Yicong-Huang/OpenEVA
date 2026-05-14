@@ -199,17 +199,25 @@ def _build_repo_authors() -> dict:
 # gh CLI runners
 # ---------------------------------------------------------------------------
 
-def gh_run(args: list, repo: str = "", timeout: int = 20):
+def gh_run(args: list, repo: str = "", timeout: int = 20,
+           input_text: str | None = None):
     """Run a gh CLI command with the correct account token via GH_TOKEN env var.
 
     This is the ONE place that shells out to the `gh` binary. Wrappers
     (`gh_run_json`, `gh_run_or_raise`, `gh_run_async`) live in
     `app_state` so tests that monkeypatch `app_state.gh_run` see the
-    override through those wrappers via the re-exported binding."""
+    override through those wrappers via the re-exported binding.
+
+    `input_text` is piped to the subprocess's stdin. Use it for
+    `gh api ... --input -` calls that ship a JSON body too rich for
+    `-f`/`-F` flag pairs (e.g. an array of nested objects)."""
     env = dict(os.environ)
     if repo:
         account = gh_account_for_repo(repo)
         token = _gh_tokens.get(account, "")
         if token:
             env["GH_TOKEN"] = token
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, env=env,
+        input=input_text,
+    )

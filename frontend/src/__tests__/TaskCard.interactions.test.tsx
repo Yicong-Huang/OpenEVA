@@ -242,9 +242,13 @@ describe('TaskCard interactions', () => {
     expect(handler).toHaveBeenCalled()
   })
 
-  it('renders status summary', () => {
+  it('does not render the removed status summary block', () => {
+    // The Chinese status-summary line under the task description was
+    // removed when OpenEVA went OSS -- the data was redundant with the
+    // status pill + PRs list. The render block is gone but we keep an
+    // assertion here so any accidental re-introduction fails fast.
     render(<TaskCard project={makeProject()} taskId="task-1" actions={[]} />)
-    expect(screen.getByTestId('status-summary')).toBeInTheDocument()
+    expect(screen.queryByTestId('status-summary')).toBeNull()
   })
 
   it('kill session button calls killSession and shows pending state', async () => {

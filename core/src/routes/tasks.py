@@ -267,7 +267,13 @@ Rules:
 - ticket_url: build from the configured prefix map below; if no
   match, leave null and the UI will render the ticket id as plain text
 - DUPLICATE CHECK: if any existing task has the same ticket_id, set duplicate_of and duplicate_reason
-- dependencies: only reference task IDs from the existing tasks list
+- dependencies: ALWAYS attempt to pick at least ONE dependency from the
+  existing tasks list when any plausibly fits. Look for: same ticket
+  prefix / parent feature, foundational task this work would naturally
+  build on (e.g. an infra / refactor task this work consumes), or a
+  task whose description shares core nouns. Skip only when no task in
+  the list is even loosely related. Never invent ids -- only reference
+  existing task IDs from the list above. Order: most relevant first.
 - notes: keep the original wording where it carries information; do NOT pad with platitudes or restate the description.
 
 Ticket prefix -> URL base (configured via `jira.ticket_url_prefixes`):

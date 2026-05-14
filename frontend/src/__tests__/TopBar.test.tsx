@@ -26,9 +26,9 @@ vi.mock('../hooks/useTheme', () => ({
 }))
 
 describe('TopBar', () => {
-  it('renders Eva title', () => {
+  it('renders OpenEVA title', () => {
     render(<TopBar />)
-    expect(screen.getByText('Eva')).toBeInTheDocument()
+    expect(screen.getByText('OpenEVA')).toBeInTheDocument()
   })
 
   it('renders all status components', () => {

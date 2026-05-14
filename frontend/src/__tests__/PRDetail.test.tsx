@@ -49,6 +49,10 @@ vi.mock('../api', () => ({
     updatePRBody: vi.fn().mockResolvedValue({ ok: true }),
     replyToComment: vi.fn().mockResolvedValue({ ok: true }),
     submitPRReview: vi.fn().mockResolvedValue({ ok: true, event: 'APPROVE' }),
+    getPRPendingReview: vi.fn().mockResolvedValue({ review_id: null, body: '', comments: [] }),
+    addPendingComment: vi.fn().mockResolvedValue({ review_id: 1, created: true }),
+    deletePendingComment: vi.fn().mockResolvedValue({ ok: true }),
+    submitPendingReview: vi.fn().mockResolvedValue({ ok: true, event: 'APPROVE' }),
   },
 }))
 
@@ -1296,7 +1300,7 @@ describe('PRDetail', () => {
       fireEvent.click(screen.getByLabelText(/Approve/))
       fireEvent.click(screen.getByTestId('review-submit-btn'))
       await waitFor(() => {
-        expect(api.submitPRReview).toHaveBeenCalledWith('org/repo', 42, 'APPROVE', '')
+        expect(api.submitPendingReview).toHaveBeenCalledWith('org/repo', 42, 'APPROVE', '')
       })
     })
 
@@ -1311,7 +1315,7 @@ describe('PRDetail', () => {
       fireEvent.change(textarea, { target: { value: 'please fix the thing' } })
       fireEvent.click(screen.getByTestId('review-submit-btn'))
       await waitFor(() => {
-        expect(api.submitPRReview).toHaveBeenCalledWith(
+        expect(api.submitPendingReview).toHaveBeenCalledWith(
           'org/repo', 42, 'REQUEST_CHANGES', 'please fix the thing',
         )
       })
@@ -1330,7 +1334,7 @@ describe('PRDetail', () => {
         fireEvent.click(screen.getByTestId('review-submit-btn'))
         // tick
         await new Promise(r => setTimeout(r, 10))
-        expect(api.submitPRReview).not.toHaveBeenCalled()
+        expect(api.submitPendingReview).not.toHaveBeenCalled()
         // User got told why.
         expect(window.alert).toHaveBeenCalled()
       } finally {

@@ -29,7 +29,7 @@ import { timeAgo } from '../utils'
 import { nudgeLayout } from '../utils/nudgeLayout'
 import { useGraphLayout } from '../hooks/useGraphLayout'
 import { usePendingCreates } from '../hooks/usePendingCreates'
-import { startCreate, dismissCreate } from '../services/pendingCreates'
+import { startCreate, dismissCreate, setPendingPosition } from '../services/pendingCreates'
 import { DraftTaskNode, DRAFT_NODE_W, DRAFT_NODE_H } from './DraftTaskNode'
 import {
   STATUS_COLORS, NODE_W, NODE_H, MINI_H,
@@ -785,7 +785,25 @@ const GraphViewInner = React.memo(function GraphViewInner({ project, onSelectTas
         change.position &&
         change.dragging === false
       ) {
-        setPosition(change.id, { x: change.position.x, y: change.position.y })
+        // Draft + pending nodes live in their own stores (component
+        // state for drafts, the module-scoped pendingCreates service
+        // for in-flight smart-creates). Their positions still need
+        // to survive the next render -- otherwise the rebuild
+        // useEffect would reset the drag to the original drop point.
+        if (change.id.startsWith('draft-')) {
+          const draftId = change.id.slice('draft-'.length)
+          const pos = { x: change.position.x, y: change.position.y }
+          setLocalDrafts(prev => prev.map(d =>
+            d.draftId === draftId ? { ...d, position: pos } : d
+          ))
+        } else if (change.id.startsWith('pending-')) {
+          const draftId = change.id.slice('pending-'.length)
+          setPendingPosition(draftId, {
+            x: change.position.x, y: change.position.y,
+          })
+        } else {
+          setPosition(change.id, { x: change.position.x, y: change.position.y })
+        }
       }
     }
     onNodesChange(adjusted)
@@ -1065,6 +1083,19 @@ const GraphViewInner = React.memo(function GraphViewInner({ project, onSelectTas
     }
     if (Object.keys(seed).length) seedPositions(seed)
   }, [graphData, expandedNodes, project.tasks, positions, seedPositions])
+
+  // When a pending smart-create resolves to a real task, seed the
+  // project's layout position with whatever the user dragged the temp
+  // node to. Without this the new node would land wherever dagre's
+  // auto-layout puts it -- defeating the point of dropping the temp
+  // node where you want the task to live.
+  useEffect(() => {
+    for (const p of pendingList) {
+      if (p.taskId && p.position && !positions[p.taskId]) {
+        setPosition(p.taskId, p.position)
+      }
+    }
+  }, [pendingList, positions, setPosition])
 
   // Apply highlighting whenever layout, selectedTask, or tasks change.
   // Also append draft (local) and pending (in-flight smart-create)

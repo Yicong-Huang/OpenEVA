@@ -1,4 +1,4 @@
-import type { Project, Task, PR, PRDetail, ActionDef, EvaEvent, ForkableData, GraphData } from './types'
+import type { Project, Task, PR, PRDetail, ActionDef, EvaEvent, ForkableData, GraphData, PendingReviewComment } from './types'
 
 async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(path, options)
@@ -74,6 +74,25 @@ export const api = {
   submitPRReview: (repo: string, number: number, event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', body: string) =>
     post<{ ok: boolean; event: string }>(
       '/api/pr-review', { repo, number, event, body }),
+  // Pending (draft) review endpoints. Inline comments accumulate as a
+  // PENDING review on GitHub until the user finalizes with an event.
+  getPRPendingReview: (repo: string, number: number) =>
+    fetchApi<{ review_id: number | null; body: string; comments: PendingReviewComment[] }>(
+      `/api/pr-pending-review?repo=${encodeURIComponent(repo)}&number=${number}`,
+    ),
+  addPendingComment: (input: {
+    repo: string; number: number; path: string; line: number; body: string;
+    side?: 'LEFT' | 'RIGHT';
+    start_line?: number; start_side?: 'LEFT' | 'RIGHT';
+  }) => post<{ review_id: number; created: boolean }>('/api/pr-pending-comment', input),
+  deletePendingComment: (repo: string, commentId: number) =>
+    fetchApi<{ ok: boolean }>(
+      `/api/pr-pending-comment?repo=${encodeURIComponent(repo)}&comment_id=${commentId}`,
+      { method: 'DELETE' },
+    ),
+  submitPendingReview: (repo: string, number: number, event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', body = '') =>
+    post<{ ok: boolean; event: string }>(
+      '/api/pr-pending-review/submit', { repo, number, event, body }),
   addReviewWatch: (url: string) =>
     post<{ url: string; repo: string; number: number; title: string; added_at: string }>(
       '/api/review-requests/watchlist', { url }),

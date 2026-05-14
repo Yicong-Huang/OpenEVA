@@ -128,6 +128,13 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   useEventBus('task.*', useCallback(() => refetchSessions(), [refetchSessions]))
   useEventBus('github.*', useCallback(() => refetchReviews(), [refetchReviews]))
   useEventBus('ticket.*', useCallback(() => refetchTickets(), [refetchTickets]))
+  // `review.*` covers `review.session.opened` / `review.session.killed`
+  // which the backend emits when an action button starts/stops the
+  // agent session for a PR. Without this listener the review row's
+  // `session_name` updates server-side but the middle-pane ReviewCard
+  // never picks it up -- the user clicks Review PR and sees nothing
+  // happen, even though the tmux session is already running.
+  useEventBus('review.*', useCallback(() => refetchReviews(), [refetchReviews]))
   // Kill flows delete the session row from the DB. The snapshot already
   // gets the `session.state -> stopped` patch, but `/api/all-sessions`
   // (which carries the per-row business metadata + the `running` flag)

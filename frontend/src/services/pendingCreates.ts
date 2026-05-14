@@ -202,6 +202,26 @@ export function dismissCreate(draftId: string) {
 }
 
 
+/** Update the on-canvas position of a pending entry. Called when the
+ *  user drags the in-flight "creating" node so the position survives
+ *  the next subscriber re-render (otherwise the useEffect that
+ *  rebuilds nodes from this store would reset the drag).
+ *
+ *  Also: the resolved task gets seeded into the project's per-task
+ *  layout via `setPosition(taskId, ...)` from the GraphView side --
+ *  we just track the source-of-truth here for the in-flight node. */
+export function setPendingPosition(draftId: string, position: { x: number; y: number }) {
+  const entry = _store[draftId]
+  if (!entry) return
+  // Only emit on actual change to keep useEffect noise down.
+  if (entry.position && entry.position.x === position.x && entry.position.y === position.y) {
+    return
+  }
+  entry.position = position
+  _notify()
+}
+
+
 /** Test helper: clear everything. Not part of the public app surface;
  *  gated by name so production code grep won't find it accidentally. */
 export function _resetForTests() {

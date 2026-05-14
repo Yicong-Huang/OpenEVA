@@ -118,6 +118,29 @@ export interface PRDetail {
   }>
 }
 
+/** A single inline comment attached to my pending (draft) review on a PR.
+ *  Mirrors the subset of GitHub's review-comment fields the UI needs to
+ *  render the comment inline at its file:line + offer a delete button. */
+export interface PendingReviewComment {
+  id: number
+  path: string
+  /** File line number when GitHub has anchored the draft to one, OR a
+   *  fallback to `position` when not (drafts often only carry the diff
+   *  position). For matching against a rendered diff prefer `position`. */
+  line: number | null
+  /** 1-based position within the unified diff (counts every line below
+   *  the first `@@`). Stable across drafts/finalized comments, so this
+   *  is what the file-diff renderer matches on to place the comment
+   *  inline at the right row. */
+  position: number | null
+  side: 'LEFT' | 'RIGHT'
+  start_line: number | null
+  start_side: 'LEFT' | 'RIGHT' | null
+  body: string
+  created_at: string
+  in_reply_to_id: number | null
+}
+
 export interface ActionDef {
   id: string
   label: string

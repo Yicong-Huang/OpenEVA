@@ -959,3 +959,281 @@ def submit_pr_review(payload: PRReviewSubmit):
         "pr_number": payload.number,
     }, persist=False)
     return {"ok": True, "event": event}
+
+
+# ---------------------------------------------------------------------------
+# Pending (draft) reviews -- inline comments accumulate as a draft on
+# GitHub until the user finalizes them with Approve / Request changes /
+# Comment. Storage is GitHub-native (PENDING review state), Eva owns no
+# persistence: every call below is a thin wrapper over `gh api`.
+# ---------------------------------------------------------------------------
+
+def _my_pending_review(repo: str, number: int) -> dict | None:
+    """Return my open pending review for (repo, number), or None.
+
+    GitHub allows at most one pending review per (user, PR). We
+    identify "mine" by matching the configured gh account login for
+    this repo against `user.login` on each PENDING review.
+    """
+    me = app_state.gh_account_for_repo(repo)
+    if not me:
+        return None
+    reviews = app_state.gh_run_json(
+        ["gh", "api", f"repos/{repo}/pulls/{number}/reviews",
+         "--paginate"],
+        repo=repo, default=[],
+    )
+    if not isinstance(reviews, list):
+        return None
+    for r in reviews:
+        if (r.get("state") == "PENDING"
+                and (r.get("user") or {}).get("login") == me):
+            return r
+    return None
+
+
+def _pending_review_comments(repo: str, number: int, review_id: int) -> list[dict]:
+    """List the inline comments attached to a specific pending review.
+
+    Uses the per-review comments endpoint
+    (`/pulls/{n}/reviews/{review_id}/comments`) rather than the PR-wide
+    `/pulls/{n}/comments`: GitHub does NOT include unsubmitted draft
+    comments in the PR-wide list, so the filter-by-review-id approach
+    silently returned an empty set. `line`/`original_line` are also
+    `null` for some pending lines (only `position`/`original_position`
+    are set until the review is submitted), so the fallback chain
+    picks the first non-null value.
+    """
+    raw = app_state.gh_run_json(
+        ["gh", "api",
+         f"repos/{repo}/pulls/{number}/reviews/{review_id}/comments",
+         "--paginate"],
+        repo=repo, default=[],
+    )
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for c in raw:
+        # Drafts not yet pinned to a fixed line still carry `position`
+        # / `original_position`. Surface whichever is set so the UI
+        # always has *something* to render under the file path.
+        line = (
+            c.get("line")
+            or c.get("original_line")
+            or c.get("position")
+            or c.get("original_position")
+        )
+        out.append({
+            "id": c.get("id"),
+            "path": c.get("path", ""),
+            "line": line,
+            "position": c.get("position") or c.get("original_position"),
+            "side": c.get("side", "RIGHT"),
+            "start_line": c.get("start_line"),
+            "start_side": c.get("start_side"),
+            "body": c.get("body", ""),
+            "created_at": c.get("created_at", ""),
+            "in_reply_to_id": c.get("in_reply_to_id"),
+        })
+    return out
+
+
+@app_state.app.get("/api/pr-pending-review")
+def get_pr_pending_review(repo: str, number: int):
+    """Return my draft (PENDING) review on (repo, number).
+
+    Shape: `{ review_id, body, comments: [...] }` if one exists, or
+    `{ review_id: null, comments: [] }` when there's no draft yet.
+    Surfaces the same data the GitHub web UI shows under "Your
+    pending review", so the PR detail page can render it inline.
+    """
+    review = _my_pending_review(repo, number)
+    if not review:
+        return {"review_id": None, "body": "", "comments": []}
+    return {
+        "review_id": review.get("id"),
+        "body": review.get("body", "") or "",
+        "comments": _pending_review_comments(
+            repo, number, int(review.get("id"))),
+    }
+
+
+class PendingCommentBody(BaseModel):
+    repo: str
+    number: int
+    path: str
+    line: int                     # the line being commented on (in the diff)
+    body: str
+    side: str = "RIGHT"           # RIGHT (added) / LEFT (removed)
+    start_line: Optional[int] = None  # for multi-line comments
+    start_side: Optional[str] = None
+
+
+def _pr_head_sha(repo: str, number: int) -> str:
+    info = app_state.gh_run_json(
+        ["gh", "api", f"repos/{repo}/pulls/{number}",
+         "--jq", ".head.sha"],
+        repo=repo, default="",
+    )
+    return info if isinstance(info, str) else ""
+
+
+@app_state.app.post("/api/pr-pending-comment")
+def add_pending_comment(payload: PendingCommentBody):
+    """Add an inline comment to my pending review on (repo, number).
+
+    Two-path implementation:
+      * No pending review yet: create one with this single comment.
+        `POST /pulls/{n}/reviews` accepts a `comments` array; omitting
+        `event` makes the review stay in PENDING state.
+      * Pending review exists: attach the comment to it via
+        `POST /pulls/{n}/comments` with `pull_request_review_id`
+        and the PR's head SHA (commit_id is required by that
+        endpoint, even when the comment is destined for a draft).
+    """
+    body = (payload.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=422, detail="body is required")
+    existing = _my_pending_review(payload.repo, payload.number)
+    if existing is None:
+        # Create a pending review carrying this first comment.
+        comment_obj = {
+            "path": payload.path,
+            "body": body,
+            "line": payload.line,
+            "side": payload.side,
+        }
+        if payload.start_line is not None:
+            comment_obj["start_line"] = payload.start_line
+            comment_obj["start_side"] = payload.start_side or payload.side
+        gh_args = [
+            "gh", "api",
+            f"repos/{payload.repo}/pulls/{payload.number}/reviews",
+            "--method", "POST",
+            "--input", "-",
+        ]
+        # Use stdin (-) to ship the JSON body; --raw-field on a nested
+        # array would need shell-escaping that gh CLI doesn't expose.
+        proc_result = app_state.gh_run(
+            gh_args, repo=payload.repo,
+            input_text=_json.dumps({"comments": [comment_obj]}),
+        )
+        if proc_result.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"gh api failed: {proc_result.stderr.strip()[:400]}",
+            )
+        new_review = _json.loads(proc_result.stdout or "{}")
+        return {
+            "review_id": new_review.get("id"),
+            "created": True,
+        }
+    # Extend an existing pending review.
+    head_sha = _pr_head_sha(payload.repo, payload.number)
+    if not head_sha:
+        raise HTTPException(status_code=502, detail="couldn't resolve PR head SHA")
+    args = [
+        "gh", "api",
+        f"repos/{payload.repo}/pulls/{payload.number}/comments",
+        "--method", "POST",
+        "-f", f"body={body}",
+        "-f", f"commit_id={head_sha}",
+        "-f", f"path={payload.path}",
+        "-F", f"line={payload.line}",
+        "-f", f"side={payload.side}",
+        "-F", f"pull_request_review_id={existing.get('id')}",
+    ]
+    if payload.start_line is not None:
+        args += ["-F", f"start_line={payload.start_line}"]
+        args += ["-f", f"start_side={payload.start_side or payload.side}"]
+    app_state.gh_run_or_raise(args, repo=payload.repo)
+    return {"review_id": existing.get("id"), "created": False}
+
+
+@app_state.app.delete("/api/pr-pending-comment")
+def delete_pending_comment(repo: str, comment_id: int):
+    """Remove an inline comment from my pending review.
+
+    Uses the standard review-comment delete endpoint; GitHub
+    cleans up the row on the draft review without affecting other
+    pending lines.
+    """
+    app_state.gh_run_or_raise(
+        ["gh", "api",
+         f"repos/{repo}/pulls/comments/{comment_id}",
+         "--method", "DELETE"],
+        repo=repo,
+    )
+    return {"ok": True}
+
+
+class PendingSubmit(BaseModel):
+    repo: str
+    number: int
+    event: str          # APPROVE | REQUEST_CHANGES | COMMENT
+    body: str = ""      # overall review body, optional for APPROVE
+
+
+@app_state.app.post("/api/pr-pending-review/submit")
+def submit_pending_review(payload: PendingSubmit):
+    """Finalize the draft (PENDING) review with the chosen event.
+
+    If there are no inline comments yet AND the user wants to send
+    just a top-level body, we still POST a fresh non-pending review
+    -- matches the GitHub UI's "Review changes" dialog behavior.
+    Otherwise we look up the existing pending review and submit it
+    via `POST /pulls/{n}/reviews/{id}/events`, attaching the optional
+    body.
+    """
+    event = (payload.event or "").upper()
+    if event not in _REVIEW_EVENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"event must be one of {sorted(_REVIEW_EVENTS)}; got {payload.event!r}",
+        )
+    body = (payload.body or "").strip()
+    if event != "APPROVE" and not body:
+        # Stay consistent with GitHub's rule and the immediate-submit
+        # endpoint above -- COMMENT / REQUEST_CHANGES require a body.
+        raise HTTPException(
+            status_code=422, detail=f"body is required when event={event}")
+    existing = _my_pending_review(payload.repo, payload.number)
+    if existing is None:
+        # No draft to finalize -- delegate to the immediate-submit path
+        # so the user can still send a body-only review without first
+        # opening a pending one.
+        return submit_pr_review(PRReviewSubmit(
+            repo=payload.repo, number=payload.number, event=event, body=body,
+        ))
+    args = [
+        "gh", "api",
+        f"repos/{payload.repo}/pulls/{payload.number}/reviews/{existing.get('id')}/events",
+        "--method", "POST",
+        "-f", f"event={event}",
+    ]
+    if body:
+        args += ["-f", f"body={body}"]
+    app_state.gh_run_or_raise(args, repo=payload.repo)
+    _event_to_state = {
+        "APPROVE": "approved",
+        "REQUEST_CHANGES": "changes_requested",
+        "COMMENT": "commented",
+    }
+    canonical = f"https://github.com/{payload.repo}/pull/{payload.number}"
+    existing_row = app_state._db.get_review_pr(canonical)
+    if existing_row:
+        app_state._db.upsert_review_pr(
+            url=canonical,
+            repo=existing_row["repo"],
+            number=existing_row["number"],
+            my_review_state=_event_to_state[event],
+        )
+    app_state._db.mark_pr_dirty(payload.number)
+    app_state._db.mark_review_pr_dirty(number=payload.number)
+    app_state.emit_event("github.pr.updated", {
+        "title": f"Review {event.lower().replace('_', ' ')} submitted on #{payload.number}",
+        "message": (body[:200] or event),
+        "severity": "info",
+        "pr_number": payload.number,
+    }, persist=False)
+    return {"ok": True, "event": event}
