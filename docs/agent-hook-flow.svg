@@ -1,0 +1,335 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1480 1180" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
+  <defs>
+    <!-- Background gradient (Eva dark theme) -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <!-- Card gradients -->
+    <linearGradient id="cardBlue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#172033"/>
+    </linearGradient>
+    <linearGradient id="cardAmber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a1f0c"/>
+      <stop offset="1" stop-color="#1c1407"/>
+    </linearGradient>
+    <linearGradient id="cardPurple" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#221d3d"/>
+      <stop offset="1" stop-color="#16132a"/>
+    </linearGradient>
+    <linearGradient id="cardGreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0e2a1f"/>
+      <stop offset="1" stop-color="#0a1c14"/>
+    </linearGradient>
+
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity="0.55"/>
+    </filter>
+
+    <!-- Arrow heads -->
+    <marker id="arr" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0,1 L10,6 L0,11 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrAccent" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0,1 L10,6 L0,11 z" fill="#818cf8"/>
+    </marker>
+    <marker id="arrAmber" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0,1 L10,6 L0,11 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrGreen" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M0,1 L10,6 L0,11 z" fill="#10b981"/>
+    </marker>
+  </defs>
+
+  <rect width="1480" height="1180" fill="url(#bg)"/>
+
+  <!-- Title -->
+  <text x="740" y="46" text-anchor="middle" font-size="22" font-weight="700" fill="#f1f5f9" letter-spacing="0.4">
+    Agent hook &#8594; Eva event pipeline
+  </text>
+  <text x="740" y="70" text-anchor="middle" font-size="12" fill="#94a3b8">
+    where each hook fires &#8226; the eva event it produces &#8226; the downstream handlers it wakes up
+  </text>
+
+  <!-- =========================================================== -->
+  <!-- Row 1: Agent + 5 hook types                                  -->
+  <!-- =========================================================== -->
+
+  <!-- Agent box -->
+  <rect x="600" y="100" width="280" height="64" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1" filter="url(#shadow)"/>
+  <text x="740" y="123" text-anchor="middle" font-size="13" font-weight="700" fill="#e2e8f0">Claude Code in tmux</text>
+  <text x="740" y="143" text-anchor="middle" font-size="10" fill="#94a3b8">one session per task / review / cron job</text>
+  <text x="740" y="157" text-anchor="middle" font-size="9" fill="#64748b" font-family="ui-monospace, monospace">eva-hook.sh registered in agent settings</text>
+
+  <!-- Hook event labels row -->
+  <text x="80" y="208" font-size="11" font-weight="600" fill="#94a3b8" letter-spacing="0.8" text-transform="uppercase">
+    HOOK EVENTS (each fires at a different moment in the agent's lifecycle)
+  </text>
+
+  <!-- 5 hook event boxes -->
+  <!-- SessionStart -->
+  <g>
+    <rect x="60" y="226" width="250" height="92" rx="8" fill="url(#cardAmber)" stroke="#f59e0b" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="80" y="248" font-size="9" font-weight="800" fill="#f59e0b" letter-spacing="0.8">HOOK</text>
+    <text x="80" y="269" font-size="14" font-weight="700" fill="#fbbf24" font-family="ui-monospace, monospace">SessionStart</text>
+    <text x="80" y="289" font-size="10" fill="#cbd5e1">When the agent process</text>
+    <text x="80" y="302" font-size="10" fill="#cbd5e1">first comes up (new or</text>
+    <text x="80" y="315" font-size="10" fill="#cbd5e1">resume).</text>
+  </g>
+
+  <!-- UserPromptSubmit -->
+  <g>
+    <rect x="334" y="226" width="250" height="92" rx="8" fill="url(#cardAmber)" stroke="#f59e0b" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="354" y="248" font-size="9" font-weight="800" fill="#f59e0b" letter-spacing="0.8">HOOK</text>
+    <text x="354" y="269" font-size="14" font-weight="700" fill="#fbbf24" font-family="ui-monospace, monospace">UserPromptSubmit</text>
+    <text x="354" y="289" font-size="10" fill="#cbd5e1">You hit Enter on a new</text>
+    <text x="354" y="302" font-size="10" fill="#cbd5e1">message; agent is about</text>
+    <text x="354" y="315" font-size="10" fill="#cbd5e1">to start processing.</text>
+  </g>
+
+  <!-- Stop -->
+  <g>
+    <rect x="608" y="226" width="250" height="92" rx="8" fill="url(#cardAmber)" stroke="#f59e0b" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="628" y="248" font-size="9" font-weight="800" fill="#f59e0b" letter-spacing="0.8">HOOK</text>
+    <text x="628" y="269" font-size="14" font-weight="700" fill="#fbbf24" font-family="ui-monospace, monospace">Stop</text>
+    <text x="628" y="289" font-size="10" fill="#cbd5e1">Agent finished its turn</text>
+    <text x="628" y="302" font-size="10" fill="#cbd5e1">and is back at the prompt</text>
+    <text x="628" y="315" font-size="10" fill="#cbd5e1">cursor.</text>
+  </g>
+
+  <!-- Notification: idle_prompt -->
+  <g>
+    <rect x="882" y="226" width="250" height="92" rx="8" fill="url(#cardAmber)" stroke="#f59e0b" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="902" y="248" font-size="9" font-weight="800" fill="#f59e0b" letter-spacing="0.8">HOOK / NOTIFICATION</text>
+    <text x="902" y="269" font-size="14" font-weight="700" fill="#fbbf24" font-family="ui-monospace, monospace">: idle_prompt</text>
+    <text x="902" y="289" font-size="10" fill="#cbd5e1">Agent has been sitting</text>
+    <text x="902" y="302" font-size="10" fill="#cbd5e1">idle at prompt for a</text>
+    <text x="902" y="315" font-size="10" fill="#cbd5e1">while (gentle nudge).</text>
+  </g>
+
+  <!-- Notification: permission_prompt -->
+  <g>
+    <rect x="1156" y="226" width="252" height="92" rx="8" fill="url(#cardAmber)" stroke="#ef4444" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="1176" y="248" font-size="9" font-weight="800" fill="#ef4444" letter-spacing="0.8">HOOK / NOTIFICATION</text>
+    <text x="1176" y="269" font-size="14" font-weight="700" fill="#fca5a5" font-family="ui-monospace, monospace">: permission_prompt</text>
+    <text x="1176" y="289" font-size="10" fill="#cbd5e1">Agent is asking for a</text>
+    <text x="1176" y="302" font-size="10" fill="#cbd5e1">tool-use approval and</text>
+    <text x="1176" y="315" font-size="10" fill="#cbd5e1">cannot proceed yet.</text>
+  </g>
+
+  <!-- Lines from Agent box down to the 5 hook boxes -->
+  <path d="M 740 164 L 740 195 L 185 195 L 185 226" fill="none" stroke="#475569" stroke-width="1" marker-end="url(#arr)"/>
+  <path d="M 740 195 L 459 195 L 459 226" fill="none" stroke="#475569" stroke-width="1" marker-end="url(#arr)"/>
+  <path d="M 740 195 L 733 195 L 733 226" fill="none" stroke="#475569" stroke-width="1" marker-end="url(#arr)"/>
+  <path d="M 740 195 L 1007 195 L 1007 226" fill="none" stroke="#475569" stroke-width="1" marker-end="url(#arr)"/>
+  <path d="M 740 195 L 1282 195 L 1282 226" fill="none" stroke="#475569" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- =========================================================== -->
+  <!-- Row 2: eva-hook.sh bridge                                   -->
+  <!-- =========================================================== -->
+
+  <!-- arrows from each hook box down to the eva-hook.sh box -->
+  <path d="M 185 318 L 185 360 L 580 360 L 580 386" fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path d="M 459 318 L 459 358 L 640 358 L 640 386" fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path d="M 733 318 L 733 386" fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path d="M 1007 318 L 1007 358 L 826 358 L 826 386" fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+  <path d="M 1282 318 L 1282 360 L 886 360 L 886 386" fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <rect x="560" y="386" width="360" height="64" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1" filter="url(#shadow)"/>
+  <text x="740" y="410" text-anchor="middle" font-size="13" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">eva-hook.sh</text>
+  <text x="740" y="427" text-anchor="middle" font-size="10" fill="#94a3b8">resolves the tmux session name via $TMUX / parent-pid walk</text>
+  <text x="740" y="442" text-anchor="middle" font-size="10" fill="#94a3b8">POST { session, event, data } &#8594; /api/hook (background curl)</text>
+
+  <!-- Arrow down -->
+  <path d="M 740 450 L 740 488" fill="none" stroke="#818cf8" stroke-width="1.5" marker-end="url(#arrAccent)"/>
+  <text x="755" y="475" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">HTTP POST</text>
+
+  <!-- =========================================================== -->
+  <!-- Row 3: /api/hook backend                                    -->
+  <!-- =========================================================== -->
+
+  <rect x="280" y="488" width="920" height="180" rx="10" fill="url(#cardPurple)" stroke="#818cf8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="300" y="513" font-size="9" font-weight="800" fill="#a5b4fc" letter-spacing="0.8">BACKEND</text>
+  <text x="300" y="535" font-size="15" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">POST /api/hook  (receive_hook)</text>
+  <text x="300" y="552" font-size="10" fill="#94a3b8" font-family="ui-monospace, monospace">core/src/routes/sessions.py</text>
+
+  <!-- Inner: rule table -->
+  <text x="300" y="582" font-size="11" font-weight="700" fill="#cbd5e1" letter-spacing="0.4">1. Resolve rule &#8594; (new_state, emit_type)</text>
+
+  <!-- 5 rule rows -->
+  <g font-family="ui-monospace, monospace" font-size="10">
+    <!-- Headers -->
+    <text x="320" y="605" font-size="9" fill="#64748b" letter-spacing="0.6">HOOK</text>
+    <text x="500" y="605" font-size="9" fill="#64748b" letter-spacing="0.6">STATE</text>
+    <text x="640" y="605" font-size="9" fill="#64748b" letter-spacing="0.6">EVA EVENT EMITTED</text>
+    <text x="920" y="605" font-size="9" fill="#64748b" letter-spacing="0.6">SEVERITY</text>
+
+    <!-- Rows -->
+    <text x="320" y="620" fill="#fbbf24">SessionStart</text>
+    <text x="500" y="620" fill="#10b981">starting</text>
+    <text x="640" y="620" fill="#a5b4fc">agent.session_start</text>
+    <text x="920" y="620" fill="#94a3b8">info</text>
+
+    <text x="320" y="636" fill="#fbbf24">UserPromptSubmit</text>
+    <text x="500" y="636" fill="#facc15">thinking</text>
+    <text x="640" y="636" fill="#a5b4fc">agent.prompt_submit</text>
+    <text x="920" y="636" fill="#94a3b8">info</text>
+
+    <text x="320" y="652" fill="#fbbf24">Stop</text>
+    <text x="500" y="652" fill="#10b981">idle</text>
+    <text x="640" y="652" fill="#a5b4fc">agent.task_done</text>
+    <text x="920" y="652" fill="#94a3b8">info</text>
+
+    <text x="320" y="668" fill="#fbbf24">Notification:idle_prompt</text>
+    <text x="500" y="668" fill="#10b981">idle</text>
+    <text x="640" y="668" fill="#a5b4fc">agent.needs_input</text>
+    <text x="920" y="668" fill="#94a3b8">info</text>
+
+    <text x="320" y="684" fill="#fca5a5">Notification:permission_prompt</text>
+    <text x="500" y="684" fill="#ef4444">needs_permission</text>
+    <text x="640" y="684" fill="#fca5a5">agent.needs_permission</text>
+    <text x="920" y="684" fill="#fca5a5">warning</text>
+  </g>
+
+  <!-- Dispatcher hint -->
+  <text x="300" y="708" font-size="11" font-weight="700" fill="#cbd5e1" letter-spacing="0.4">2. Per-session-family side effects (in priority order)</text>
+
+  <!-- =========================================================== -->
+  <!-- Row 4: 3 session-family branches                            -->
+  <!-- =========================================================== -->
+
+  <!-- Connector down to the 3 branches -->
+  <path d="M 740 668 L 740 740" fill="none" stroke="#818cf8" stroke-width="1.5" marker-end="url(#arrAccent)"/>
+
+  <!-- Family: cron-* -->
+  <g>
+    <rect x="60" y="740" width="420" height="124" rx="8" fill="url(#cardGreen)" stroke="#10b981" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="80" y="763" font-size="9" font-weight="800" fill="#34d399" letter-spacing="0.8">SESSION FAMILY</text>
+    <text x="80" y="784" font-size="14" font-weight="700" fill="#bbf7d0" font-family="ui-monospace, monospace">cron-&lt;slug&gt;-&lt;id&gt;</text>
+    <text x="80" y="804" font-size="10" fill="#cbd5e1">Only Stop triggers here:</text>
+    <text x="80" y="819" font-size="10" fill="#a3e6c5" font-family="ui-monospace, monospace">finish_run_for_session(...)</text>
+    <text x="80" y="836" font-size="10" fill="#94a3b8">stamps cron_job_runs row terminal so</text>
+    <text x="80" y="850" font-size="10" fill="#94a3b8">duration reflects "agent done", not tick.</text>
+  </g>
+
+  <!-- Family: review-* -->
+  <g>
+    <rect x="500" y="740" width="420" height="124" rx="8" fill="url(#cardGreen)" stroke="#10b981" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="520" y="763" font-size="9" font-weight="800" fill="#34d399" letter-spacing="0.8">SESSION FAMILY</text>
+    <text x="520" y="784" font-size="14" font-weight="700" fill="#bbf7d0" font-family="ui-monospace, monospace">review-&lt;owner&gt;-&lt;repo&gt;-&lt;n&gt;</text>
+    <text x="520" y="804" font-size="10" fill="#cbd5e1">All events; row mirror + audit:</text>
+    <text x="520" y="819" font-size="10" fill="#a3e6c5" font-family="ui-monospace, monospace">upsert review_prs (workflow=active,</text>
+    <text x="520" y="833" font-size="10" fill="#a3e6c5" font-family="ui-monospace, monospace">  agent_session_id on SessionStart)</text>
+    <text x="520" y="848" font-size="10" fill="#a3e6c5" font-family="ui-monospace, monospace">append review_history (audit log)</text>
+  </g>
+
+  <!-- Family: task -->
+  <g>
+    <rect x="940" y="740" width="468" height="124" rx="8" fill="url(#cardGreen)" stroke="#10b981" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="960" y="763" font-size="9" font-weight="800" fill="#34d399" letter-spacing="0.8">SESSION FAMILY</text>
+    <text x="960" y="784" font-size="14" font-weight="700" fill="#bbf7d0" font-family="ui-monospace, monospace">&lt;task-id&gt;  (everything else)</text>
+    <text x="960" y="804" font-size="10" fill="#cbd5e1">SessionStart only -- captures the UUID:</text>
+    <text x="960" y="819" font-size="10" fill="#a3e6c5" font-family="ui-monospace, monospace">sessions.agent_session_id = data.session_id</text>
+    <text x="960" y="836" font-size="10" fill="#94a3b8">so a later resume after tmux death can</text>
+    <text x="960" y="850" font-size="10" fill="#94a3b8">re-attach the same conversation.</text>
+  </g>
+
+  <!-- Connectors from /api/hook to the 3 branches -->
+  <path d="M 740 740 L 740 730 L 270 730 L 270 740" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+  <path d="M 740 740 L 710 740" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+  <path d="M 740 740 L 740 730 L 1174 730 L 1174 740" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+
+  <!-- =========================================================== -->
+  <!-- Row 5: emit_event + session_state.set_state                 -->
+  <!-- =========================================================== -->
+
+  <rect x="280" y="892" width="920" height="58" rx="8" fill="#0c2944" stroke="#3b82f6" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="300" y="915" font-size="9" font-weight="800" fill="#93c5fd" letter-spacing="0.8">COMMON TAIL</text>
+  <text x="300" y="934" font-size="11" fill="#cbd5e1" font-family="ui-monospace, monospace">
+    session_state.set_state(name, state=new_state)  &#8594;  patches in-memory cache + emits  session.state  SSE
+  </text>
+  <text x="300" y="948" font-size="11" fill="#cbd5e1" font-family="ui-monospace, monospace">
+    app_state.emit_event(emit_type, data)            &#8594;  persists to events DB + emits  agent.&lt;...&gt;     SSE
+  </text>
+
+  <!-- Connector from 3 branches down to common tail -->
+  <path d="M 270 864 L 270 892" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+  <path d="M 710 864 L 710 892" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+  <path d="M 1174 864 L 1174 892" fill="none" stroke="#10b981" stroke-width="1.2" marker-end="url(#arrGreen)"/>
+
+  <!-- =========================================================== -->
+  <!-- Row 6: SSE bus + frontend handlers                          -->
+  <!-- =========================================================== -->
+
+  <path d="M 740 950 L 740 978" fill="none" stroke="#818cf8" stroke-width="1.8" marker-end="url(#arrAccent)"/>
+  <text x="755" y="970" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">GET /api/events/stream (SSE)</text>
+
+  <!-- Bus bar -->
+  <rect x="60" y="978" width="1348" height="22" rx="11" fill="#1e293b" stroke="#818cf8" stroke-width="1" filter="url(#shadow)"/>
+  <text x="734" y="993" text-anchor="middle" font-size="11" font-weight="700" fill="#a5b4fc" letter-spacing="0.4" font-family="ui-monospace, monospace">
+    useEventBus  (single SSE per tab, fans out by event-type prefix wildcards)
+  </text>
+
+  <!-- 4 handler columns -->
+  <!-- 1. SessionStatusProvider -->
+  <g>
+    <rect x="60" y="1018" width="340" height="142" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="80" y="1040" font-size="9" font-weight="800" fill="#7dd3fc" letter-spacing="0.8">FRONTEND HANDLER</text>
+    <text x="80" y="1060" font-size="13" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">SessionStatusProvider</text>
+    <text x="80" y="1078" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">session.state          &#8594; patch snapshot</text>
+    <text x="80" y="1093" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">session.snapshot.*    &#8594; full replay</text>
+    <text x="80" y="1108" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">task.*                     &#8594; refetchSessions</text>
+    <text x="80" y="1123" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">github.* / review.*  &#8594; refetchReviews</text>
+    <text x="80" y="1138" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">ticket.*                   &#8594; refetchTickets</text>
+    <text x="80" y="1153" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">session.killed         &#8594; refetchSessions</text>
+  </g>
+
+  <!-- 2. ProjectPage -->
+  <g>
+    <rect x="416" y="1018" width="340" height="142" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="436" y="1040" font-size="9" font-weight="800" fill="#7dd3fc" letter-spacing="0.8">FRONTEND HANDLER</text>
+    <text x="436" y="1060" font-size="13" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">ProjectPage (graph view)</text>
+    <text x="436" y="1078" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">agent.*    &#8594; refetchProject</text>
+    <text x="436" y="1093" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">session.*  &#8594; refetchProject</text>
+    <text x="436" y="1108" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">github.*   &#8594; refetchProject</text>
+    <text x="436" y="1123" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">task.*     &#8594; (project-scoped re-render)</text>
+    <text x="436" y="1144" font-size="9" fill="#64748b">Drives the graph, TaskCard panel,</text>
+    <text x="436" y="1156" font-size="9" fill="#64748b">and the live status pills.</text>
+  </g>
+
+  <!-- 3. EventStatus -->
+  <g>
+    <rect x="772" y="1018" width="320" height="142" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="792" y="1040" font-size="9" font-weight="800" fill="#7dd3fc" letter-spacing="0.8">FRONTEND HANDLER</text>
+    <text x="792" y="1060" font-size="13" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">EventStatus (top-bar)</text>
+    <text x="792" y="1078" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">agent.task_done         &#8594; refresh feed</text>
+    <text x="792" y="1093" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">agent.needs_permission  &#8594; refresh feed</text>
+    <text x="792" y="1108" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">github.*                &#8594; refresh feed</text>
+    <text x="792" y="1123" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">auth.* / slack.*        &#8594; refresh feed</text>
+    <text x="792" y="1144" font-size="9" fill="#64748b">The bell-icon dropdown surfaces</text>
+    <text x="792" y="1156" font-size="9" fill="#64748b">the persisted event log.</text>
+  </g>
+
+  <!-- 4. ReviewCard + others -->
+  <g>
+    <rect x="1108" y="1018" width="300" height="142" rx="8" fill="url(#cardBlue)" stroke="#475569" stroke-width="1.2" filter="url(#shadow)"/>
+    <text x="1128" y="1040" font-size="9" font-weight="800" fill="#7dd3fc" letter-spacing="0.8">FRONTEND HANDLER</text>
+    <text x="1128" y="1060" font-size="13" font-weight="700" fill="#e2e8f0" font-family="ui-monospace, monospace">ReviewCard / PRCard</text>
+    <text x="1128" y="1078" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">review.*    &#8594; reload history,</text>
+    <text x="1128" y="1090" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">                     pending-review badge</text>
+    <text x="1128" y="1108" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">github.*    &#8594; "PR has update"</text>
+    <text x="1128" y="1120" font-size="9" fill="#94a3b8" font-family="ui-monospace, monospace">                     dot on header</text>
+    <text x="1128" y="1144" font-size="9" fill="#64748b">Plus countless per-component</text>
+    <text x="1128" y="1156" font-size="9" fill="#64748b">listeners on focused screens.</text>
+  </g>
+
+  <!-- Lines from SSE bus down to each handler -->
+  <path d="M 230 1000 L 230 1018" fill="none" stroke="#818cf8" stroke-width="1.2" marker-end="url(#arrAccent)"/>
+  <path d="M 586 1000 L 586 1018" fill="none" stroke="#818cf8" stroke-width="1.2" marker-end="url(#arrAccent)"/>
+  <path d="M 932 1000 L 932 1018" fill="none" stroke="#818cf8" stroke-width="1.2" marker-end="url(#arrAccent)"/>
+  <path d="M 1258 1000 L 1258 1018" fill="none" stroke="#818cf8" stroke-width="1.2" marker-end="url(#arrAccent)"/>
+
+</svg>
