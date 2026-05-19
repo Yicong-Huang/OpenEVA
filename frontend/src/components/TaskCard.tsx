@@ -41,7 +41,7 @@ export function TaskCard({
   const [syncColor, setSyncColor] = useState<string | undefined>(undefined)
   const [pendingAction, setPendingAction] = useState<'opening' | 'killing' | null>(null)
   const [shouldAutoExpand, setShouldAutoExpand] = useState(false)
-  const { alert, prompt, promptWithCheckbox } = useAlert()
+  const { alert, prompt, promptWithCheckbox, confirmAt } = useAlert()
 
   const tasks = project.tasks || {}
   const task = tasks[taskId] || ({} as Task)
@@ -152,6 +152,41 @@ export function TaskCard({
     // Don't clear pendingAction here -- the event bus refetch will
     // refresh the session row and pendingAction unsets naturally.
   }, [launch, onOpenAction])
+
+  // Click handler for the "Do This Task" button. When the project
+  // uses tickets and this task doesn't have one yet, bubble-prompt the
+  // user: should the agent create the JIRA ticket first, then dive
+  // into implementation? Picking "yes" ships both prompts (create
+  // ticket -> do task) as a single combined customPrompt so the
+  // agent runs them in one session without having to re-prompt.
+  const handleDoTask = useCallback(async (e: React.MouseEvent) => {
+    const needsTicket = hasTickets && !ticketId
+    if (!needsTicket) {
+      handleAction('do-task')
+      return
+    }
+    const yes = await confirmAt(
+      {
+        title: 'Create JIRA ticket first?',
+        message: 'This task has no ticket yet. Creating one first lets the work be tracked + linked to the right epic before the agent starts.',
+        confirmLabel: 'Yes, create ticket first',
+        cancelLabel: 'Just do the task',
+      },
+      { x: e.clientX, y: e.clientY },
+    )
+    if (!yes) {
+      handleAction('do-task')
+      return
+    }
+    const createTicket = actions.find((a) => a.id === 'create-ticket')
+    const doTask = actions.find((a) => a.id === 'do-task')
+    const combined = (
+      `STEP 1: ${(createTicket?.prompt_template || '').trim()}\n\n` +
+      `STEP 2 (only after the ticket is created and linked to this task): ` +
+      `${(doTask?.prompt_template || '').trim()}`
+    )
+    handleAction('do-task', undefined, undefined, combined)
+  }, [hasTickets, ticketId, actions, handleAction, confirmAt])
 
   // React to external action trigger (e.g. Ask Agent from PRDetail).
   // Guard with `taskId` when present: the parent's externalAction state
@@ -504,7 +539,13 @@ export function TaskCard({
             <ActionButton
               key={a.id}
               label={a.label}
-              onClick={() => handleAction(a.id)}
+              // "Do This Task" gets the create-ticket-first bubble
+              // prompt when the project tracks tickets and this task
+              // doesn't have one yet. All other actions go through
+              // the bare handleAction path.
+              onClick={a.id === 'do-task'
+                ? (e: React.MouseEvent) => handleDoTask(e)
+                : () => handleAction(a.id)}
             />
           ))}
         {status !== 'closed' && (

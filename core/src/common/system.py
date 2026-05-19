@@ -2,7 +2,12 @@
 
 import json as _json
 import re as _re
-import sqlite3
+# pysqlite3 fallback -- see app_state.py / eva_db.py for why mixing
+# stdlib sqlite3 with pysqlite3 on the same DB file corrupts the WAL.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[no-redef]
 import subprocess
 import time as _time
 import threading

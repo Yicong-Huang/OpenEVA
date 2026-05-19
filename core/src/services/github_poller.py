@@ -10,7 +10,11 @@ Previously this module owned its own daemon thread; see
 """
 
 import re as _re
-import sqlite3
+# pysqlite3 fallback -- see app_state.py for why mixing engines corrupts the WAL.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[no-redef]
 import time as _time
 
 import app_state

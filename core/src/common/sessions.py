@@ -226,6 +226,44 @@ def resume_session(session_name):
         action = "relaunched"
     launch_session_argv(session_name, working_dir, argv)
 
+    # Flip the snapshot to `starting` immediately so the SessionCard
+    # stops showing `stopped` (the state it was in while crashed).
+    from . import session_state
+    inferred_kind = session_state._infer_kind(session_name)
+    task_id = session.get("task_id", "") or ""
+    session_state.set_state(
+        session_name,
+        state="starting",
+        detail=f"resume ({action})",
+        kind=inferred_kind,
+        project_id=project_id,
+        target_id=task_id,
+        agent_session_id=uuid,
+    )
+
+    # `claude resume <uuid>` does NOT fire the SessionStart hook
+    # (only fresh `claude` invocations do), so without this nudge the
+    # snapshot would stay at 'starting' until the user typed a prompt
+    # (UserPromptSubmit -> thinking) or the agent went idle (no hook
+    # fires when nothing is happening). Schedule a one-shot tmux-pane
+    # re-read so we can flip to whatever the TUI actually shows --
+    # idle / thinking / needs_permission. Five seconds is enough for
+    # claude's startup + TUI paint on this host; if the pane is still
+    # blank `_state_from_tmux_pane` falls back to idle anyway.
+    import threading
+    def _refine_state_from_pane():
+        try:
+            state, detail = session_state._state_from_tmux_pane(session_name)
+            session_state.set_state(
+                session_name, state=state, detail=detail or f"resumed ({action})",
+                kind=inferred_kind, project_id=project_id,
+                target_id=task_id, agent_session_id=uuid,
+            )
+        except Exception as exc:
+            print(f"[resume] pane recheck failed for {session_name}: {exc}",
+                  flush=True)
+    threading.Timer(5.0, _refine_state_from_pane).start()
+
     app_state.emit_event("session.opened", {
         "title": f"Session resumed: {session_name}",
         "message": project_id,

@@ -1,7 +1,19 @@
 """Shared application state: singletons, config, GitHub helpers, event bus, tmux helpers."""
 
 import os
-import sqlite3
+# Prefer pysqlite3-binary's modern SQLite (3.51+) over the stdlib
+# build that ships against the host libsqlite3 (often 3.31 on Ubuntu
+# 20.04). Two DIFFERENT sqlite engines hitting the same WAL file at
+# once is the root cause of the recurring "database disk image is
+# malformed" we've been chasing -- EvaDB already uses pysqlite3 but
+# the events-table writers below were on stdlib, so the WAL frames
+# were being read/written by two incompatible engines (3.31 vs 3.51
+# have small differences in WAL frame layout + SHM coordination).
+# Falling back to stdlib only when the wheel isn't installed.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[no-redef]
 import subprocess  # noqa: F401 -- patched by tests (app_state.subprocess)
 import threading
 import uuid as _uuid

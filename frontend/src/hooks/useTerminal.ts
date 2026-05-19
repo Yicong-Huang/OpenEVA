@@ -129,8 +129,35 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
       // (descendant of `container`), and the terminal stops scrolling.
       // Bubble-phase stopPropagation runs *after* xterm has already
       // handled the wheel, so the in-terminal scroll works AND the
-      // event doesn't bubble out to a parent (e.g. page scroll).
-      const wheelHandler = (e: WheelEvent) => { e.stopPropagation() }
+      // event doesn't bubble out to a parent.
+      //
+      // Boundary pass-through: if the user is wheeling in a direction
+      // xterm has NOTHING to scroll (already at the top or bottom of
+      // scrollback), let the event bubble up so the parent pane can
+      // take it. Without this, a fully-expanded SessionCard fills the
+      // pane + locks the parent's `overflow-y: auto` -- the user
+      // perceives "can't scroll the page when my cursor is over the
+      // terminal".
+      const wheelHandler = (e: WheelEvent) => {
+        try {
+          const buf = term.buffer.active
+          // viewportY is the top-of-screen line within the scrollback
+          // buffer; baseY is the bottom-most viewport position (i.e.
+          // "live tail"). Equality at either end means the wheel has
+          // no slack in that direction.
+          const atTop = buf.viewportY <= 0
+          const atBottom = buf.viewportY >= buf.baseY
+          const goingUp = e.deltaY < 0
+          const goingDown = e.deltaY > 0
+          if ((goingUp && atTop) || (goingDown && atBottom)) {
+            return  // let it bubble; parent pane scrolls
+          }
+        } catch {
+          // term not yet open (race during teardown / SSR-ish init):
+          // fall through to the conservative stopPropagation path.
+        }
+        e.stopPropagation()
+      }
       container.addEventListener('wheel', wheelHandler, { passive: true })
 
       onStatusChange?.('')

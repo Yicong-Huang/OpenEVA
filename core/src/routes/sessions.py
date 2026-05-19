@@ -608,7 +608,16 @@ async def wait_for_ready(session_name: str, timeout: int = 30):
             all_lines = lines.split("\n")
             for line in all_lines:
                 stripped = line.strip()
-                if stripped == "\u276f" or stripped.startswith("\u276f "):
+                # The agent TUI separates the `\u276f` prompt arrow from
+                # its content with a non-breaking space (U+00A0), not a
+                # regular space. Match the bare arrow OR arrow + ANY
+                # whitespace so we don't have to enumerate the exact
+                # codepoint claude happens to use in this release.
+                if (
+                    stripped == "\u276f"
+                    or (stripped.startswith("\u276f")
+                        and len(stripped) > 1 and stripped[1].isspace())
+                ):
                     print(f"[wait-ready] {session_name}: idle via tmux prompt detection", flush=True)
                     return {"ready": True, "state": "idle"}
                 if "? for shortcuts" in stripped:
@@ -635,7 +644,13 @@ def _parse_session_state(tmux_output: str):
     """
     all_lines = tmux_output.split("\n")
     all_text = tmux_output.lower()
-    has_prompt = any(l.strip() == "\u276f" or l.strip().startswith("\u276f ") for l in all_lines)
+    # Match `\u276f` standalone OR followed by ANY whitespace (claude's
+    # TUI uses U+00A0 between the arrow and the typed text, not U+0020).
+    def _is_prompt(s: str) -> bool:
+        return s == "\u276f" or (
+            s.startswith("\u276f") and len(s) > 1 and s[1].isspace()
+        )
+    has_prompt = any(_is_prompt(l.strip()) for l in all_lines)
     needs_permission = "esc to cancel" in all_text and "1. yes" in all_text
 
     if has_prompt:

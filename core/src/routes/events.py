@@ -1,7 +1,11 @@
 """Event API routes: SSE stream, get events, mark read, poll status."""
 
 import json as _json
-import sqlite3
+# pysqlite3 fallback -- see app_state.py for why mixing engines corrupts the WAL.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[no-redef]
 
 from pydantic import BaseModel
 from typing import Any, Optional

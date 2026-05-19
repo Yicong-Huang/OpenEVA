@@ -58,10 +58,18 @@ export function repoFromPrUrl(url: string | null | undefined): string {
   return (url || '').replace('https://github.com/', '').split('/pull/')[0] || ''
 }
 
-/** Render markdown to HTML using the marked library, matching vanilla behavior. */
+/** Render markdown to HTML using marked in GitHub-flavored mode.
+ *
+ *  `gfm: true` + `breaks: true` match how GitHub renders the same
+ *  markdown for PR descriptions / comments. Without `breaks` a single
+ *  newline in the source collapses to a space (CommonMark default),
+ *  which makes PR descriptions look like one squashed paragraph
+ *  instead of the layout the author wrote on github.com. */
 export function renderMarkdown(md: string): string {
   try {
-    return marked.parse(md || '', { async: false }) as string
+    return marked.parse(md || '', {
+      async: false, gfm: true, breaks: true,
+    }) as string
   } catch {
     // Fallback: escape HTML
     return (md || '')

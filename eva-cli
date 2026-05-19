@@ -21,7 +21,13 @@ so this preamble uses old-style generics or untyped containers.
 import argparse
 import json
 import os
-import sqlite3
+# Same pysqlite3 fallback as eva_db.py + app_state.py -- mixing
+# stdlib sqlite3 (3.31 on Ubuntu 20.04) with the modern engine
+# corrupts the shared WAL.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3
 import sys
 
 # Bail early on Python <3.9. The Eva codebase uses PEP-585 generics

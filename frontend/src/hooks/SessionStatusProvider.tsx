@@ -141,6 +141,11 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   // is a separate cache -- without an explicit refetch the killed
   // row keeps rendering until the next task/github/ticket event fires.
   useEventBus('session.killed', useCallback(() => refetchSessions(), [refetchSessions]))
+  // Resume flips a `stopped` session back to live. Backend writes
+  // `set_state(starting)` and emits `session.opened` -- the snapshot
+  // gets patched by the former but the `running` flag from
+  // `/api/all-sessions` doesn't update unless we re-fetch the list.
+  useEventBus('session.opened', useCallback(() => refetchSessions(), [refetchSessions]))
 
   // Project visibility toggles change which rows the backend
   // includes in each per-project bundle. Refetch the lists that

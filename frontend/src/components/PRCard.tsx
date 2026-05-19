@@ -8,7 +8,7 @@ import { CISection } from './pr/CISection'
 import { ciResult, isFailed, isNonBlocking } from './pr/ciHelpers'
 import { ReviewSection } from './pr/ReviewSection'
 import { FileList } from './pr/FileList'
-import { InlineComments, GeneralComments } from './pr/CommentThread'
+import { InlineComments, GeneralComments, ReviewSummaries } from './pr/CommentThread'
 import { evalActionCondition } from './TaskCard'
 import { useAlert } from './Alert'
 import { useSessionLauncher } from '../hooks/useSessionLauncher'
@@ -857,6 +857,10 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
         onAskAgent={hasTask ? (commentUrl) => handleActionClick('draft-reply',
           `Draft a concise reply to this review comment: ${commentUrl}\nRead the thread, construct the reply message only, do NOT post it.`
         ) : undefined} />
+
+      {/* Review-level summary text (the body of each submitted review).
+          Distinct from inline review comments + issue comments. */}
+      <ReviewSummaries reviews={pr.reviews} myLogins={myLogins} />
 
       {/* General comments */}
       <GeneralComments comments={pr.comments} repo={repo} prNumber={number} onRefresh={fetchDetail} myLogins={myLogins} />

@@ -2,7 +2,11 @@
 
 import common
 import re
-import sqlite3
+# pysqlite3 fallback -- see app_state.py for why mixing engines corrupts the WAL.
+try:
+    from pysqlite3 import dbapi2 as sqlite3
+except ImportError:
+    import sqlite3  # type: ignore[no-redef]
 from datetime import datetime, timedelta
 
 from pydantic import BaseModel
@@ -104,24 +108,49 @@ _WORKLOG_TASK_COLS = (
 
 
 def _collect_active_task_ids(start: str, end: str) -> set:
-    """Read the events table for `task.*` events in the window and
-    extract the task_ids referenced by each event title."""
+    """Find task_ids the user touched in the window.
+
+    Two sources, OR'd:
+      1. `task.*` events -- explicit CRUD (created / updated / deleted),
+         task_id parsed from the title prefix.
+      2. `agent.*` events (prompt_submit / task_done / needs_input /
+         needs_permission / session_start) -- the tmux session name in
+         the `session` column equals the task_id for task sessions.
+         Skip cron / review / ticket sessions (those have their own
+         worklog story).
+
+    The previous implementation only used #1, which silently dropped
+    every task the user worked on via the agent without triggering a
+    CRUD event -- i.e. most of the actual work. Adding #2 catches
+    "I had a long claude session on task X today, no metadata edits".
+    """
     conn = app_state._notif_db()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT type, title, ts FROM events "
-        "WHERE ts >= ? AND ts < ? AND type LIKE 'task.%' "
+        "SELECT type, title, session, ts FROM events "
+        "WHERE ts >= ? AND ts < ? "
+        "  AND (type LIKE 'task.%' OR type LIKE 'agent.%') "
         "ORDER BY ts",
         (start, end),
     ).fetchall()
     conn.close()
-    out = set()
+    out: set = set()
     for e in rows:
-        tid = (e["title"] or "")
-        for prefix in ("Task created: ", "Task updated: ", "Task deleted: "):
-            tid = tid.replace(prefix, "")
-        if tid:
-            out.add(tid)
+        ev_type = e["type"] or ""
+        if ev_type.startswith("task."):
+            tid = (e["title"] or "")
+            for prefix in ("Task created: ", "Task updated: ", "Task deleted: "):
+                tid = tid.replace(prefix, "")
+            if tid:
+                out.add(tid)
+        elif ev_type.startswith("agent."):
+            sess = (e["session"] or "").strip()
+            # Skip non-task sessions; they have their own surfaces.
+            if not sess or sess.startswith(
+                ("cron-", "review-", "ticket-")
+            ):
+                continue
+            out.add(sess)
     return out
 
 

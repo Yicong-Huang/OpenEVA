@@ -92,7 +92,17 @@ export interface PRDetail {
   mergeable: string
   reviewDecision: string
   labels: Array<{ name: string }>
-  reviews: Array<{ author: { login: string }; state: string }>
+  // `body` is the review-level summary the user types in the GitHub
+  // "Review changes" dialog -- distinct from inline review comments.
+  // Reviewers who only left inline notes have body == '', so the UI
+  // skips those.
+  reviews: Array<{
+    id?: number
+    author: { login: string }
+    state: string
+    body?: string
+    submittedAt?: string
+  }>
   comments: Array<{ id?: number; author: { login: string }; body: string; createdAt: string }>
   files: Array<{ path: string; additions: number; deletions: number }>
   statusCheckRollup: Array<{

@@ -482,6 +482,72 @@ export function InlineComments({ inlineComments, repo, prNumber, onRefresh: _onR
 }
 
 // ============================================================
+// Review summaries (the body text on `/reviews` rows)
+// ============================================================
+//
+// GitHub's "Review changes" dialog lets the reviewer type a top-level
+// summary in addition to per-line inline notes. That summary lives on
+// the review row's `body` (gh's `pr view --json reviews`) -- not on
+// any comment thread -- so the previous PRDetail render quietly
+// dropped it. Users only saw the avatar dots from `ReviewSection`
+// and never the actual prose. This component renders one bubble per
+// review whose body is non-empty.
+
+interface ReviewSummariesProps {
+  reviews: PRDetail['reviews']
+  myLogins?: string[]
+}
+
+export function ReviewSummaries({ reviews, myLogins = [] }: ReviewSummariesProps) {
+  const withBody = (reviews || []).filter((r) => (r.body || '').trim().length > 0)
+  if (withBody.length === 0) return null
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8, fontWeight: 600 }}>
+        Review Summaries ({withBody.length})
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {withBody.map((r, i) => {
+          const user = r.author?.login || 'unknown'
+          const isOwn = myLogins.includes(user)
+          // State pill colour mirrors GitHub: green for APPROVED,
+          // red for CHANGES_REQUESTED, neutral for COMMENTED.
+          const stateColor = r.state === 'APPROVED'
+            ? 'var(--green)'
+            : r.state === 'CHANGES_REQUESTED'
+              ? 'var(--red)'
+              : 'var(--text-dim)'
+          return (
+            <CommentBubble
+              key={r.id ?? `${user}-${r.submittedAt ?? i}`}
+              user={user}
+              avatar={ghAvatar(user)}
+              createdAt={r.submittedAt || ''}
+              body={r.body || ''}
+              isOwn={isOwn}
+              accentBorder
+              actions={
+                <span
+                  style={{
+                    fontSize: 9, fontWeight: 700, letterSpacing: 0.4,
+                    padding: '1px 6px', borderRadius: 3,
+                    color: stateColor,
+                    border: `1px solid ${stateColor}`,
+                  }}
+                >
+                  {r.state}
+                </span>
+              }
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+
+// ============================================================
 // General comments (issue comments)
 // ============================================================
 
