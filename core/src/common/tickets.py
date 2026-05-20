@@ -98,6 +98,84 @@ def public_instances() -> list[dict]:
     return out
 
 
+# ---- ADF -> markdown ----
+
+def _render_adf(node: Any) -> str:
+    """Flatten an Atlassian Document Format (ADF) tree into markdown.
+
+    JIRA Cloud returns issue descriptions as ADF -- a JSON tree of
+    `{type, content?, text?, marks?, attrs?}` nodes. We don't need
+    rich formatting on the Eva side; just turn it into something
+    human-readable that round-trips into `tasks.description`.
+
+    Recognised:
+      - text nodes (plus `code` / `strong` / `em` marks)
+      - paragraph / heading / hardBreak block nodes
+      - bulletList / orderedList / listItem
+      - codeBlock
+      - blockquote
+      - inlineCard / link marks (rendered as the bare URL)
+
+    Anything unrecognised just recurses into `content` so unfamiliar
+    node types don't drop their text contents.
+    """
+    if isinstance(node, str):
+        return node
+    if not isinstance(node, dict):
+        return ""
+    t = node.get("type", "")
+    if t == "text":
+        text = node.get("text", "") or ""
+        marks = node.get("marks") or []
+        for m in marks:
+            mt = m.get("type") if isinstance(m, dict) else None
+            if mt == "code":
+                text = f"`{text}`"
+            elif mt == "strong":
+                text = f"**{text}**"
+            elif mt == "em":
+                text = f"*{text}*"
+            elif mt == "link":
+                href = (m.get("attrs") or {}).get("href") or ""
+                if href and href != text:
+                    text = f"[{text}]({href})"
+        return text
+    if t == "hardBreak":
+        return "\n"
+    if t == "inlineCard":
+        return (node.get("attrs") or {}).get("url", "") or ""
+    children = node.get("content") or []
+    inner = "".join(_render_adf(c) for c in children)
+    if t == "paragraph":
+        return inner + "\n\n"
+    if t == "heading":
+        lvl = (node.get("attrs") or {}).get("level", 2)
+        try:
+            lvl = max(1, min(6, int(lvl)))
+        except (TypeError, ValueError):
+            lvl = 2
+        return ("#" * lvl) + " " + inner + "\n\n"
+    if t == "bulletList":
+        return inner + "\n"
+    if t == "orderedList":
+        return inner + "\n"
+    if t == "listItem":
+        # Strip trailing newlines on a single-line item so the bullet
+        # stays compact.
+        return "- " + inner.rstrip() + "\n"
+    if t == "codeBlock":
+        lang = (node.get("attrs") or {}).get("language", "") or ""
+        return f"```{lang}\n{inner}\n```\n\n"
+    if t == "blockquote":
+        # Prefix every line of `inner` with `> ` so nested paragraphs
+        # all read as one quoted block.
+        return "\n".join("> " + line for line in inner.rstrip().split("\n")) + "\n\n"
+    if t == "rule":
+        return "\n---\n\n"
+    # Doc, or any unrecognised container: just return the inner.
+    return inner
+
+
 # ---- Sync ----
 
 def _normalise_issue(issue: dict, instance: dict) -> dict:
@@ -114,10 +192,15 @@ def _normalise_issue(issue: dict, instance: dict) -> dict:
     priority = (fields.get("priority") or {})
     issue_type = (fields.get("issuetype") or {})
     # Server (v2) returns plain text in `description`; Cloud (v3)
-    # returns ADF. Strings round-trip cleanly; non-strings get
-    # str()-ified so the cache column never blows up.
+    # returns ADF (Atlassian Document Format, a JSON tree). Render
+    # ADF dicts to markdown so the description stored on `tasks` is
+    # human-readable -- the previous `str(description)` path emitted
+    # Python dict repr like `{'type': 'doc', ...}` which was unusable
+    # in the UI.
     description = fields.get("description") or ""
-    if not isinstance(description, str):
+    if isinstance(description, dict):
+        description = _render_adf(description)
+    elif not isinstance(description, str):
         description = str(description)
     # JIRA Server returns `name` for assignee; Cloud returns
     # `emailAddress` + `displayName`. Pick whichever's present so the

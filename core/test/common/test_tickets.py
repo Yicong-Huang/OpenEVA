@@ -2417,10 +2417,11 @@ class TestSyncOneEmitException:
 
 class TestNonStringDescription:
     """JIRA Cloud (v3) returns Atlassian Document Format (ADF) for
-    `description` -- a dict, not a string. The mapper coerces it via
-    str() so the cache column never blows up."""
+    `description` -- a dict tree. `_normalise_issue` now renders ADF
+    into markdown via `_render_adf` so the stored description is
+    human-readable prose, not Python dict repr."""
 
-    def test_dict_description_is_coerced_to_string(self):
+    def test_empty_adf_doc_renders_to_empty_string(self):
         adf_doc = {"type": "doc", "version": 1, "content": []}
         instance = {
             "name": "cloud",
@@ -2444,7 +2445,41 @@ class TestNonStringDescription:
         )
         # description must be a string in the cache row.
         assert isinstance(out["description"], str)
-        assert out["description"]  # non-empty
+        # Empty `content: []` -> empty rendered prose. The important
+        # invariant is "string, not dict, not raising".
+        assert out["description"] == ""
+
+    def test_real_adf_renders_to_markdown(self):
+        # Realistic ADF tree with a heading + paragraph -> markdown.
+        adf_doc = {
+            "type": "doc", "version": 1,
+            "content": [
+                {"type": "heading", "attrs": {"level": 2},
+                 "content": [{"type": "text", "text": "Background"}]},
+                {"type": "paragraph",
+                 "content": [{"type": "text", "text": "Hello world."}]},
+            ],
+        }
+        instance = {
+            "name": "cloud", "base_url": "https://x.example",
+            "auth_type": "basic", "email": "a@x",
+            "api_token": "T", "jql": "x",
+        }
+        out = core_tickets._normalise_issue(
+            issue={
+                "key": "ADF-2",
+                "fields": {
+                    "summary": "s", "status": {"name": "Open"},
+                    "issuetype": {"name": "Bug"},
+                    "priority": {"name": "Medium"},
+                    "description": adf_doc,
+                    "project": {"key": "ADF"},
+                },
+            },
+            instance=instance,
+        )
+        assert out["description"].startswith("## Background")
+        assert "Hello world." in out["description"]
 
 
 class TestTrackCacheHits:
