@@ -51,14 +51,11 @@ def build_review_system_prompt(pr_row: dict) -> str:
     metadata persists across /clear and resume because it lives in
     the system prompt, not in a one-off user message.
 
-    Layout (one fact per line so the model can skim):
-      [Review] repo#number: title
-      [URL] pr url
-      [Meta] author | branch -> base | +N -M
-      [Status] pr / ci / review_decision / my_stance
-      [Tools] eva-cli for review queue + history
-      [History] how to log progress
-      [Language] reply in Chinese
+    Post-Phase-2 merge: a "review" is just a task with `type='review'`
+    whose task_id matches the tmux session name (`review-<owner>-<repo>-<n>`).
+    The same eva-cli verbs (append-history, add-pr, check-status) that
+    feature/bug tasks use apply here -- mention them so the agent
+    doesn't treat reviews as a parallel universe.
     """
     repo = pr_row.get("repo") or ""
     number = pr_row.get("number")
@@ -74,6 +71,19 @@ def build_review_system_prompt(pr_row: dict) -> str:
     review_decision = pr_row.get("review_status") or ""
     my_stance = pr_row.get("my_review_state") or ""
 
+    # Derive the review task_id (matches the tmux session name + the
+    # `tasks.task_id` post-merge). Falls back to a placeholder if URL
+    # is malformed -- the prompt is still useful even without the
+    # exact id.
+    import re as _re
+    m = _re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", url)
+    if m:
+        slug = _re.sub(r"[^a-zA-Z0-9]+", "-",
+                       f"{m.group(1)}/{m.group(2)}").strip("-").lower()
+        task_id = f"review-{slug}-{m.group(3)}"
+    else:
+        task_id = "<review-task-id>"
+
     lines = [
         f"[Review] {repo}#{number}: {title}".rstrip(),
         f"[URL] {url}",
@@ -87,10 +97,17 @@ def build_review_system_prompt(pr_row: dict) -> str:
             f"my_stance={my_stance or '(none)'}"
         ),
         "",
-        "[Tools] eva-cli -- run `eva-cli --help` for review queue + history.",
+        "[Tools] eva-cli -- run `eva-cli --help` for task/PR/session management.",
+        "This review is just a task (type='review', task_id matches the "
+        "tmux session name above). The same CRUD applies as for feature/"
+        "bug tasks -- append history, link related PRs, change status.",
         "[History] After each meaningful pass run:",
-        f"  eva-cli append-review-history '{url}' '<=100 chars, terse>'",
+        f"  eva-cli append-history \"\" {task_id} \"<=100 chars, terse>\"",
         "Append-only timeline. One fact per line: what you did or what's blocked.",
+        "[Link PR] Review-type tasks conventionally stay 1:1 with the PR "
+        "being reviewed (already attached). If you need to reference an "
+        "additional related PR for context, attach it explicitly:",
+        f"  eva-cli add-pr \"\" {task_id} <pr_number> <pr_url>",
         "[Language] Reply in Chinese (中文).",
     ]
     return "\n".join(lines)

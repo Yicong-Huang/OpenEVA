@@ -524,11 +524,27 @@ def build_background_system(
         if matched:
             lines.append(f"Focus PR #{pr_num}: {pr_context.get('repo','')} branch={matched.get('head_branch','')} ci={matched.get('ci_status','?')} review={matched.get('review_status','')}")
 
+    proj_arg = task_data.get("project") or ""
+    tid = task_data.get("task_id") or "<task>"
+    # task.type drives surface (feature / bug / test / chore / review /
+    # flaky-test / slow-test / compliance / ticket-derived / ...) but
+    # the worker workflow is the same: any task can attach PRs and
+    # append history. The model otherwise assumes "ticket" / "review"
+    # are second-class and skips linking PRs to them.
     lines.append("")
     lines.append("[Tools] eva-cli -- run `eva-cli --help` for task/PR/session management.")
+    lines.append("Every work item is a `task` with an open `type` field. "
+                 "type=feature/bug/review/flaky-test/etc. is metadata only -- "
+                 "the same CRUD applies (link PRs, append history, change status).")
     lines.append("[History] After each meaningful step (commit, PR event, blocker) run:")
-    lines.append(f"  eva-cli append-history {task_data.get('project','<proj>')} {task_data.get('task_id','<task>')} \"<=100 chars, terse\"")
-    lines.append("Keep each line one fact: what you did or what's blocking. Append-only timeline, no editing old lines.")
+    lines.append(f"  eva-cli append-history {proj_arg or '\"\"'} {tid} \"<=100 chars, terse\"")
+    lines.append("Keep each line one fact: what you did or what's blocking. "
+                 "Append-only timeline, no editing old lines.")
+    lines.append("[Link PR] When you open or discover a related PR, attach it:")
+    lines.append(f"  eva-cli add-pr {proj_arg or '\"\"'} {tid} <pr_number> <pr_url>")
+    lines.append("Multiple PRs per task are supported (review-type tasks "
+                 "conventionally stay 1:1 with their PR; other types can "
+                 "carry many).")
     lines.append("Also call `eva-cli check-status` when you think status should change.")
     lines.append("[Language] Reply in Chinese (中文).")
 

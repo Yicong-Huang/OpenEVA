@@ -215,7 +215,7 @@ class TestOpenReviewSession:
         sysprompt = argv[idx + 1]
         assert "example/repo" in sysprompt
         assert "#42" in sysprompt or "42" in sysprompt
-        assert "append-review-history" in sysprompt
+        assert "append-history" in sysprompt
         # The returned `prompt` (typed into the TUI as user message)
         # is the action template, not the system context.
         assert out["prompt"]
@@ -292,9 +292,14 @@ class TestBuildReviewSystemPrompt:
         )
         assert "[Review] example/repo#42: EX-0 fix null handling" in out
         assert "[URL] https://github.com/example/repo/pull/42" in out
-        # Closing hint tells the agent to log back via CLI
-        assert "eva-cli append-review-history" in out
-        assert "https://github.com/example/repo/pull/42" in out
+        # Closing hint tells the agent to log back via CLI. Post-merge
+        # the review task is just a task, so `append-history` (taking a
+        # task_id) is the right verb.
+        assert "eva-cli append-history" in out
+        assert "review-example-repo-42" in out
+        # The same prompt should advertise eva-cli add-pr so the agent
+        # knows it can attach related PRs to the review task.
+        assert "eva-cli add-pr" in out
 
     def test_tolerates_missing_fields_without_keyerror(self):
         """The template uses `.get()` defaults, so a minimal pr_row
