@@ -61,10 +61,9 @@ def check_pr_task_drift() -> list[Finding]:
     """
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT p.project, p.task_id, p.url, p.status as pr_status, "
-        "       t.status as task_status "
-        "FROM prs p JOIN tasks t "
-        "  ON t.project = p.project AND t.task_id = p.task_id "
+        "SELECT t.project as project, p.task_id, p.url, "
+        "       p.status as pr_status, t.status as task_status "
+        "FROM prs p JOIN tasks t ON t.task_id = p.task_id "
         "WHERE p.status = 'merged' AND t.status = 'not_started'"
     ).fetchall()
     for r in rows:
@@ -93,14 +92,13 @@ def check_all_prs_merged_but_task_open() -> list[Finding]:
     """
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT p.project, p.task_id, "
+        "SELECT t.project as project, p.task_id, "
         "       SUM(CASE WHEN p.status = 'merged' THEN 1 ELSE 0 END) as merged_n, "
         "       COUNT(*) as total_n, "
         "       t.status as task_status "
-        "FROM prs p JOIN tasks t "
-        "  ON t.project = p.project AND t.task_id = p.task_id "
+        "FROM prs p JOIN tasks t ON t.task_id = p.task_id "
         "WHERE t.status NOT IN ('done', 'closed') "
-        "GROUP BY p.project, p.task_id "
+        "GROUP BY p.task_id "
         "HAVING merged_n = total_n AND total_n > 0"
     ).fetchall()
     for r in rows:
@@ -146,12 +144,11 @@ def check_ticket_fields_paired() -> list[Finding]:
 
 
 def check_orphan_prs() -> list[Finding]:
-    """PRs whose project or task no longer exists."""
+    """PRs whose task no longer exists."""
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT p.project, p.task_id, p.url FROM prs p "
-        "LEFT JOIN tasks t "
-        "  ON t.project = p.project AND t.task_id = p.task_id "
+        "SELECT p.task_id, p.url FROM prs p "
+        "LEFT JOIN tasks t ON t.task_id = p.task_id "
         "WHERE t.task_id IS NULL"
     ).fetchall()
     for r in rows:
@@ -160,12 +157,9 @@ def check_orphan_prs() -> list[Finding]:
             severity=SEVERITY_ERROR,
             message=(
                 f"PR {r['url']} references "
-                f"task '{r['task_id']}' in '{r['project']}' which doesn't exist"
+                f"task '{r['task_id']}' which doesn't exist"
             ),
-            ref={
-                "project": r["project"], "task_id": r["task_id"],
-                "url": r["url"],
-            },
+            ref={"task_id": r["task_id"], "url": r["url"]},
             fixable=True,
         ))
     return findings
@@ -175,12 +169,11 @@ def check_orphan_history() -> list[Finding]:
     """task_history rows pointing at a non-existent task."""
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT h.project, h.task_id, COUNT(*) as n "
+        "SELECT h.task_id, COUNT(*) as n "
         "FROM task_history h "
-        "LEFT JOIN tasks t "
-        "  ON t.project = h.project AND t.task_id = h.task_id "
+        "LEFT JOIN tasks t ON t.task_id = h.task_id "
         "WHERE t.task_id IS NULL "
-        "GROUP BY h.project, h.task_id"
+        "GROUP BY h.task_id"
     ).fetchall()
     for r in rows:
         findings.append(Finding(
@@ -188,10 +181,9 @@ def check_orphan_history() -> list[Finding]:
             severity=SEVERITY_ERROR,
             message=(
                 f"{r['n']} task_history entries reference "
-                f"non-existent task '{r['task_id']}' in '{r['project']}'"
+                f"non-existent task '{r['task_id']}'"
             ),
-            ref={"project": r["project"], "task_id": r["task_id"],
-                 "count": r["n"]},
+            ref={"task_id": r["task_id"], "count": r["n"]},
             fixable=True,
         ))
     return findings
@@ -201,12 +193,10 @@ def check_orphan_dependencies() -> list[Finding]:
     """task_dependencies rows where either endpoint task is gone."""
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT d.project, d.task_id, d.depends_on "
+        "SELECT d.task_id, d.depends_on "
         "FROM task_dependencies d "
-        "LEFT JOIN tasks t1 "
-        "  ON t1.project = d.project AND t1.task_id = d.task_id "
-        "LEFT JOIN tasks t2 "
-        "  ON t2.project = d.project AND t2.task_id = d.depends_on "
+        "LEFT JOIN tasks t1 ON t1.task_id = d.task_id "
+        "LEFT JOIN tasks t2 ON t2.task_id = d.depends_on "
         "WHERE t1.task_id IS NULL OR t2.task_id IS NULL"
     ).fetchall()
     for r in rows:
@@ -215,10 +205,10 @@ def check_orphan_dependencies() -> list[Finding]:
             severity=SEVERITY_ERROR,
             message=(
                 f"dependency '{r['task_id']}' -> '{r['depends_on']}' "
-                f"in '{r['project']}' references a missing task"
+                f"references a missing task"
             ),
             ref={
-                "project": r["project"], "task_id": r["task_id"],
+                "task_id": r["task_id"],
                 "depends_on": r["depends_on"],
             },
             fixable=True,
@@ -230,11 +220,13 @@ def check_duplicate_pr_urls() -> list[Finding]:
     """Same PR URL attached to multiple tasks. Usually a sync bug."""
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT url, GROUP_CONCAT(project || '/' || task_id, ', ') as tasks, "
+        "SELECT p.url, "
+        "       GROUP_CONCAT(COALESCE(t.project,'')||'/'||p.task_id, ', ') AS tasks, "
         "       COUNT(*) as n "
-        "FROM prs "
-        "WHERE url IS NOT NULL AND url != '' "
-        "GROUP BY url HAVING n > 1"
+        "FROM prs p "
+        "  LEFT JOIN tasks t ON t.task_id = p.task_id "
+        "WHERE p.url IS NOT NULL AND p.url != '' "
+        "GROUP BY p.url HAVING n > 1"
     ).fetchall()
     for r in rows:
         findings.append(Finding(
@@ -260,9 +252,10 @@ def check_prs_missing_author() -> list[Finding]:
     manual cleanup. Aggregate counts hid the structure.
     """
     rows = app_state._db._conn.execute(
-        "SELECT project, task_id, number, url FROM prs "
-        "WHERE author IS NULL OR author = '' "
-        "ORDER BY project, task_id, number"
+        "SELECT t.project AS project, p.task_id, p.number, p.url "
+        "FROM prs p LEFT JOIN tasks t ON t.task_id = p.task_id "
+        "WHERE p.author IS NULL OR p.author = '' "
+        "ORDER BY t.project, p.task_id, p.number"
     ).fetchall()
     if not rows:
         return []
@@ -303,8 +296,8 @@ def check_duplicate_pr_rows() -> list[Finding]:
     attached to *different* tasks (intentional umbrella PR pattern).
     """
     rows = app_state._db._conn.execute(
-        "SELECT project, task_id, number, COUNT(*) AS n FROM prs "
-        "GROUP BY project, task_id, number "
+        "SELECT task_id, number, COUNT(*) AS n FROM prs "
+        "GROUP BY task_id, number "
         "HAVING n > 1"
     ).fetchall()
     findings: list[Finding] = []
@@ -313,12 +306,12 @@ def check_duplicate_pr_rows() -> list[Finding]:
             kind="duplicate_pr_row",
             severity=SEVERITY_WARN,
             message=(
-                f"PR #{r['number']} on task {r['project']}/{r['task_id']} "
+                f"PR #{r['number']} on task {r['task_id']} "
                 f"appears {r['n']} times in the prs table -- duplicate "
                 f"rows accumulate when a write path uses INSERT instead "
                 f"of UPSERT; loop-notes item E proposes adding a PK"
             ),
-            ref={"project": r["project"], "task_id": r["task_id"],
+            ref={"task_id": r["task_id"],
                  "number": r["number"], "count": r["n"]},
             fixable=False,
         ))
@@ -472,14 +465,19 @@ def check_long_idle_input_sessions() -> list[Finding]:
 
 
 def check_stale_review_sessions() -> list[Finding]:
-    """Review sessions whose `my_workflow_state='active'` but the tmux
-    session is gone. Mirrors `check_stale_task_sessions` for the
-    review_prs row family."""
+    """Review tasks whose `review_my_workflow_state='active'` but the
+    tmux session is gone. Mirrors `check_stale_task_sessions` for the
+    review-type task family."""
     findings: list[Finding] = []
     rows = app_state._db._conn.execute(
-        "SELECT url, repo, number, session_name, started_at "
-        "FROM review_prs "
-        "WHERE my_workflow_state='active' AND session_name != ''"
+        "SELECT t.task_id, p.url, p.number, "
+        "       s.tmux_name AS session_name, t.review_started_at "
+        "FROM tasks t "
+        "  LEFT JOIN prs p ON p.task_id = t.task_id "
+        "  LEFT JOIN sessions s ON s.task_id = t.task_id "
+        "WHERE t.type='review' "
+        "  AND t.review_my_workflow_state='active' "
+        "  AND COALESCE(s.tmux_name, '') != ''"
     ).fetchall()
     if not rows:
         return findings
@@ -492,12 +490,12 @@ def check_stale_review_sessions() -> list[Finding]:
             kind="stale_review_session",
             severity=SEVERITY_WARN,
             message=(
-                f"review session `{name}` (PR {r['repo']}#{r['number']}, "
-                f"started {r['started_at'] or '?'}) is `active` but its "
+                f"review session `{name}` (PR #{r['number']}, started "
+                f"{r['review_started_at'] or '?'}) is `active` but its "
                 f"tmux session no longer exists -- auto-fix flips it "
                 f"back to `queued`"
             ),
-            ref={"url": r["url"], "session_name": name},
+            ref={"url": r["url"] or "", "session_name": name},
             fixable=True,
         ))
     return findings
@@ -678,8 +676,8 @@ def run_audit() -> dict:
 
 def _delete_orphan_pr(ref: dict) -> bool:
     cur = app_state._db._conn.execute(
-        "DELETE FROM prs WHERE project = ? AND task_id = ? AND url = ?",
-        (ref["project"], ref["task_id"], ref["url"]),
+        "DELETE FROM prs WHERE task_id = ? AND url = ?",
+        (ref["task_id"], ref["url"]),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0
@@ -687,8 +685,8 @@ def _delete_orphan_pr(ref: dict) -> bool:
 
 def _delete_orphan_history(ref: dict) -> bool:
     cur = app_state._db._conn.execute(
-        "DELETE FROM task_history WHERE project = ? AND task_id = ?",
-        (ref["project"], ref["task_id"]),
+        "DELETE FROM task_history WHERE task_id = ?",
+        (ref["task_id"],),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0
@@ -697,8 +695,8 @@ def _delete_orphan_history(ref: dict) -> bool:
 def _delete_orphan_dependency(ref: dict) -> bool:
     cur = app_state._db._conn.execute(
         "DELETE FROM task_dependencies "
-        "WHERE project = ? AND task_id = ? AND depends_on = ?",
-        (ref["project"], ref["task_id"], ref["depends_on"]),
+        "WHERE task_id = ? AND depends_on = ?",
+        (ref["task_id"], ref["depends_on"]),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0
@@ -728,13 +726,20 @@ def _close_stale_task_session(ref: dict) -> bool:
 
 
 def _close_stale_review_session(ref: dict) -> bool:
-    """Flip a stuck review row's `my_workflow_state` from `active`
-    back to `queued` so it re-appears in the review queue."""
+    """Flip a stuck review task's `review_my_workflow_state` back to
+    `queued` AND drop the dead `sessions` row so the queue stops
+    showing a ghost session."""
+    from eva_db import EvaDB
+    task_id = EvaDB._review_task_id_from_url(ref["url"])
+    if not task_id:
+        return False
     cur = app_state._db._conn.execute(
-        "UPDATE review_prs "
-        "SET my_workflow_state='queued', session_name='' "
-        "WHERE url=?",
-        (ref["url"],),
+        "UPDATE tasks SET review_my_workflow_state='queued' "
+        "WHERE task_id=? AND type='review'",
+        (task_id,),
+    )
+    app_state._db._conn.execute(
+        "DELETE FROM sessions WHERE task_id=?", (task_id,),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0
@@ -743,8 +748,8 @@ def _close_stale_review_session(ref: dict) -> bool:
 def _canonicalize_task_type(ref: dict) -> bool:
     """Rewrite a single task's `type` column to its canonical form."""
     cur = app_state._db._conn.execute(
-        "UPDATE tasks SET type = ? WHERE project = ? AND task_id = ?",
-        (ref["to_type"], ref["project"], ref["task_id"]),
+        "UPDATE tasks SET type = ? WHERE task_id = ?",
+        (ref["to_type"], ref["task_id"]),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0
@@ -787,9 +792,8 @@ def _backfill_pr_author(ref: dict) -> bool:
     if not author:
         return False
     cur = app_state._db._conn.execute(
-        "UPDATE prs SET author = ? "
-        "WHERE project = ? AND task_id = ? AND number = ?",
-        (author, ref["project"], ref["task_id"], int(number)),
+        "UPDATE prs SET author = ? WHERE task_id = ? AND number = ?",
+        (author, ref["task_id"], int(number)),
     )
     app_state._db._conn.commit()
     return cur.rowcount > 0

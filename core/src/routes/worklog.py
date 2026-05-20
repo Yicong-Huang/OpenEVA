@@ -98,9 +98,13 @@ def _task_line(task: dict, indent: str = "            ") -> tuple[str, list[str]
 # Columns surfaced from the prs table for worklog rendering. Defined
 # once so `_query_status_changed_prs` and `_task_prs_for_worklog`
 # return rows with identical shape.
+# `project` lives on `tasks` now, not `prs`. `_query_status_changed_prs`
+# JOINs to tasks to pull it back into the result dict so the worklog
+# renderer (which buckets by project) keeps working.
 _WORKLOG_PR_COLS = (
-    "number", "title", "status", "ci_status", "url", "project", "task_id",
+    "number", "title", "status", "ci_status", "url", "task_id",
 )
+_WORKLOG_PR_OUTPUT_COLS = _WORKLOG_PR_COLS + ("project",)
 _WORKLOG_TASK_COLS = (
     "project", "task_id", "description", "ticket_id", "ticket_url",
     "notes", "status",
@@ -167,12 +171,13 @@ def _query_status_changed_prs(start: str, end: str) -> list:
     """
     cols = ", ".join(f"p.{c}" for c in _WORKLOG_PR_COLS)
     rows = app_state._db._conn.execute(
-        f"SELECT {cols} FROM prs p "
+        f"SELECT {cols}, t.project AS project FROM prs p "
+        "  JOIN tasks t ON t.task_id = p.task_id "
         "WHERE p.status_changed_at >= ? AND p.status_changed_at < ? "
-        "ORDER BY p.project, p.number",
+        "ORDER BY t.project, p.number",
         (start, end),
     ).fetchall()
-    return [{c: r[c] for c in _WORKLOG_PR_COLS} for r in rows]
+    return [{c: r[c] for c in _WORKLOG_PR_OUTPUT_COLS} for r in rows]
 
 
 def _task_prs_for_worklog(project: str, task_id: str) -> list:
@@ -183,14 +188,15 @@ def _task_prs_for_worklog(project: str, task_id: str) -> list:
     rows can slip through. Strict filter at the SQL layer is cheaper
     than per-row guards in the renderer.
     """
-    cols = ", ".join(_WORKLOG_PR_COLS)
+    cols = ", ".join(f"p.{c}" for c in _WORKLOG_PR_COLS)
     rows = app_state._db._conn.execute(
-        f"SELECT {cols} FROM prs "
-        "WHERE project=? AND task_id=? AND title != '' "
-        "ORDER BY number DESC",
-        (project, task_id),
+        f"SELECT {cols}, t.project AS project FROM prs p "
+        "  JOIN tasks t ON t.task_id = p.task_id "
+        "WHERE p.task_id=? AND p.title != '' "
+        "ORDER BY p.number DESC",
+        (task_id,),
     ).fetchall()
-    return [{c: r[c] for c in _WORKLOG_PR_COLS} for r in rows]
+    return [{c: r[c] for c in _WORKLOG_PR_OUTPUT_COLS} for r in rows]
 
 
 def _build_worklog_buckets(task_ids: set, prs: list) -> tuple:

@@ -248,9 +248,9 @@ class TestGeneratorContent:
             "PRAGMA foreign_keys=OFF",
         )
         db._conn.execute(
-            "INSERT INTO prs(project, task_id, number, url, status, "
-            "title, status_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("test-proj", "task-b", 4242,
+            "INSERT INTO prs(task_id, number, url, status, "
+            "title, status_changed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("task-b", 4242,
              "https://github.com/x/y/pull/4242",
              "merged", "",  # empty title is the key
              "2099-01-01T11:00:00Z"),
@@ -335,8 +335,8 @@ class TestGeneratorContent:
                   url=url, title=title, status=status, ci_status=ci_status)
         db._conn.execute(
             "UPDATE prs SET last_updated=?, status_changed_at=? "
-            "WHERE project=? AND task_id=? AND number=?",
-            (ts, ts, "test-proj", task_id, number),
+            "WHERE task_id=? AND number=?",
+            (ts, ts, task_id, number),
         )
         db._conn.commit()
 
@@ -506,8 +506,8 @@ class TestGeneratorContent:
                   title="Old PR re-polled today", status="merged", ci_status="passing")
         db._conn.execute(
             "UPDATE prs SET last_updated=?, status_changed_at=? "
-            "WHERE project=? AND task_id=? AND number=?",
-            ("2099-01-01T12:00:00", "", "test-proj", "task-b", 12345),
+            "WHERE task_id=? AND number=?",
+            ("2099-01-01T12:00:00", "", "task-b", 12345),
         )
         db._conn.commit()
 
@@ -527,9 +527,9 @@ class TestGeneratorContent:
         # last_updated much earlier, status_changed_at in window -> included.
         db._conn.execute(
             "UPDATE prs SET last_updated=?, status_changed_at=? "
-            "WHERE project=? AND task_id=? AND number=?",
+            "WHERE task_id=? AND number=?",
             ("2098-01-01T00:00:00", "2099-01-01T10:00:00",
-             "test-proj", "task-b", 55555),
+             "task-b", 55555),
         )
         db._conn.commit()
 

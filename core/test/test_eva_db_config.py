@@ -682,10 +682,9 @@ def test_is_task_blocked_missing_dep(db):
     """Task is blocked if dependency doesn't exist in tasks table."""
     db.create_project("p1")
     db.create_task("p1", "a")
-    # Manually insert a dep pointing to nonexistent task
     db._conn.execute(
-        "INSERT INTO task_dependencies (project, task_id, depends_on) VALUES (?, ?, ?)",
-        ("p1", "a", "ghost"),
+        "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+        ("a", "ghost"),
     )
     db._conn.commit()
     assert db.is_task_blocked("p1", "a") is True

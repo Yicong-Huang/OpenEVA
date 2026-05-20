@@ -306,9 +306,20 @@ def delete_instance(name: str):
             status_code=404,
             detail=f"JIRA instance {name!r} not configured")
     _settings.set_value(_settings.KEY_JIRA_INSTANCES, out)
-    # Drop cached tickets for the deleted instance.
+    # Drop cached ticket fields for the deleted instance (tasks stay,
+    # only the JIRA-cache columns are cleared; mirrors `delete_ticket`).
     app_state._db._conn.execute(
-        "DELETE FROM tickets WHERE instance_name=?", (name,),
+        "UPDATE tasks SET "
+        "  ticket_id=NULL, ticket_url='', ticket_summary='', "
+        "  ticket_priority='', ticket_issue_type='', "
+        "  ticket_project_key='', ticket_assignee_email='', "
+        "  ticket_reporter_email='', ticket_status='', "
+        "  ticket_status_category='', ticket_labels='[]', "
+        "  ticket_components='[]', ticket_fix_versions='[]', "
+        "  ticket_parent_key='', ticket_resolution='', "
+        "  ticket_instance='', ticket_synced_at='' "
+        "WHERE ticket_instance=?",
+        (name,),
     )
     app_state._db._conn.commit()
     return {"ok": True}

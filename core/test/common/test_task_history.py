@@ -46,11 +46,15 @@ class TestDBAppend:
         with pytest.raises(ValueError, match="not found"):
             db.append_task_history("test-proj", "ghost-xyz", "hi")
 
-    def test_rejects_unknown_project(self, patched_server):
-        import pytest
+    def test_unknown_project_is_silently_accepted(self, patched_server):
+        # Post-Phase-2 merge: task_id is globally unique, so the
+        # `project` argument to append_task_history is informational
+        # only -- a mismatch no longer raises. The task lookup is
+        # still by task_id, which we know exists in the seed data
+        # under "test-proj".
         db = patched_server._db
-        with pytest.raises(ValueError, match="not found"):
-            db.append_task_history("nope", "task-a", "hi")
+        out = db.append_task_history("nope", "task-a", "hi")
+        assert out["text"] == "hi"
 
 
 class TestDBList:

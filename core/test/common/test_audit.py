@@ -113,9 +113,9 @@ class TestOrphanPRs:
         db.create_project(project_id="p", name="p")
         _insert_orphan(
             db,
-            "INSERT INTO prs(project, task_id, number, url, status, author) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("p", "ghost-task", 99, "https://x/y/pull/99", "open", "me"),
+            "INSERT INTO prs(task_id, number, url, status, author) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ghost-task", 99, "https://x/y/pull/99", "open", "me"),
         )
         findings = core_audit.check_orphan_prs()
         assert any(
@@ -147,9 +147,9 @@ class TestOrphanDependencies:
         _seed_minimal(db, "p", "real")
         _insert_orphan(
             db,
-            "INSERT INTO task_dependencies(project, task_id, depends_on) "
-            "VALUES (?, ?, ?)",
-            ("p", "real", "missing-dep"),
+            "INSERT INTO task_dependencies(task_id, depends_on) "
+            "VALUES (?, ?)",
+            ("real", "missing-dep"),
         )
         findings = core_audit.check_orphan_dependencies()
         assert any(
@@ -198,9 +198,9 @@ class TestDuplicatePrRows:
         db = patched_server._db
         _seed_minimal(db, "p", "t")
         db._conn.execute(
-            "INSERT INTO prs(project, task_id, number, url, status) "
-            "VALUES(?, ?, ?, ?, ?)",
-            ("p", "t", 91, "https://x/y/pull/91", "open"),
+            "INSERT INTO prs(task_id, number, url, status) "
+            "VALUES(?, ?, ?, ?)",
+            ("t", 91, "https://x/y/pull/91", "open"),
         )
         db._conn.commit()
         try:
@@ -210,9 +210,9 @@ class TestDuplicatePrRows:
         import pytest
         with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
             db._conn.execute(
-                "INSERT INTO prs(project, task_id, number, url, status) "
-                "VALUES(?, ?, ?, ?, ?)",
-                ("p", "t", 91, "https://x/y/pull/91", "open"),
+                "INSERT INTO prs(task_id, number, url, status) "
+                "VALUES(?, ?, ?, ?)",
+                ("t", 91, "https://x/y/pull/91", "open"),
             )
 
     def test_check_finds_dupe_if_constraint_were_dropped(self, patched_server):
@@ -223,7 +223,7 @@ class TestDuplicatePrRows:
         _seed_minimal(db, "p", "t")
         db._conn.executescript("""
             CREATE TABLE prs_no_unique (
-                project TEXT, task_id TEXT, number INTEGER,
+                task_id TEXT, number INTEGER,
                 url TEXT, status TEXT, title TEXT DEFAULT '',
                 session TEXT, working_dir TEXT DEFAULT '~',
                 ci_status TEXT DEFAULT 'unknown',
@@ -242,16 +242,16 @@ class TestDuplicatePrRows:
             INSERT INTO prs_no_unique SELECT * FROM prs;
             DROP TABLE prs;
             ALTER TABLE prs_no_unique RENAME TO prs;
-            INSERT INTO prs(project, task_id, number, url, status)
-                VALUES('p', 't', 91, 'https://x/y/pull/91', 'open');
-            INSERT INTO prs(project, task_id, number, url, status)
-                VALUES('p', 't', 91, 'https://x/y/pull/91', 'open');
+            INSERT INTO prs(task_id, number, url, status)
+                VALUES('t', 91, 'https://x/y/pull/91', 'open');
+            INSERT INTO prs(task_id, number, url, status)
+                VALUES('t', 91, 'https://x/y/pull/91', 'open');
         """)
         db._conn.commit()
         findings = core_audit.check_duplicate_pr_rows()
         assert len(findings) == 1
         assert findings[0].ref == {
-            "project": "p", "task_id": "t", "number": 91, "count": 2,
+            "task_id": "t", "number": 91, "count": 2,
         }
 
 
@@ -630,9 +630,9 @@ class TestRunAudit:
         db.create_project(project_id="p-x", name="p-x")
         _insert_orphan(
             db,
-            "INSERT INTO prs(project, task_id, number, url, status, author) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("p-x", "no-task", 1, "https://x/y/pull/100", "open", "me"),
+            "INSERT INTO prs(task_id, number, url, status, author) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("no-task", 1, "https://x/y/pull/100", "open", "me"),
         )
         result = core_audit.run_audit()
         assert result["summary"]["total"] == len(result["findings"])
@@ -660,9 +660,9 @@ class TestFixers:
         db.create_project(project_id="p", name="p")
         _insert_orphan(
             db,
-            "INSERT INTO prs(project, task_id, number, url, status, author) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("p", "ghost", 9, "https://x/y/pull/9", "open", "me"),
+            "INSERT INTO prs(task_id, number, url, status, author) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ghost", 9, "https://x/y/pull/9", "open", "me"),
         )
         result = core_audit.run_audit()
         orphans = [f for f in result["findings"] if f["kind"] == "orphan_pr"]
@@ -685,9 +685,9 @@ class TestFixers:
         db.create_project(project_id="p", name="p")
         _insert_orphan(
             db,
-            "INSERT INTO prs(project, task_id, number, url, status, author) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("p", "ghost", 1, "https://x/y/pull/1", "open", "me"),
+            "INSERT INTO prs(task_id, number, url, status, author) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ghost", 1, "https://x/y/pull/1", "open", "me"),
         )
         all_findings = core_audit.run_audit()["findings"]
         result = core_audit.fix_all(all_findings)
@@ -726,9 +726,9 @@ class TestFixers:
         db.create_project(project_id="p3", name="p3")
         _insert_orphan(
             db,
-            "INSERT INTO task_dependencies(project, task_id, depends_on) "
-            "VALUES (?, ?, ?)",
-            ("p3", "child", "ghost-parent"),
+            "INSERT INTO task_dependencies(task_id, depends_on) "
+            "VALUES (?, ?)",
+            ("child", "ghost-parent"),
         )
         orphans = [f for f in core_audit.run_audit()["findings"]
                    if f["kind"] == "orphan_dependency"]
@@ -737,8 +737,8 @@ class TestFixers:
         assert ok is True
         cnt = db._conn.execute(
             "SELECT COUNT(*) as n FROM task_dependencies "
-            "WHERE project=? AND task_id=? AND depends_on=?",
-            ("p3", "child", "ghost-parent"),
+            "WHERE task_id=? AND depends_on=?",
+            ("child", "ghost-parent"),
         ).fetchone()["n"]
         assert cnt == 0
 

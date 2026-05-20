@@ -68,6 +68,13 @@ def list_all_project_sessions():
         pid = s["project"]
         if pid in hidden:
             continue
+        # Skip review-type sessions: they have their own page (All
+        # Reviews) and don't belong in the per-project task-session
+        # grouping. The migration set their project to '__reviews__'
+        # as a non-project marker. Detecting by `type='review'` would
+        # require an extra join; the marker filter is cheap.
+        if pid == "__reviews__" or s["tmux_name"].startswith("review-"):
+            continue
         if pid not in result:
             proj = app_state._db.get_project(pid) or {}
             result[pid] = {

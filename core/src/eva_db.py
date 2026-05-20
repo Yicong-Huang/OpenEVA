@@ -176,6 +176,44 @@ def _row_to_dict(row) -> dict:
     return dict(row)
 
 
+# Type classifier for migrated/synced JIRA tickets. Mirrors the logic
+# in `bin/migrate_unify_tasks.py:classify_ticket_type` -- if that file
+# changes its rules, this one needs to follow. Kept as a module helper
+# so both `upsert_ticket` and the one-shot migration land tickets in
+# the same task `type`.
+import re as _re_classify  # noqa: E402 -- module-level, intentional
+_FLAKY_RE = _re_classify.compile(
+    r"flaky|testman|test[- ]?failure|test failure|failing target",
+    _re_classify.I,
+)
+_SLOW_RE = _re_classify.compile(r"\bslow\b|slowness|slow[- ]?test",
+                                _re_classify.I)
+_COMPLIANCE_RE = _re_classify.compile(r"\bcompliance\b|\bsecurity\b|cve-",
+                                      _re_classify.I)
+
+
+def _classify_ticket_type(summary: str, labels_json: str, issue_type: str) -> str:
+    """Pick a concrete task `type` for a synced JIRA ticket."""
+    try:
+        labels = json.loads(labels_json) if labels_json else []
+    except (json.JSONDecodeError, ValueError):
+        labels = []
+    text_bag = " ".join([summary or "", *(labels or [])])
+    if _FLAKY_RE.search(text_bag):
+        return "flaky-test"
+    if _SLOW_RE.search(text_bag):
+        return "slow-test"
+    if _COMPLIANCE_RE.search(" ".join(labels or [])):
+        return "compliance"
+    it = (issue_type or "").lower().strip()
+    if "sub-task" in it or "subtask" in it:
+        return "subtask"
+    return {
+        "bug": "bug", "task": "task", "story": "feature",
+        "epic": "epic", "improvement": "feature", "new feature": "feature",
+    }.get(it, "bug")
+
+
 def _pr_row_to_dict(row) -> dict:
     """Convert a `prs` row to a dict and append the computed
     `unread_comment_count` so every PR-shape path (list_all_prs,
@@ -241,11 +279,20 @@ class EvaDB:
                 updated_at TEXT
             );
 
+            -- Unified `tasks` table. Per the reviews/tickets merge
+            -- (bin/migrate_unify_tasks.py), the `review_prs` and
+            -- `tickets` tables are gone -- their rows are now task
+            -- rows with type='review' or type='flaky-test' / 'bug' /
+            -- 'task' / ... and their fields became ticket_* / review_*
+            -- prefixed columns below.
+            --
+            -- PK is task_id alone (globally unique). `project` is a
+            -- soft folder grouping; '' / NULL = unsorted.
             CREATE TABLE IF NOT EXISTS tasks (
-                project TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                description TEXT DEFAULT '',
+                task_id TEXT PRIMARY KEY,
+                project TEXT,
                 type TEXT DEFAULT 'feature',
+                description TEXT DEFAULT '',
                 status TEXT DEFAULT 'not_started'
                     CHECK(status IN ('not_started','in_progress','in_review','done','needs_follow_up','closed')),
                 group_name TEXT DEFAULT '',
@@ -254,17 +301,38 @@ class EvaDB:
                 follow_ups TEXT DEFAULT '[]',
                 ticket_id TEXT,
                 ticket_url TEXT,
+                ticket_summary TEXT DEFAULT '',
+                ticket_priority TEXT DEFAULT '',
+                ticket_issue_type TEXT DEFAULT '',
+                ticket_project_key TEXT DEFAULT '',
+                ticket_assignee_email TEXT DEFAULT '',
+                ticket_reporter_email TEXT DEFAULT '',
+                ticket_status TEXT DEFAULT '',
+                ticket_status_category TEXT DEFAULT '',
+                ticket_labels TEXT DEFAULT '[]',
+                ticket_components TEXT DEFAULT '[]',
+                ticket_fix_versions TEXT DEFAULT '[]',
+                ticket_parent_key TEXT DEFAULT '',
+                ticket_resolution TEXT DEFAULT '',
+                ticket_instance TEXT DEFAULT '',
+                ticket_synced_at TEXT DEFAULT '',
+                review_my_review_state TEXT DEFAULT '',
+                review_my_workflow_state TEXT DEFAULT '',
+                review_started_at TEXT DEFAULT '',
+                review_last_seen_comment_count INTEGER DEFAULT 0,
+                review_added_at TEXT DEFAULT '',
+                review_source TEXT DEFAULT '',
+                review_dirty INTEGER DEFAULT 0,
                 created_at TEXT,
-                updated_at TEXT,
-                PRIMARY KEY (project, task_id)
+                updated_at TEXT
             );
 
-            -- Append-only history log per task. Complements the `notes`
-            -- column on tasks: `notes` is a single editable persistent blob
-            -- (a pinned summary the user maintains), while `task_history`
-            -- is an immutable timeline of events appended by agents and
-            -- humans. Each entry is short (<=100 chars) and timestamped
-            -- so the timeline is scannable.
+            -- Append-only history log per task. Complements `tasks.notes`:
+            -- `notes` is a single editable blob (a pinned summary the
+            -- user maintains), `task_history` is an immutable timeline
+            -- of events appended by agents and humans. Each entry is
+            -- short (<=100 chars) and timestamped so the timeline is
+            -- scannable. Now also absorbs the old review_history rows.
             CREATE TABLE IF NOT EXISTS task_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project TEXT NOT NULL,
@@ -273,18 +341,16 @@ class EvaDB:
                 text TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_task_history_task
-                ON task_history(project, task_id, ts DESC);
+                ON task_history(task_id, ts DESC);
 
             CREATE TABLE IF NOT EXISTS task_dependencies (
-                project TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 depends_on TEXT NOT NULL,
-                PRIMARY KEY (project, task_id, depends_on),
-                FOREIGN KEY (project, task_id) REFERENCES tasks(project, task_id) ON DELETE CASCADE
+                PRIMARY KEY (task_id, depends_on),
+                FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS prs (
-                project TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 number INTEGER NOT NULL,
                 url TEXT DEFAULT '',
@@ -295,9 +361,6 @@ class EvaDB:
                 ci_status TEXT DEFAULT 'unknown',
                 review_status TEXT DEFAULT '',
                 comment_count INTEGER DEFAULT 0,
-                -- Snapshot of `comment_count` at the time the user last
-                -- opened this PR. UI renders an "N new" badge when
-                -- comment_count > last_seen_comment_count.
                 last_seen_comment_count INTEGER NOT NULL DEFAULT 0,
                 additions INTEGER DEFAULT 0,
                 deletions INTEGER DEFAULT 0,
@@ -305,26 +368,24 @@ class EvaDB:
                 head_branch TEXT DEFAULT '',
                 base_branch TEXT DEFAULT '',
                 last_updated TEXT DEFAULT '',
-                -- Separate from last_updated: this is the timestamp at which
-                -- the PR's status field actually changed (e.g. open -> merged).
-                -- `last_updated` tracks when Eva last talked to GitHub -- a
-                -- normal poll bumps it even when nothing changed, which used
-                -- to pollute the auto-generated worklog with PRs that
-                -- "happened today" only in the Eva-refresh sense.
+                -- Separate from last_updated: this is the timestamp at
+                -- which the PR's status field actually changed (e.g.
+                -- open -> merged). `last_updated` tracks when Eva last
+                -- talked to GitHub -- a normal poll bumps it even when
+                -- nothing changed, which used to pollute the auto-
+                -- generated worklog with PRs that "happened today"
+                -- only in the Eva-refresh sense.
                 status_changed_at TEXT DEFAULT '',
                 dirty INTEGER DEFAULT 0,
-                UNIQUE(project, task_id, number),
-                FOREIGN KEY (project, task_id) REFERENCES tasks(project, task_id) ON DELETE CASCADE
+                UNIQUE(task_id, number),
+                FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
             );
 
-            CREATE INDEX IF NOT EXISTS idx_tasks_project
-                ON tasks(project);
-
-            CREATE INDEX IF NOT EXISTS idx_tasks_project_status
-                ON tasks(project, status);
-
-            CREATE INDEX IF NOT EXISTS idx_prs_project_task
-                ON prs(project, task_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
+            CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks(type);
+            CREATE INDEX IF NOT EXISTS idx_tasks_ticket ON tasks(ticket_id)
+                WHERE ticket_id IS NOT NULL AND ticket_id != '';
+            CREATE INDEX IF NOT EXISTS idx_prs_task ON prs(task_id);
 
             -- Config tables --
 
@@ -418,71 +479,10 @@ class EvaDB:
         )
         self._conn.commit()
 
-        # Unified review queue. One row per PR we track in "All Reviews".
-        # Populated by three paths: (1) periodic sync of `gh search prs
-        # --review-requested=@me` + `--mentions=@me`, (2) manual pins via
-        # POST /api/review-requests/watchlist, (3) a per-PR `gh pr view`
-        # enrichment for CI / review / diff fields. `source` tells the
-        # UI whether an Unpin button is meaningful.
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS review_prs (
-                url TEXT PRIMARY KEY,
-                repo TEXT NOT NULL,
-                number INTEGER NOT NULL,
-                title TEXT DEFAULT '',
-                author TEXT DEFAULT '',
-                status TEXT DEFAULT 'open',
-                ci_status TEXT DEFAULT 'unknown',
-                review_status TEXT DEFAULT 'review_required',
-                my_review_state TEXT DEFAULT '' CHECK(my_review_state IN (
-                    '', 'pending_review', 'approved',
-                    'changes_requested', 'commented')),
-                comment_count INTEGER DEFAULT 0,
-                additions INTEGER DEFAULT 0,
-                deletions INTEGER DEFAULT 0,
-                head_branch TEXT DEFAULT '',
-                base_branch TEXT DEFAULT '',
-                last_updated TEXT DEFAULT '',
-                source TEXT NOT NULL DEFAULT 'manual',
-                added_at TEXT NOT NULL,
-                synced_at TEXT DEFAULT '',
-                -- `dirty=1` means a refresh is pending for this row.
-                -- Set by: newly-pinned rows, github_poller on notification
-                -- about this PR, or a manual "refresh this one" tap.
-                -- Cleared by the sync worker after a successful enrich.
-                dirty INTEGER DEFAULT 0,
-                -- Snapshot of `comment_count` at the time the user last
-                -- opened this review. UI renders an "N new" badge when
-                -- comment_count > last_seen_comment_count.
-                last_seen_comment_count INTEGER NOT NULL DEFAULT 0,
-                -- Review-workflow columns: populated when the user
-                -- opens an agent session against this PR.
-                session_name TEXT DEFAULT '',
-                agent_session_id TEXT DEFAULT '',
-                started_at TEXT DEFAULT '',
-                my_workflow_state TEXT DEFAULT 'queued' CHECK(
-                    my_workflow_state IN (
-                        'queued', 'active', 'done', 'dismissed'))
-            )
-        """)
-        self._conn.commit()
-        # Review history (append-only timeline per review PR). Parallels
-        # `task_history` -- one terse line per step (<=100 chars). Fed
-        # by the user via `eva-cli append-review-history`, by the agent via
-        # the /api/hook pipeline, and by core/common.reviews.py when workflow
-        # state transitions.
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS review_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                review_url TEXT NOT NULL,
-                text TEXT NOT NULL,
-                ts TEXT NOT NULL,
-                source TEXT DEFAULT 'manual'
-            );
-            CREATE INDEX IF NOT EXISTS idx_review_history_url
-                ON review_history(review_url, ts DESC);
-        """)
-        self._conn.commit()
+        # The legacy `review_prs` + `review_history` tables are gone --
+        # data merged into `tasks` (type='review' + review_* columns)
+        # and `task_history` (one shared timeline). See
+        # bin/migrate_unify_tasks.py.
 
         # settings: a generic JSON key-value store. Plugin runtime
         # config (cookies, tokens, channel ids, ...) plus framework
@@ -545,62 +545,9 @@ class EvaDB:
         """)
         self._conn.commit()
 
-        # tickets: cached snapshot of JIRA issues assigned to the user.
-        # We persist the full row (vs. live API fetch on every page
-        # render) so the Tickets page works offline + is fast. `key`
-        # is the JIRA issue key (e.g. "PROJ-1234") and the natural
-        # primary key.  `assignee_email` is denormalised so per-user
-        # filtering is O(index) -- the page filters by the configured
-        # JIRA email so multi-user installs don't cross-leak.
-        # `instance_name` lets one user track multiple JIRAs (e.g. an
-        # OSS Apache JIRA + a corporate Atlassian Cloud one) without
-        # issue keys colliding (`EX-1` could exist in both).
-        # Composite primary key (instance_name, key).
-        #
-        # Order matters: create-or-leave the table first; if it
-        # predates multi-JIRA, the migration step below adds the
-        # `instance_name` column. Indexes touching that column run
-        # AFTER the migration so they always see a valid schema.
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS tickets (
-                instance_name TEXT NOT NULL DEFAULT '',
-                key TEXT NOT NULL,
-                summary TEXT NOT NULL DEFAULT '',
-                description TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT '',
-                priority TEXT NOT NULL DEFAULT '',
-                issue_type TEXT NOT NULL DEFAULT '',
-                project_key TEXT NOT NULL DEFAULT '',
-                assignee_email TEXT NOT NULL DEFAULT '',
-                reporter_email TEXT NOT NULL DEFAULT '',
-                url TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT '',
-                synced_at TEXT NOT NULL DEFAULT '',
-                -- Phase-1 enrichment columns. JSON-encoded for the
-                -- list-shaped values (labels / components / fix_versions)
-                -- so we don't need a side-table per facet. Empty string
-                -- '' means "not synced yet" / "no value"; the parser
-                -- defaults to [] / "" on a non-JSON read.
-                labels TEXT NOT NULL DEFAULT '',
-                components TEXT NOT NULL DEFAULT '',
-                fix_versions TEXT NOT NULL DEFAULT '',
-                parent_key TEXT NOT NULL DEFAULT '',
-                resolution TEXT NOT NULL DEFAULT '',
-                status_category TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (instance_name, key)
-            );
-        """)
-        self._conn.commit()
-        self._conn.executescript("""
-            CREATE INDEX IF NOT EXISTS idx_tickets_assignee
-                ON tickets(assignee_email, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_tickets_status
-                ON tickets(status);
-            CREATE INDEX IF NOT EXISTS idx_tickets_instance
-                ON tickets(instance_name);
-        """)
-        self._conn.commit()
+        # The legacy `tickets` table is gone -- JIRA cache rows moved
+        # into `tasks` (ticket_* prefixed columns; type derived from
+        # labels / issue_type). See bin/migrate_unify_tasks.py.
 
         # Seed default action definitions
         self._seed_action_defaults()
@@ -861,17 +808,21 @@ class EvaDB:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # `project` is accepted for back-compat with existing callers but
+    # unused -- task_id alone is now globally unique. Eventually a
+    # follow-up cleanup pass can drop the parameter.
+
     def _get_dependencies(self, project: str, task_id: str) -> list:
         cur = self._conn.execute(
-            "SELECT depends_on FROM task_dependencies WHERE project=? AND task_id=?",
-            (project, task_id),
+            "SELECT depends_on FROM task_dependencies WHERE task_id=?",
+            (task_id,),
         )
         return [row["depends_on"] for row in cur.fetchall()]
 
     def _get_prs(self, project: str, task_id: str) -> list:
         cur = self._conn.execute(
-            "SELECT * FROM prs WHERE project=? AND task_id=?",
-            (project, task_id),
+            "SELECT * FROM prs WHERE task_id=?",
+            (task_id,),
         )
         return [_pr_row_to_dict(row) for row in cur.fetchall()]
 
@@ -879,9 +830,9 @@ class EvaDB:
         """Most-recent-first list of history entries for a task."""
         cur = self._conn.execute(
             "SELECT ts, text FROM task_history "
-            "WHERE project=? AND task_id=? "
+            "WHERE task_id=? "
             "ORDER BY ts DESC, id DESC LIMIT ?",
-            (project, task_id, limit),
+            (task_id, limit),
         )
         return [{"ts": row["ts"], "text": row["text"]} for row in cur.fetchall()]
 
@@ -920,38 +871,44 @@ class EvaDB:
         ticket_id=None,
         ticket_url=None,
     ) -> dict:
-        """Insert a new task and return it as a dict."""
+        """Insert a new task and return it as a dict. task_id must be
+        globally unique. `project` is the optional folder grouping
+        (pass '' or None for unsorted)."""
         _validate_status(status)
         now = _now_iso()
         self._conn.execute(
             """
             INSERT INTO tasks
-                (project, task_id, description, type, status, group_name, notes,
+                (task_id, project, description, type, status, group_name, notes,
                  priority, ticket_id, ticket_url, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project, task_id, description, type, status, group_name, notes,
+            (task_id, project or "", description, type, status, group_name, notes,
              priority, ticket_id, ticket_url, now, now),
         )
         self._conn.commit()
         return self.get_task(project, task_id)
 
     def get_task(self, project: str, task_id: str):
-        """Return task dict with dependencies and prs, or None if not found."""
+        """Return task dict with dependencies and prs, or None if not found.
+
+        Lookup is by task_id alone (globally unique post-merge); the
+        `project` parameter is accepted for back-compat but unused.
+        """
         row = self._conn.execute_fetchone(
-            "SELECT * FROM tasks WHERE project=? AND task_id=?",
-            (project, task_id),
+            "SELECT * FROM tasks WHERE task_id=?",
+            (task_id,),
         )
         if row is None:
             return None
-        return self._task_row_to_dict(row, project, task_id)
+        return self._task_row_to_dict(row, row["project"] or "", task_id)
 
     def _validate_follow_ups(self, project: str, follow_ups: list) -> None:
         """Ensure follow_ups are natural language descriptions, not task IDs."""
         if not isinstance(follow_ups, list):
             raise ValueError("follow_ups must be a list of strings")
         task_ids = {r["task_id"] for r in self._conn.execute_fetchall(
-            "SELECT task_id FROM tasks WHERE project=?", (project,)
+            "SELECT task_id FROM tasks"
         )}
         for item in follow_ups:
             if not isinstance(item, str):
@@ -964,16 +921,32 @@ class EvaDB:
                 )
 
     def update_task(self, project: str, task_id: str, **fields) -> dict:
-        """Update only the provided fields and auto-stamp updated_at."""
+        """Update only the provided fields and auto-stamp updated_at.
+
+        Match is by task_id alone (globally unique). `project` accepted
+        for back-compat but unused for matching; if `project` appears
+        in `fields` we DO write it (re-grouping).
+        """
         allowed = {
+            "project",
             "description", "type", "status", "group_name", "notes",
             "priority", "ticket_id", "ticket_url", "follow_ups",
+            # ticket_* / review_* cache columns are settable so jira_sync
+            # + review-sync can refresh them in-place.
+            "ticket_summary", "ticket_priority", "ticket_issue_type",
+            "ticket_project_key", "ticket_assignee_email",
+            "ticket_reporter_email", "ticket_status",
+            "ticket_status_category", "ticket_labels",
+            "ticket_components", "ticket_fix_versions",
+            "ticket_parent_key", "ticket_resolution",
+            "ticket_instance", "ticket_synced_at",
+            "review_my_review_state", "review_my_workflow_state",
+            "review_started_at", "review_last_seen_comment_count",
+            "review_added_at", "review_source", "review_dirty",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
-        # Validate status
         if "status" in updates:
             _validate_status(updates["status"])
-        # Validate and serialize follow_ups
         if "follow_ups" in updates:
             self._validate_follow_ups(project, updates["follow_ups"])
             updates["follow_ups"] = json.dumps(updates["follow_ups"])
@@ -982,9 +955,9 @@ class EvaDB:
 
         updates["updated_at"] = _now_iso()
         set_clause = ", ".join(f"{col}=?" for col in updates)
-        values = list(updates.values()) + [project, task_id]
+        values = list(updates.values()) + [task_id]
         self._conn.execute(
-            f"UPDATE tasks SET {set_clause} WHERE project=? AND task_id=?",
+            f"UPDATE tasks SET {set_clause} WHERE task_id=?",
             values,
         )
         self._conn.commit()
@@ -992,29 +965,34 @@ class EvaDB:
 
     def delete_task(self, project: str, task_id: str) -> bool:
         """Delete a task (cascades to dependencies, prs, and history).
-        Returns True if deleted."""
+        Returns True if deleted. `project` is unused (task_id is global)."""
         cur = self._conn.execute(
-            "DELETE FROM tasks WHERE project=? AND task_id=?",
-            (project, task_id),
+            "DELETE FROM tasks WHERE task_id=?",
+            (task_id,),
         )
-        # Cascade cleanup -- sqlite FOREIGN KEY ... ON DELETE CASCADE is
-        # off by default unless PRAGMA foreign_keys=ON is set per-connection,
-        # so we delete explicitly. Safe to run even when the task didn't
-        # exist; affected_rows will be 0.
+        # Explicit task_history cleanup -- FOREIGN KEY ON DELETE CASCADE
+        # doesn't apply here because task_history isn't FK'd to tasks.
         self._conn.execute(
-            "DELETE FROM task_history WHERE project=? AND task_id=?",
-            (project, task_id),
+            "DELETE FROM task_history WHERE task_id=?",
+            (task_id,),
         )
         self._conn.commit()
         return cur.rowcount > 0
 
     def list_tasks(self, project: str) -> list:
-        """Return list of task dicts for the given project."""
-        rows = self._conn.execute_fetchall(
-            "SELECT * FROM tasks WHERE project=?",
-            (project,),
-        )
-        return [self._task_row_to_dict(row, project, row["task_id"]) for row in rows]
+        """Return list of task dicts for the given project. Pass
+        `project=''` to list unsorted tasks; pass `project=None` (via
+        positional ``None``) to list every task across folders."""
+        if project is None:
+            rows = self._conn.execute_fetchall(
+                "SELECT * FROM tasks"
+            )
+        else:
+            rows = self._conn.execute_fetchall(
+                "SELECT * FROM tasks WHERE project=?",
+                (project,),
+            )
+        return [self._task_row_to_dict(row, row["project"] or "", row["task_id"]) for row in rows]
 
     # ------------------------------------------------------------------
     # Task history (append-only timeline replacing the mutable `notes` blob)
@@ -1051,11 +1029,11 @@ class EvaDB:
         (otherwise history could leak across delete/recreate cycles)."""
         text = self._validate_history_text(text, self.TASK_HISTORY_MAX_CHARS)
         if not self.get_task(project, task_id):
-            raise ValueError(f"task {task_id!r} not found in project {project!r}")
+            raise ValueError(f"task {task_id!r} not found")
         ts = ts or _now_iso()
         self._conn.execute(
             "INSERT INTO task_history (project, task_id, ts, text) VALUES (?, ?, ?, ?)",
-            (project, task_id, ts, text),
+            (project or "", task_id, ts, text),
         )
         self._conn.commit()
         return {"ts": ts, "text": text}
@@ -1071,41 +1049,26 @@ class EvaDB:
     def add_dependency(self, project: str, task_id: str, depends_on: str) -> None:
         """Add a dependency for a task (INSERT OR IGNORE)."""
         self._conn.execute(
-            """
-            INSERT OR IGNORE INTO task_dependencies (project, task_id, depends_on)
-            VALUES (?, ?, ?)
-            """,
-            (project, task_id, depends_on),
+            "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+            (task_id, depends_on),
         )
         self._conn.commit()
 
     def list_dependents(self, project: str, depends_on: str) -> list:
-        """Return task_ids in `project` that depend on `depends_on`.
-
-        Used by the write-boundary fan-out: when task A's status
-        changes, every B that lists A as a dependency may have its
-        computed `effective_status` (blocked vs not) flipped, so we
-        emit a follow-up `task.updated` event for each B so the
-        frontend's useProject / TaskCard can refresh in lockstep.
-
-        Direct edges only -- not transitive. Caller can recurse if it
-        needs the full reverse-cone.
-        """
+        """Return task_ids that depend on `depends_on`. Direct edges
+        only (callers can recurse for transitive). `project` is unused
+        post-merge -- dep graph is now global."""
         cur = self._conn.execute(
-            "SELECT task_id FROM task_dependencies "
-            "WHERE project=? AND depends_on=?",
-            (project, depends_on),
+            "SELECT task_id FROM task_dependencies WHERE depends_on=?",
+            (depends_on,),
         )
         return [r[0] for r in cur.fetchall()]
 
     def remove_dependency(self, project: str, task_id: str, depends_on: str) -> None:
-        """Remove a dependency from a task."""
+        """Remove a dependency edge."""
         self._conn.execute(
-            """
-            DELETE FROM task_dependencies
-            WHERE project=? AND task_id=? AND depends_on=?
-            """,
-            (project, task_id, depends_on),
+            "DELETE FROM task_dependencies WHERE task_id=? AND depends_on=?",
+            (task_id, depends_on),
         )
         self._conn.commit()
 
@@ -1113,15 +1076,12 @@ class EvaDB:
         """Replace all dependencies for a task atomically."""
         with self._conn:
             self._conn.execute(
-                "DELETE FROM task_dependencies WHERE project=? AND task_id=?",
-                (project, task_id),
+                "DELETE FROM task_dependencies WHERE task_id=?",
+                (task_id,),
             )
             self._conn.executemany(
-                """
-                INSERT INTO task_dependencies (project, task_id, depends_on)
-                VALUES (?, ?, ?)
-                """,
-                [(project, task_id, dep) for dep in deps_list],
+                "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+                [(task_id, dep) for dep in deps_list],
             )
 
     def is_task_blocked(self, project: str, task_id: str) -> bool:
@@ -1136,12 +1096,11 @@ class EvaDB:
             f"""
             SELECT COUNT(*) AS cnt
             FROM task_dependencies td
-            LEFT JOIN tasks t
-                ON t.project = td.project AND t.task_id = td.depends_on
-            WHERE td.project = ? AND td.task_id = ?
+            LEFT JOIN tasks t ON t.task_id = td.depends_on
+            WHERE td.task_id = ?
               AND (t.task_id IS NULL OR t.status NOT IN ({placeholders}))
             """,
-            (project, task_id, *sorted(UNBLOCKING_DEP_STATUSES)),
+            (task_id, *sorted(UNBLOCKING_DEP_STATUSES)),
         )
         row = cur.fetchone()
         return row["cnt"] > 0
@@ -1170,27 +1129,28 @@ class EvaDB:
         base_branch: str = "",
         last_updated: str = "",
     ) -> None:
-        """Insert a PR row and touch common.tasks.updated_at."""
+        """Insert a PR row and touch tasks.updated_at. `project` accepted
+        for back-compat but unused -- PR is FK'd by task_id alone now."""
         self._conn.execute(
             """
-            INSERT INTO prs (project, task_id, number, url, status, title, session, working_dir,
+            INSERT INTO prs (task_id, number, url, status, title, session, working_dir,
                              ci_status, review_status, comment_count, additions, deletions, author, head_branch, base_branch, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project, task_id, number, url, status, title, session, working_dir,
+            (task_id, number, url, status, title, session, working_dir,
              ci_status, review_status, comment_count, additions, deletions, author, head_branch, base_branch, last_updated),
         )
         self._conn.execute(
-            "UPDATE tasks SET updated_at=? WHERE project=? AND task_id=?",
-            (_now_iso(), project, task_id),
+            "UPDATE tasks SET updated_at=? WHERE task_id=?",
+            (_now_iso(), task_id),
         )
         self._conn.commit()
 
     def delete_pr(self, project: str, task_id: str, number: int) -> bool:
         """Delete a PR row. Returns True if a row was deleted."""
         cur = self._conn.execute(
-            "DELETE FROM prs WHERE project=? AND task_id=? AND number=?",
-            (project, task_id, number),
+            "DELETE FROM prs WHERE task_id=? AND number=?",
+            (task_id, number),
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -1286,14 +1246,14 @@ class EvaDB:
         we never rewrite it on subsequent polls.
         """
         self._update_pr_rows(
-            where_sql="project=? AND task_id=? AND number=?",
-            where_params=(project, task_id, number),
+            where_sql="task_id=? AND number=?",
+            where_params=(task_id, number),
             fields=fields,
         )
 
     def list_all_prs(self, status: str = "", search: str = "") -> list:
-        """List all PRs across all projects, optionally filtered by status or search."""
-        query = "SELECT p.*, t.description as task_description, t.status as task_status FROM prs p JOIN tasks t ON p.project=t.project AND p.task_id=t.task_id"
+        """List all PRs across all tasks, optionally filtered by status or search."""
+        query = "SELECT p.*, t.description as task_description, t.status as task_status, t.project as project FROM prs p JOIN tasks t ON p.task_id=t.task_id"
         conditions = []
         params = []
         if status:
@@ -1309,9 +1269,9 @@ class EvaDB:
         return [_pr_row_to_dict(r) for r in rows]
 
     def find_pr_by_number(self, number: int):
-        """Find a PR by number across all projects. Returns dict or None."""
+        """Find a PR by number across all tasks. Returns dict or None."""
         row = self._conn.execute_fetchone(
-            "SELECT p.*, t.description as task_description FROM prs p JOIN tasks t ON p.project=t.project AND p.task_id=t.task_id WHERE p.number=? LIMIT 1",
+            "SELECT p.*, t.description as task_description, t.project as project FROM prs p JOIN tasks t ON p.task_id=t.task_id WHERE p.number=? LIMIT 1",
             (number,),
         )
         return _pr_row_to_dict(row) if row else None
@@ -1354,9 +1314,9 @@ class EvaDB:
         self._conn.commit()
 
     def list_dirty_prs(self) -> list:
-        """Return all dirty PRs across all projects."""
+        """Return all dirty PRs across all tasks."""
         rows = self._conn.execute_fetchall(
-            "SELECT p.*, t.description as task_description, t.status as task_status FROM prs p JOIN tasks t ON p.project=t.project AND p.task_id=t.task_id WHERE p.dirty=1"
+            "SELECT p.*, t.description as task_description, t.status as task_status, t.project as project FROM prs p JOIN tasks t ON p.task_id=t.task_id WHERE p.dirty=1"
         )
         return [dict(r) for r in rows]
 
@@ -1409,143 +1369,300 @@ class EvaDB:
         "commented",          # my latest review was COMMENT
     })
 
-    def upsert_review_pr(self, url: str, repo: str, number: int, **fields) -> dict:
-        """Insert or merge a review-queue row.
+    # All review_prs methods below now back onto the unified `tasks`
+    # table (type='review'). Each "review row" is one task row plus one
+    # `prs` row attached to it (review tasks are 1:1 with their PR).
+    # The methods preserve the old return shape so route + frontend code
+    # don't have to change in this commit.
 
-        `added_at` stamps on first insert and is preserved on updates so
-        the UI can still sort "newly-arrived review requests" by arrival
-        time. `synced_at` always bumps to now so we know how fresh the
-        enrichment fields are. Only columns in `_REVIEW_PR_FIELDS` can
-        be overwritten via kwargs -- schema columns are immutable.
-        """
+    @staticmethod
+    def _review_task_id_from_url(url: str) -> str:
+        """`https://github.com/owner/repo/pull/N` -> `review-owner-repo-N`.
+
+        Mirrors the migration's slug logic (`bin/migrate_unify_tasks.py
+        :review_task_id`). Returns '' for un-parseable URLs."""
+        import re as _re
+        m = _re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", url or "")
+        if not m:
+            return ""
+        slug = _re.sub(r"[^a-zA-Z0-9]+", "-",
+                       f"{m.group(1)}/{m.group(2)}").strip("-").lower()
+        return f"review-{slug}-{m.group(3)}"
+
+    @staticmethod
+    def _repo_from_review_url(url: str) -> str:
+        import re as _re
+        m = _re.search(r"github\.com/([^/]+)/([^/]+)/pull/", url or "")
+        return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+    def _review_row_from_task(self, task_row, pr_row) -> dict:
+        """Reshape a (task, pr) pair back into the old review_prs row
+        dict so existing callers see the legacy shape. `task_row` is a
+        Row from `tasks` (type='review'); `pr_row` is the matching prs
+        row (may be None if a review task has no PR attached)."""
+        url = pr_row["url"] if pr_row else ""
+        # Pull session_name + agent_session_id from sessions if open.
+        sess = self._conn.execute_fetchone(
+            "SELECT tmux_name, agent_session_id FROM sessions WHERE task_id=?",
+            (task_row["task_id"],),
+        )
+        return {
+            "url": url,
+            "repo": self._repo_from_review_url(url),
+            "number": (pr_row["number"] if pr_row else 0),
+            "title": (pr_row["title"] if pr_row else (task_row["description"] or "")),
+            "author": (pr_row["author"] if pr_row else ""),
+            "status": (pr_row["status"] if pr_row else "open"),
+            "ci_status": (pr_row["ci_status"] if pr_row else "unknown"),
+            "review_status": (pr_row["review_status"] if pr_row else ""),
+            "my_review_state": task_row["review_my_review_state"] or "",
+            "comment_count": (pr_row["comment_count"] if pr_row else 0),
+            "additions": (pr_row["additions"] if pr_row else 0),
+            "deletions": (pr_row["deletions"] if pr_row else 0),
+            "head_branch": (pr_row["head_branch"] if pr_row else ""),
+            "base_branch": (pr_row["base_branch"] if pr_row else ""),
+            "last_updated": (pr_row["last_updated"] if pr_row else ""),
+            "source": task_row["review_source"] or "manual",
+            "added_at": task_row["review_added_at"] or "",
+            "synced_at": task_row["updated_at"] or "",
+            "dirty": task_row["review_dirty"] or 0,
+            "last_seen_comment_count": task_row["review_last_seen_comment_count"] or 0,
+            "session_name": (sess["tmux_name"] if sess else ""),
+            "agent_session_id": (sess["agent_session_id"] if sess else ""),
+            "started_at": task_row["review_started_at"] or "",
+            "my_workflow_state": task_row["review_my_workflow_state"] or "queued",
+        }
+
+    def upsert_review_pr(self, url: str, repo: str, number: int, **fields) -> dict:
+        """Insert or merge a review row. Splits the update across the
+        `tasks` row (workflow state) and the `prs` row (GitHub metadata)
+        so callers can keep using the old `(url, repo, number, **fields)`
+        signature."""
+        task_id = self._review_task_id_from_url(url)
+        if not task_id:
+            raise ValueError(f"can't derive review task_id from url {url!r}")
         now = _now_iso()
-        existing = self._conn.execute_fetchone(
-            "SELECT * FROM review_prs WHERE url=?", (url,),
+        existing_task = self._conn.execute_fetchone(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,),
         )
-        added_at = existing["added_at"] if existing else now
-        # Start from existing row so partial updates don't wipe fields
-        # the caller didn't provide.
-        base = dict(existing) if existing else {}
-        base.update({
-            "url": url, "repo": repo, "number": number,
-            "added_at": added_at, "synced_at": now,
-        })
-        for k, v in fields.items():
-            if k not in self._REVIEW_PR_FIELDS:
-                continue
-            if k == "my_review_state" and v not in self.REVIEW_STATES:
-                raise ValueError(
-                    f"my_review_state must be one of {sorted(self.REVIEW_STATES)}; "
-                    f"got {v!r}",
-                )
-            if (k == "my_workflow_state"
-                    and v not in self.REVIEW_WORKFLOW_STATES):
-                raise ValueError(
-                    f"my_workflow_state must be one of "
-                    f"{sorted(self.REVIEW_WORKFLOW_STATES)}; got {v!r}",
-                )
-            base[k] = v
-        # Fill defaults for new rows.
-        base.setdefault("title", "")
-        base.setdefault("author", "")
-        base.setdefault("status", "open")
-        base.setdefault("ci_status", "unknown")
-        base.setdefault("review_status", "review_required")
-        base.setdefault("comment_count", 0)
-        base.setdefault("additions", 0)
-        base.setdefault("deletions", 0)
-        base.setdefault("head_branch", "")
-        base.setdefault("base_branch", "")
-        base.setdefault("last_updated", "")
-        base.setdefault("source", "manual")
-        base.setdefault("my_review_state", "")
-        # Workflow columns: preserved across sync passes so the github
-        # poller doesn't wipe my `session_name` every time it enriches.
-        base.setdefault("session_name", "")
-        base.setdefault("agent_session_id", "")
-        base.setdefault("my_workflow_state", "queued")
-        base.setdefault("started_at", "")
-        # `dirty` also needs explicit carry-through -- INSERT OR REPLACE
-        # would otherwise reset unlisted columns to their DEFAULT on
-        # every upsert. Keep the prior value (or 0 for fresh rows).
-        base.setdefault("dirty", 0)
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO review_prs
-                (url, repo, number, title, author, status,
-                 ci_status, review_status, my_review_state,
-                 comment_count, additions, deletions,
-                 head_branch, base_branch,
-                 last_updated, source, added_at, synced_at,
-                 session_name, agent_session_id,
-                 my_workflow_state, started_at, dirty)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                url, repo, number,
-                base["title"], base["author"], base["status"],
-                base["ci_status"], base["review_status"], base["my_review_state"],
-                base["comment_count"], base["additions"], base["deletions"],
-                base["head_branch"], base["base_branch"],
-                base["last_updated"], base["source"],
-                base["added_at"], base["synced_at"],
-                base["session_name"], base["agent_session_id"],
-                base["my_workflow_state"], base["started_at"], base["dirty"],
-            ),
+        # Validate enum kwargs before any write.
+        if "my_review_state" in fields and fields["my_review_state"] not in self.REVIEW_STATES:
+            raise ValueError(
+                f"my_review_state must be one of {sorted(self.REVIEW_STATES)}; "
+                f"got {fields['my_review_state']!r}",
+            )
+        if ("my_workflow_state" in fields
+                and fields["my_workflow_state"] not in self.REVIEW_WORKFLOW_STATES):
+            raise ValueError(
+                f"my_workflow_state must be one of "
+                f"{sorted(self.REVIEW_WORKFLOW_STATES)}; got {fields['my_workflow_state']!r}",
+            )
+
+        # Task-side fields: workflow + tracking
+        task_updates = {"updated_at": now}
+        for k_old, k_new in (
+            ("my_review_state", "review_my_review_state"),
+            ("my_workflow_state", "review_my_workflow_state"),
+            ("started_at", "review_started_at"),
+            ("source", "review_source"),
+        ):
+            if k_old in fields:
+                task_updates[k_new] = fields[k_old]
+        if existing_task is None:
+            # Create the review task row.
+            self._conn.execute(
+                """
+                INSERT INTO tasks (task_id, project, type, description, status,
+                    review_added_at, review_source, review_my_workflow_state,
+                    review_my_review_state, review_started_at,
+                    created_at, updated_at)
+                VALUES (?, '', 'review', ?, 'not_started',
+                    ?, ?, ?, ?, ?,
+                    ?, ?)
+                """,
+                (
+                    task_id,
+                    fields.get("title", "") or "",
+                    now,
+                    fields.get("source", "manual"),
+                    fields.get("my_workflow_state", "queued"),
+                    fields.get("my_review_state", ""),
+                    fields.get("started_at", ""),
+                    now, now,
+                ),
+            )
+        elif task_updates:
+            set_clause = ", ".join(f"{c}=?" for c in task_updates)
+            self._conn.execute(
+                f"UPDATE tasks SET {set_clause} WHERE task_id=?",
+                list(task_updates.values()) + [task_id],
+            )
+
+        # PR-side fields: ci/review/title/author etc. on the prs row.
+        existing_pr = self._conn.execute_fetchone(
+            "SELECT * FROM prs WHERE task_id=? AND number=?", (task_id, number),
         )
+        pr_field_map = {
+            "title": "title", "author": "author", "status": "status",
+            "ci_status": "ci_status", "review_status": "review_status",
+            "comment_count": "comment_count",
+            "additions": "additions", "deletions": "deletions",
+            "head_branch": "head_branch", "base_branch": "base_branch",
+            "last_updated": "last_updated",
+        }
+        pr_updates = {pr_col: fields[k]
+                      for k, pr_col in pr_field_map.items() if k in fields}
+        if existing_pr is None:
+            self._conn.execute(
+                """
+                INSERT INTO prs (task_id, number, url, status, title,
+                                 ci_status, review_status, comment_count,
+                                 additions, deletions, author,
+                                 head_branch, base_branch, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id, number, url,
+                    fields.get("status", "open"),
+                    fields.get("title", ""),
+                    fields.get("ci_status", "unknown"),
+                    fields.get("review_status", "review_required"),
+                    fields.get("comment_count", 0),
+                    fields.get("additions", 0),
+                    fields.get("deletions", 0),
+                    fields.get("author", ""),
+                    fields.get("head_branch", ""),
+                    fields.get("base_branch", ""),
+                    fields.get("last_updated", ""),
+                ),
+            )
+        elif pr_updates:
+            set_clause = ", ".join(f"{c}=?" for c in pr_updates)
+            self._conn.execute(
+                f"UPDATE prs SET {set_clause} WHERE task_id=? AND number=?",
+                list(pr_updates.values()) + [task_id, number],
+            )
+        # Session columns from the legacy upsert. session_name='' (or
+        # agent_session_id='') means "clear the session reference"
+        # (callers use this on kill); a non-empty value writes through
+        # to the sessions table.
+        if "session_name" in fields or "agent_session_id" in fields:
+            clearing = (
+                fields.get("session_name", None) == ""
+                and fields.get("agent_session_id", None) == ""
+            )
+            if clearing:
+                self._conn.execute(
+                    "DELETE FROM sessions WHERE task_id=?", (task_id,),
+                )
+            else:
+                sess = self._conn.execute_fetchone(
+                    "SELECT * FROM sessions WHERE task_id=?", (task_id,),
+                )
+                tmux_name = (fields.get("session_name")
+                             or (sess["tmux_name"] if sess else task_id))
+                agent_sid = (fields.get("agent_session_id")
+                             or (sess["agent_session_id"] if sess else ""))
+                if sess is None:
+                    self._conn.execute(
+                        "INSERT INTO sessions (task_id, project, tmux_name, "
+                        "agent_session_id, created_at, updated_at) "
+                        "VALUES (?, '', ?, ?, ?, ?)",
+                        (task_id, tmux_name, agent_sid, now, now),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE sessions SET tmux_name=?, agent_session_id=?, "
+                        "updated_at=? WHERE task_id=?",
+                        (tmux_name, agent_sid, now, task_id),
+                    )
         self._conn.commit()
         return self.get_review_pr(url) or {}
 
     def get_review_pr(self, url: str):
-        row = self._conn.execute_fetchone(
-            "SELECT * FROM review_prs WHERE url=?", (url,),
+        task_id = self._review_task_id_from_url(url)
+        if not task_id:
+            return None
+        task_row = self._conn.execute_fetchone(
+            "SELECT * FROM tasks WHERE task_id=? AND type='review'",
+            (task_id,),
         )
-        return _row_to_dict(row) if row else None
+        if task_row is None:
+            return None
+        pr_row = self._conn.execute_fetchone(
+            "SELECT * FROM prs WHERE task_id=? LIMIT 1", (task_id,),
+        )
+        return self._review_row_from_task(task_row, pr_row)
 
     def list_review_prs(self) -> list:
-        """All review-queue rows, most-recently-updated first. Sort keys
-        on `last_updated` (GitHub's own updatedAt) so new activity floats
-        to the top the same way the GitHub notifications API orders
-        entries."""
+        """All review tasks, most-recently-updated first. Sort key is
+        the attached PR's `last_updated` (GitHub's updatedAt) so new
+        activity floats to the top."""
         rows = self._conn.execute_fetchall(
-            "SELECT * FROM review_prs ORDER BY last_updated DESC, added_at DESC"
+            "SELECT t.*, p.url AS _pr_url FROM tasks t "
+            "LEFT JOIN prs p ON p.task_id = t.task_id "
+            "WHERE t.type='review' "
+            "ORDER BY COALESCE(p.last_updated, t.review_added_at) DESC, "
+            "         t.review_added_at DESC"
         )
-        return [_row_to_dict(r) for r in rows]
+        out = []
+        for r in rows:
+            pr_row = None
+            if r["_pr_url"]:
+                pr_row = self._conn.execute_fetchone(
+                    "SELECT * FROM prs WHERE task_id=?", (r["task_id"],),
+                )
+            out.append(self._review_row_from_task(r, pr_row))
+        return out
 
     def delete_review_pr(self, url: str) -> bool:
+        task_id = self._review_task_id_from_url(url)
+        if not task_id:
+            return False
         cur = self._conn.execute(
-            "DELETE FROM review_prs WHERE url=?", (url,),
+            "DELETE FROM tasks WHERE task_id=? AND type='review'",
+            (task_id,),
         )
         self._conn.commit()
         return cur.rowcount > 0
 
     def mark_review_seen(self, url: str) -> bool:
-        """Snapshot the row's current comment_count into
-        last_seen_comment_count. Frontend calls this when the user
-        opens a review (selectedPR transition) so any further
-        comment_count growth from the next review-sync surfaces as
-        a "N new" badge on the PR node. Returns True if a row was
-        updated, False on unknown url."""
+        """Snapshot the row's current PR comment_count into
+        review_last_seen_comment_count on the task."""
+        task_id = self._review_task_id_from_url(url)
+        if not task_id:
+            return False
+        pr = self._conn.execute_fetchone(
+            "SELECT comment_count FROM prs WHERE task_id=? LIMIT 1", (task_id,),
+        )
+        if pr is None:
+            return False
         cur = self._conn.execute(
-            "UPDATE review_prs "
-            "SET last_seen_comment_count = comment_count "
-            "WHERE url = ?",
-            (url,),
+            "UPDATE tasks SET review_last_seen_comment_count=? "
+            "WHERE task_id=? AND type='review'",
+            (pr["comment_count"] or 0, task_id),
         )
         self._conn.commit()
         return cur.rowcount > 0
 
     def mark_review_pr_dirty(self, *, url: str = "", number: int = 0) -> bool:
-        """Flag a review row for the next sync worker pass. Match by url
-        OR by number (github_poller only has the PR number). Returns
-        True if a row was actually touched."""
+        """Flag a review task for the next sync pass. Match by url
+        (preferred) or by PR number."""
         if url:
+            task_id = self._review_task_id_from_url(url)
+            if not task_id:
+                return False
             cur = self._conn.execute(
-                "UPDATE review_prs SET dirty=1 WHERE url=?", (url,),
+                "UPDATE tasks SET review_dirty=1 "
+                "WHERE task_id=? AND type='review'",
+                (task_id,),
             )
         elif number:
             cur = self._conn.execute(
-                "UPDATE review_prs SET dirty=1 WHERE number=?", (number,),
+                "UPDATE tasks SET review_dirty=1 "
+                "WHERE type='review' AND task_id IN "
+                "  (SELECT task_id FROM prs WHERE number=?)",
+                (number,),
             )
         else:
             return False
@@ -1554,16 +1671,36 @@ class EvaDB:
 
     def list_dirty_review_prs(self) -> list:
         rows = self._conn.execute_fetchall(
-            "SELECT * FROM review_prs WHERE dirty=1"
+            "SELECT t.*, p.url AS _pr_url FROM tasks t "
+            "LEFT JOIN prs p ON p.task_id = t.task_id "
+            "WHERE t.type='review' AND t.review_dirty=1"
         )
-        return [_row_to_dict(r) for r in rows]
+        out = []
+        for r in rows:
+            pr_row = None
+            if r["_pr_url"]:
+                pr_row = self._conn.execute_fetchone(
+                    "SELECT * FROM prs WHERE task_id=?", (r["task_id"],),
+                )
+            out.append(self._review_row_from_task(r, pr_row))
+        return out
 
     def clear_review_pr_dirty(self, url: str) -> None:
-        self._conn.execute("UPDATE review_prs SET dirty=0 WHERE url=?", (url,))
+        task_id = self._review_task_id_from_url(url)
+        if not task_id:
+            return
+        self._conn.execute(
+            "UPDATE tasks SET review_dirty=0 "
+            "WHERE task_id=? AND type='review'",
+            (task_id,),
+        )
         self._conn.commit()
 
     def clear_all_review_pr_dirty(self) -> None:
-        self._conn.execute("UPDATE review_prs SET dirty=0 WHERE dirty=1")
+        self._conn.execute(
+            "UPDATE tasks SET review_dirty=0 "
+            "WHERE type='review' AND review_dirty=1"
+        )
         self._conn.commit()
 
     # ----- review_history (append-only timeline per review PR) --------
@@ -1576,32 +1713,48 @@ class EvaDB:
     def append_review_history(self, review_url: str, text: str,
                               source: str = "manual",
                               ts: str = "") -> dict:
-        """Insert one review-history entry. Raises ValueError if text is
-        empty, longer than REVIEW_HISTORY_MAX_CHARS, or the review_prs
-        row doesn't exist (otherwise the history could leak past an
-        unpinned PR)."""
+        """Insert one review-history entry. Backed by task_history now;
+        we synthesise the entry's `source` into a `[source] ` prefix
+        on the text so the single timeline table can absorb the
+        bookkeeping that used to live in `review_history`."""
         text = self._validate_history_text(text, self.REVIEW_HISTORY_MAX_CHARS)
-        if not self.get_review_pr(review_url):
+        task_id = self._review_task_id_from_url(review_url)
+        if not task_id or not self._conn.execute_fetchone(
+            "SELECT 1 FROM tasks WHERE task_id=? AND type='review'", (task_id,),
+        ):
             raise ValueError(f"review_pr {review_url!r} not found")
         ts = ts or _now_iso()
+        src = source or "manual"
+        stored_text = text if src == "manual" else f"[{src}] {text}"
         self._conn.execute(
-            "INSERT INTO review_history (review_url, ts, text, source) "
-            "VALUES (?, ?, ?, ?)",
-            (review_url, ts, text, source or "manual"),
+            "INSERT INTO task_history (project, task_id, ts, text) "
+            "VALUES ('', ?, ?, ?)",
+            (task_id, ts, stored_text),
         )
         self._conn.commit()
-        return {"ts": ts, "text": text, "source": source or "manual"}
+        return {"ts": ts, "text": text, "source": src}
 
     def list_review_history(self, review_url: str, limit: int = 50) -> list:
-        """Return review-history entries newest-first. Matches
-        `_get_history`'s shape so the frontend can share renderers
-        across task and review timelines."""
+        """Return review-history entries newest-first by undoing the
+        `[source] ...` prefix that `append_review_history` writes."""
+        task_id = self._review_task_id_from_url(review_url)
+        if not task_id:
+            return []
         rows = self._conn.execute_fetchall(
-            "SELECT ts, text, source FROM review_history "
-            "WHERE review_url=? ORDER BY ts DESC LIMIT ?",
-            (review_url, max(1, int(limit or 50))),
+            "SELECT ts, text FROM task_history "
+            "WHERE task_id=? ORDER BY ts DESC LIMIT ?",
+            (task_id, max(1, int(limit or 50))),
         )
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            t = r["text"] or ""
+            src = "manual"
+            if t.startswith("[") and "] " in t:
+                bracket = t.index("] ")
+                src = t[1:bracket]
+                t = t[bracket + 2:]
+            out.append({"ts": r["ts"], "text": t, "source": src})
+        return out
 
     # ----- Legacy aliases (review_watchlist semantic) ----------------
     # Kept until the last caller of the watchlist-named API is gone.
@@ -1623,10 +1776,21 @@ class EvaDB:
     def list_review_watch(self) -> list:
         """Only manual pins, added-newest-first (legacy contract)."""
         rows = self._conn.execute_fetchall(
-            "SELECT * FROM review_prs WHERE source IN ('manual', 'both') "
-            "ORDER BY added_at DESC"
+            "SELECT t.*, p.url AS _pr_url FROM tasks t "
+            "LEFT JOIN prs p ON p.task_id = t.task_id "
+            "WHERE t.type='review' "
+            "  AND COALESCE(t.review_source, 'manual') IN ('manual', 'both') "
+            "ORDER BY t.review_added_at DESC"
         )
-        return [_row_to_dict(r) for r in rows]
+        out = []
+        for r in rows:
+            pr_row = None
+            if r["_pr_url"]:
+                pr_row = self._conn.execute_fetchone(
+                    "SELECT * FROM prs WHERE task_id=?", (r["task_id"],),
+                )
+            out.append(self._review_row_from_task(r, pr_row))
+        return out
 
     def delete_review_watch(self, url: str) -> bool:
         return self.delete_review_pr(url)
@@ -1702,46 +1866,47 @@ class EvaDB:
         return (row[0], row[1]) if row else None
 
     def find_tasks_by_ticket(self, ticket_id: str):
-        """Find all tasks with a given ticket_id. Returns list of (project, task_id, status)."""
+        """Find OTHER tasks that reference this ticket. The ticket-task
+        itself (post-merge, the JIRA row IS a task with task_id == key)
+        is excluded -- the UI uses this list to render "linked tasks"
+        meaning "external work attached to this ticket", not the
+        ticket's own row. Returns list of (project, task_id, status)."""
         rows = self._conn.execute_fetchall(
-            "SELECT project, task_id, status FROM tasks WHERE ticket_id=?",
-            (ticket_id,),
+            "SELECT project, task_id, status FROM tasks "
+            "WHERE ticket_id=? AND task_id != ?",
+            (ticket_id, ticket_id),
         )
         return [(r[0], r[1], r[2]) for r in rows]
 
     def rename_task(self, project: str, old_id: str, new_id: str) -> bool:
-        """Rename a task_id atomically: update task, deps, reverse deps, and PRs."""
+        """Rename a task_id atomically: update task, deps, reverse deps,
+        and PRs. `project` accepted for back-compat but unused (task_id
+        is globally unique post-merge)."""
         with self._conn:
-            # Check old exists, new doesn't
             if not self._conn.execute(
-                "SELECT 1 FROM tasks WHERE project=? AND task_id=?", (project, old_id)
+                "SELECT 1 FROM tasks WHERE task_id=?", (old_id,)
             ).fetchone():
                 return False
             if self._conn.execute(
-                "SELECT 1 FROM tasks WHERE project=? AND task_id=?", (project, new_id)
+                "SELECT 1 FROM tasks WHERE task_id=?", (new_id,)
             ).fetchone():
                 return False
-            # Temporarily disable FK enforcement so we can rename deps before the task row
             self._conn.execute("PRAGMA foreign_keys=OFF")
-            # Update own dependencies before renaming the task row
             self._conn.execute(
-                "UPDATE task_dependencies SET task_id=? WHERE project=? AND task_id=?",
-                (new_id, project, old_id),
+                "UPDATE task_dependencies SET task_id=? WHERE task_id=?",
+                (new_id, old_id),
             )
-            # Update reverse dependencies (other tasks that depend on old_id)
             self._conn.execute(
-                "UPDATE task_dependencies SET depends_on=? WHERE project=? AND depends_on=?",
-                (new_id, project, old_id),
+                "UPDATE task_dependencies SET depends_on=? WHERE depends_on=?",
+                (new_id, old_id),
             )
-            # Update PRs
             self._conn.execute(
-                "UPDATE prs SET task_id=? WHERE project=? AND task_id=?",
-                (new_id, project, old_id),
+                "UPDATE prs SET task_id=? WHERE task_id=?",
+                (new_id, old_id),
             )
-            # Rename in tasks table
             self._conn.execute(
-                "UPDATE tasks SET task_id=?, updated_at=? WHERE project=? AND task_id=?",
-                (new_id, _now_iso(), project, old_id),
+                "UPDATE tasks SET task_id=?, updated_at=? WHERE task_id=?",
+                (new_id, _now_iso(), old_id),
             )
             self._conn.execute("PRAGMA foreign_keys=ON")
         return True
@@ -2169,83 +2334,179 @@ class EvaDB:
             )
         ]
 
-    # ---- Tickets (JIRA cache) ----
+    # ---- Tickets (JIRA cache, now stored on `tasks`) ----
+
+    # Ticket-shape column map: legacy `tickets` column -> the new
+    # column on `tasks`. Used by both upsert and the row-shape helper
+    # so the two stay aligned.
+    _TICKET_COL_MAP = {
+        "key": "ticket_id",
+        "summary": "ticket_summary",
+        "description": "description",
+        "status": "ticket_status",
+        "priority": "ticket_priority",
+        "issue_type": "ticket_issue_type",
+        "project_key": "ticket_project_key",
+        "assignee_email": "ticket_assignee_email",
+        "reporter_email": "ticket_reporter_email",
+        "url": "ticket_url",
+        "labels": "ticket_labels",
+        "components": "ticket_components",
+        "fix_versions": "ticket_fix_versions",
+        "parent_key": "ticket_parent_key",
+        "resolution": "ticket_resolution",
+        "status_category": "ticket_status_category",
+        "instance_name": "ticket_instance",
+        "synced_at": "ticket_synced_at",
+        "created_at": "created_at",
+        "updated_at": "updated_at",
+    }
+
+    def _task_row_to_ticket_dict(self, row) -> dict:
+        """Reshape a tasks row back into the legacy ticket dict the
+        Tickets page / jira_sync code expects."""
+        return {
+            "instance_name": row["ticket_instance"] or "",
+            "key": row["ticket_id"] or "",
+            "summary": row["ticket_summary"] or "",
+            "description": row["description"] or "",
+            "status": row["ticket_status"] or "",
+            "priority": row["ticket_priority"] or "",
+            "issue_type": row["ticket_issue_type"] or "",
+            "project_key": row["ticket_project_key"] or "",
+            "assignee_email": row["ticket_assignee_email"] or "",
+            "reporter_email": row["ticket_reporter_email"] or "",
+            "url": row["ticket_url"] or "",
+            "created_at": row["created_at"] or "",
+            "updated_at": row["updated_at"] or "",
+            "synced_at": row["ticket_synced_at"] or "",
+            "labels": row["ticket_labels"] or "",
+            "components": row["ticket_components"] or "",
+            "fix_versions": row["ticket_fix_versions"] or "",
+            "parent_key": row["ticket_parent_key"] or "",
+            "resolution": row["ticket_resolution"] or "",
+            "status_category": row["ticket_status_category"] or "",
+        }
 
     def upsert_ticket(self, **fields) -> dict:
-        """Insert or update a ticket row keyed by `(instance_name, key)`.
+        """Insert or update a ticket-task row keyed by ticket_id (JIRA key).
 
-        Whitelisted columns only: a typo on the caller side is
-        rejected loudly rather than silently writing into a column
-        that doesn't exist."""
-        allowed = {"instance_name", "key", "summary", "description",
-                   "status", "priority", "issue_type", "project_key",
-                   "assignee_email", "reporter_email", "url",
-                   "created_at", "updated_at", "synced_at",
-                   # Phase-1 enrichment columns. JSON-encoded list values
-                   # are caller's responsibility (`common.tickets._normalise_issue`).
-                   "labels", "components", "fix_versions",
-                   "parent_key", "resolution", "status_category"}
+        On first sight, classify the type by labels/issue_type via the
+        same logic the migration uses. After that, type is sticky (user
+        edits or smart-create overrides win)."""
+        allowed = set(self._TICKET_COL_MAP.keys())
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown ticket columns: {sorted(bad)}")
         if "key" not in fields:
             raise ValueError("'key' is required")
-        # `instance_name` defaults to '' for back-compat with older
-        # callers that haven't been migrated yet.
+        key = fields["key"]
         fields.setdefault("instance_name", "")
         if not fields.get("synced_at"):
             fields["synced_at"] = _now_iso()
-        cols = list(fields.keys())
-        placeholders = ", ".join("?" * len(cols))
-        on_conflict = ", ".join(
-            f"{c}=excluded.{c}"
-            for c in cols if c not in ("instance_name", "key")
+
+        existing = self._conn.execute_fetchone(
+            "SELECT task_id, type FROM tasks WHERE ticket_id=?",
+            (key,),
         )
-        self._conn.execute(
-            f"INSERT INTO tickets({', '.join(cols)}) VALUES({placeholders}) "
-            f"ON CONFLICT(instance_name, key) DO UPDATE SET {on_conflict}",
-            tuple(fields[c] for c in cols),
-        )
+        # Translate legacy field keys to the new column names.
+        updates = {self._TICKET_COL_MAP[k]: v for k, v in fields.items()}
+        updates["ticket_id"] = key
+        updates["updated_at"] = updates.get("updated_at") or _now_iso()
+
+        if existing:
+            task_id = existing["task_id"]
+            set_clause = ", ".join(f"{c}=?" for c in updates)
+            self._conn.execute(
+                f"UPDATE tasks SET {set_clause} WHERE task_id=?",
+                list(updates.values()) + [task_id],
+            )
+        else:
+            # Type classification (mirrors bin/migrate_unify_tasks.py).
+            ttype = _classify_ticket_type(
+                fields.get("summary", ""), fields.get("labels", "[]"),
+                fields.get("issue_type", ""),
+            )
+            # Pick a globally-unique task_id; collide with `-jira` suffix.
+            taken_row = self._conn.execute_fetchone(
+                "SELECT 1 FROM tasks WHERE task_id=?", (key,),
+            )
+            candidate = f"{key}-jira" if taken_row else key
+            extra = {
+                "task_id": candidate, "project": "",
+                "type": ttype, "status": "not_started",
+                "priority": 5,
+            }
+            cols = list(updates) + list(extra)
+            vals = list(updates.values()) + list(extra.values())
+            placeholders = ", ".join("?" for _ in cols)
+            self._conn.execute(
+                f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
+                vals,
+            )
         self._conn.commit()
-        return self.get_ticket(fields["key"], instance_name=fields["instance_name"])
+        return self.get_ticket(key, instance_name=fields["instance_name"])
 
     def get_ticket(self, key: str, *, instance_name: str = ""):
-        row = self._conn.execute_fetchone(
-            "SELECT * FROM tickets WHERE key=? AND instance_name=?",
-            (key, instance_name),
-        )
-        return _row_to_dict(row) if row else None
+        """Return the JIRA-cache view for `(instance_name, key)`. The
+        common case (`instance_name=''`) means "any instance" --
+        callers walking multiple instances pass the explicit name to
+        scope the lookup."""
+        if instance_name:
+            row = self._conn.execute_fetchone(
+                "SELECT * FROM tasks WHERE ticket_id=? AND ticket_instance=?",
+                (key, instance_name),
+            )
+        else:
+            row = self._conn.execute_fetchone(
+                "SELECT * FROM tasks WHERE ticket_id=?",
+                (key,),
+            )
+        return self._task_row_to_ticket_dict(row) if row else None
 
     def list_tickets(self, *, assignee_email: str = "",
                      instance_name: str | None = None,
                      limit: int = 100) -> list:
-        """List tickets, newest-update first.
+        """List JIRA-synced ticket-tasks newest-update first.
 
-        - `assignee_email`: scope to one assignee (multi-user installs).
-        - `instance_name`: None = all instances; explicit empty string
-          = the legacy single-JIRA bucket; specific name = that one.
-        """
-        clauses = []
+        Filters to tasks whose `ticket_synced_at` is non-empty so we
+        only return the JIRA-side cache, not every task that happens
+        to reference a ticket_id by hand."""
+        clauses = ["ticket_id IS NOT NULL", "ticket_id != ''",
+                   "ticket_synced_at != ''"]
         params: list = []
         if assignee_email:
-            clauses.append("assignee_email = ?")
+            clauses.append("ticket_assignee_email = ?")
             params.append(assignee_email)
         if instance_name is not None:
-            clauses.append("instance_name = ?")
+            clauses.append("ticket_instance = ?")
             params.append(instance_name)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
         params.append(limit)
         rows = self._conn.execute_fetchall(
-            f"SELECT * FROM tickets {where} "
-            f"ORDER BY updated_at DESC, key DESC LIMIT ?",
+            f"SELECT * FROM tasks {where} "
+            f"ORDER BY updated_at DESC, ticket_id DESC LIMIT ?",
             tuple(params),
         )
-        return [_row_to_dict(r) for r in rows]
+        return [self._task_row_to_ticket_dict(r) for r in rows]
 
     def delete_ticket(self, key: str, *, instance_name: str = "") -> bool:
+        """Clear the ticket fields on the matching task. We DON'T delete
+        the task row -- it may carry user-authored work + history we
+        want to keep. The ticket cache simply detaches."""
         cur = self._conn.execute(
-            "DELETE FROM tickets WHERE key=? AND instance_name=?",
-            (key, instance_name),
+            "UPDATE tasks SET "
+            "  ticket_id=NULL, ticket_url='', ticket_summary='', "
+            "  ticket_priority='', ticket_issue_type='', "
+            "  ticket_project_key='', ticket_assignee_email='', "
+            "  ticket_reporter_email='', ticket_status='', "
+            "  ticket_status_category='', ticket_labels='[]', "
+            "  ticket_components='[]', ticket_fix_versions='[]', "
+            "  ticket_parent_key='', ticket_resolution='', "
+            "  ticket_instance='', ticket_synced_at='', "
+            "  updated_at=? "
+            "WHERE ticket_id=?",
+            (_now_iso(), key),
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -2253,23 +2514,30 @@ class EvaDB:
     def delete_tickets_synced_before(self, cutoff_iso: str,
                                      *, assignee_email: str = "",
                                      instance_name: str | None = None) -> int:
-        """Sync helper: prune tickets the JQL no longer matches.
-
-        `instance_name` scoping prevents cross-JIRA pollution: a sync
-        of instance A must not touch instance B's rows even if the
-        same email assignee shows up in both.
-        """
-        clauses = ["synced_at < ?"]
+        """Sync helper: detach ticket cache from rows that JQL no longer
+        returns. Mirrors `delete_ticket` -- the task itself stays."""
+        clauses = ["ticket_id IS NOT NULL", "ticket_id != ''",
+                   "ticket_synced_at < ?"]
         params: list = [cutoff_iso]
         if assignee_email:
-            clauses.append("assignee_email = ?")
+            clauses.append("ticket_assignee_email = ?")
             params.append(assignee_email)
         if instance_name is not None:
-            clauses.append("instance_name = ?")
+            clauses.append("ticket_instance = ?")
             params.append(instance_name)
         cur = self._conn.execute(
-            f"DELETE FROM tickets WHERE {' AND '.join(clauses)}",
-            tuple(params),
+            "UPDATE tasks SET "
+            "  ticket_id=NULL, ticket_url='', ticket_summary='', "
+            "  ticket_priority='', ticket_issue_type='', "
+            "  ticket_project_key='', ticket_assignee_email='', "
+            "  ticket_reporter_email='', ticket_status='', "
+            "  ticket_status_category='', ticket_labels='[]', "
+            "  ticket_components='[]', ticket_fix_versions='[]', "
+            "  ticket_parent_key='', ticket_resolution='', "
+            "  ticket_instance='', ticket_synced_at='', "
+            "  updated_at=? "
+            f"WHERE {' AND '.join(clauses)}",
+            [_now_iso(), *params],
         )
         self._conn.commit()
         return cur.rowcount

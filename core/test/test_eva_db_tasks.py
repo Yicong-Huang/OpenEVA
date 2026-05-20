@@ -40,8 +40,8 @@ def test_init_creates_tables(db):
     )
     indexes = {row["name"] for row in cur.fetchall()}
     assert "idx_tasks_project" in indexes
-    assert "idx_tasks_project_status" in indexes
-    assert "idx_prs_project_task" in indexes
+    assert "idx_tasks_type" in indexes
+    assert "idx_prs_task" in indexes
 
 
 # ------------------------------------------------------------------
@@ -124,19 +124,23 @@ def test_get_nonexistent_returns_none(db):
 # ------------------------------------------------------------------
 
 def test_list_tasks(db):
-    """list_tasks should return only tasks belonging to the requested project."""
-    db.create_task("proj-a", "task-1", description="A1")
-    db.create_task("proj-a", "task-2", description="A2")
-    db.create_task("proj-b", "task-1", description="B1")
+    """list_tasks should return only tasks belonging to the requested project.
+
+    Post-Phase-2 merge: task_id is globally unique across projects, so
+    we use distinct ids per project (no more `task-1` in both proj-a
+    and proj-b)."""
+    db.create_task("proj-a", "task-a1", description="A1")
+    db.create_task("proj-a", "task-a2", description="A2")
+    db.create_task("proj-b", "task-b1", description="B1")
 
     proj_a_tasks = db.list_tasks("proj-a")
     assert len(proj_a_tasks) == 2
     ids = {t["task_id"] for t in proj_a_tasks}
-    assert ids == {"task-1", "task-2"}
+    assert ids == {"task-a1", "task-a2"}
 
     proj_b_tasks = db.list_tasks("proj-b")
     assert len(proj_b_tasks) == 1
-    assert proj_b_tasks[0]["task_id"] == "task-1"
+    assert proj_b_tasks[0]["task_id"] == "task-b1"
 
     empty = db.list_tasks("proj-c")
     assert empty == []
@@ -152,15 +156,15 @@ def test_delete_task(db):
 
     # Insert a dependency and a PR manually to verify cascade
     db._conn.execute(
-        "INSERT INTO task_dependencies (project, task_id, depends_on) VALUES (?, ?, ?)",
-        ("proj-a", "task-1", "task-0"),
+        "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+        ("task-1", "task-0"),
     )
     db._conn.execute(
         """
-        INSERT INTO prs (project, task_id, number, url, status, title)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO prs (task_id, number, url, status, title)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        ("proj-a", "task-1", 42, "https://github.com/example/repo/pull/42", "open", "My PR"),
+        ("task-1", 42, "https://github.com/example/repo/pull/42", "open", "My PR"),
     )
     db._conn.commit()
 
@@ -176,12 +180,12 @@ def test_delete_task(db):
 
     # Cascade: dependency and PR rows should also be gone
     cur = db._conn.execute(
-        "SELECT COUNT(*) AS cnt FROM task_dependencies WHERE project='proj-a' AND task_id='task-1'"
+        "SELECT COUNT(*) AS cnt FROM task_dependencies WHERE task_id='task-1'"
     )
     assert cur.fetchone()["cnt"] == 0
 
     cur = db._conn.execute(
-        "SELECT COUNT(*) AS cnt FROM prs WHERE project='proj-a' AND task_id='task-1'"
+        "SELECT COUNT(*) AS cnt FROM prs WHERE task_id='task-1'"
     )
     assert cur.fetchone()["cnt"] == 0
 
@@ -242,8 +246,8 @@ class TestDependencies:
         """is_task_blocked returns True when the dep task does not exist in tasks."""
         db.create_task("proj-a", "task-1")
         db._conn.execute(
-            "INSERT INTO task_dependencies (project, task_id, depends_on) VALUES (?, ?, ?)",
-            ("proj-a", "task-1", "ghost-task"),
+            "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+            ("task-1", "ghost-task"),
         )
         db._conn.commit()
         assert db.is_task_blocked("proj-a", "task-1") is True
@@ -546,8 +550,8 @@ def test_is_task_blocked_missing_dependency(db):
     """A task depending on a nonexistent task should be reported as blocked."""
     db.create_task("proj-a", "task-1")
     db._conn.execute(
-        "INSERT INTO task_dependencies (project, task_id, depends_on) VALUES (?, ?, ?)",
-        ("proj-a", "task-1", "ghost"),
+        "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+        ("task-1", "ghost"),
     )
     db._conn.commit()
     assert db.is_task_blocked("proj-a", "task-1") is True

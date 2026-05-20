@@ -2449,11 +2449,10 @@ class TestListPrsProjectFilter:
     def _seed_prs(self, db):
         db.add_pr("proj-a", "task-1", number=100, url="x", status="open", title="a1")
         db.add_pr("proj-a", "task-1", number=101, url="y", status="open", title="a2")
-        db.add_pr("proj-b", "task-1", number=200, url="z", status="open", title="b1") \
-            if db.get_task("proj-b", "task-1") else None
-        # Seed a task in proj-b so its PR is visible.
-        db.create_task("proj-b", "task-1", description="b task")
-        db.add_pr("proj-b", "task-1", number=200, url="z", status="open", title="b1")
+        # Post-Phase-2 merge: task_id is globally unique across
+        # projects, so the proj-b task uses a distinct id.
+        db.create_task("proj-b", "task-1b", description="b task")
+        db.add_pr("proj-b", "task-1b", number=200, url="z", status="open", title="b1")
 
     def test_filter_returns_only_matching_project(self, temp_db, capsys):
         self._seed_prs(temp_db)
