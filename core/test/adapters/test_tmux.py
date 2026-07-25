@@ -83,6 +83,86 @@ class TestSendKeys:
         tmux.send_keys("sess", "cmd")
 
 
+class TestScrollPane:
+    # --- plain-pane (no mouse) path: tmux copy-mode over scrollback ---
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=False)
+    @patch("adapters.tmux.subprocess.run")
+    def test_scroll_up_enters_copy_mode_then_scrolls(self, mock_run, _mouse):
+        mock_run.return_value = MagicMock(returncode=0)
+        tmux.scroll_pane("sess", "up", 5)
+        assert mock_run.call_args_list[0].args[0] == [
+            "tmux", "copy-mode", "-e", "-t", "sess",
+        ]
+        assert mock_run.call_args_list[1].args[0] == [
+            "tmux", "send-keys", "-t", "sess", "-X", "-N", "5", "scroll-up",
+        ]
+
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=False)
+    @patch("adapters.tmux.subprocess.run")
+    def test_scroll_down_does_not_enter_copy_mode(self, mock_run, _mouse):
+        mock_run.return_value = MagicMock(returncode=0)
+        tmux.scroll_pane("sess", "down", 3)
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0] == [
+            "tmux", "send-keys", "-t", "sess", "-X", "-N", "3", "scroll-down",
+        ]
+
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=False)
+    @patch("adapters.tmux.subprocess.run")
+    def test_clamps_line_count(self, mock_run, _mouse):
+        mock_run.return_value = MagicMock(returncode=0)
+        tmux.scroll_pane("sess", "up", 9999)
+        assert mock_run.call_args_list[1].args[0][-2:] == ["50", "scroll-up"]
+
+    # --- mouse-grabbing app (agent TUI): synthesized wheel reports ---
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=True)
+    @patch("adapters.tmux.subprocess.run")
+    def test_mouse_app_gets_wheel_reports_up(self, mock_run, _mouse):
+        mock_run.return_value = MagicMock(returncode=0)
+        tmux.scroll_pane("agent", "up", 3)
+        # One send-keys -l carrying 3 wheel-up SGR reports; no copy-mode.
+        assert mock_run.call_count == 1
+        args = mock_run.call_args.args[0]
+        assert args[:5] == ["tmux", "send-keys", "-t", "agent", "-l"]
+        assert args[5] == "\x1b[<64;1;1M" * 3
+
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=True)
+    @patch("adapters.tmux.subprocess.run")
+    def test_mouse_app_gets_wheel_reports_down(self, mock_run, _mouse):
+        mock_run.return_value = MagicMock(returncode=0)
+        tmux.scroll_pane("agent", "down", 2)
+        args = mock_run.call_args.args[0]
+        assert args[5] == "\x1b[<65;1;1M" * 2
+
+    @patch("adapters.tmux.subprocess.run")
+    def test_ignores_unknown_direction(self, mock_run):
+        tmux.scroll_pane("sess", "sideways", 3)
+        mock_run.assert_not_called()
+
+    @patch("adapters.tmux._pane_grabs_mouse", return_value=False)
+    @patch("adapters.tmux.subprocess.run",
+           side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=3))
+    def test_swallows_timeout(self, _mock_run, _mouse):
+        tmux.scroll_pane("hung", "up", 3)  # must not raise
+
+
+class TestPaneGrabsMouse:
+    @patch("adapters.tmux.subprocess.run")
+    def test_true_when_flag_set(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="1\n")
+        assert tmux._pane_grabs_mouse("sess") is True
+
+    @patch("adapters.tmux.subprocess.run")
+    def test_false_when_flag_clear(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="0\n")
+        assert tmux._pane_grabs_mouse("sess") is False
+
+    @patch("adapters.tmux.subprocess.run",
+           side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=3))
+    def test_false_on_timeout(self, _mock_run):
+        assert tmux._pane_grabs_mouse("hung") is False
+
+
 class TestKillSession:
     @patch("adapters.tmux.subprocess.run")
     def test_invokes_kill_session_command(self, mock_run):
@@ -242,6 +322,17 @@ class TestWaitUntilReady:
         monkeypatch.setattr(
             tmux, "capture_output",
             lambda _n, lines=10: "  ? for shortcuts\n",
+        )
+        assert tmux.wait_until_ready("sess", timeout_secs=1) is True
+
+    def test_returns_true_when_codex_prompt_glyph_present(self, monkeypatch):
+        # Codex's TUI uses `›` (›) as its input arrow, not Claude's
+        # `❯` (❯). Readiness detection must recognize both so
+        # action-button paste lands in Codex-family sessions.
+        monkeypatch.setattr(tmux, "session_exists", lambda _n: True)
+        monkeypatch.setattr(
+            tmux, "capture_output",
+            lambda _n, lines=10: "\n".join(["", "› Write tests", ""]),
         )
         assert tmux.wait_until_ready("sess", timeout_secs=1) is True
 

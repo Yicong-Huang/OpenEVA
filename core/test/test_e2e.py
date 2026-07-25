@@ -17,6 +17,11 @@ class TestFullActionFlow:
         return argv[argv.index("--append-system-prompt") + 1]
 
     def test_full_action_flow(self, client, patched_server, mock_tmux):
+        from common import agent as _agent
+        # Pin new-session agent to Claude-family so this flow keeps
+        # asserting the `--append-system-prompt` shape.
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         patched_server._db.create_task(
             "test-proj", "e2e-task-1", description="E2E task one", type="feature"
         )
@@ -55,6 +60,9 @@ class TestSessionSurvivesKillAndReopen:
     """Open session, kill tmux, open again -> relaunches with fresh bg in argv."""
 
     def test_session_survives_kill_and_reopen(self, client, patched_server, mock_tmux):
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         patched_server._db.create_task(
             "test-proj", "e2e-kill-task", description="Kill and reopen task"
         )

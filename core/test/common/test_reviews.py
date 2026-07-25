@@ -61,6 +61,13 @@ class TestOpenReviewSession:
     `patched_server` so we get an isolated DB + mock tmux."""
 
     def _seed(self, patched_server, url="https://github.com/example/repo/pull/42"):
+        # Pin the new-session agent to a Claude-family binary so these
+        # mechanics tests keep asserting the `-n` /
+        # `--append-system-prompt` shape (a Codex-family agent is the
+        # default; its distinct argv is covered in test_agent.py).
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         patched_server._db.upsert_review_pr(
             url=url, repo="example/repo", number=42,
             title="Fix foo", author="someone-else",
@@ -100,7 +107,7 @@ class TestOpenReviewSession:
         # Launch was called with the agent argv we expect (agent -n <name>).
         assert mock_launch.called
         argv = mock_launch.call_args[0][2]
-        assert argv[0] in ("agent", "claude")  # active agent binary
+        assert "agent" in argv or "claude" in argv  # active agent binary
         assert "-n" in argv
         assert "review-example-repo-42" in argv
 

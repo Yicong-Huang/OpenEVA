@@ -690,6 +690,7 @@ def mock_tmux():
          patch("routes.sessions.capture_output", capture_mock), \
          patch("routes.sessions.send_keys", send_keys_mock), \
          patch("routes.sessions.launch_session", launch_mock), \
+         patch("routes.sessions.launch_session_argv", launch_argv_mock), \
          patch("routes.terminal.session_exists", exists_mock):
         yield {
             "exists": exists_mock,

@@ -1,5 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { api, type Ticket } from '../api'
+import {
+  TICKET_TABS, type TicketTab, myEmails, tabForTicket, groupForTicket,
+} from '../utils/ticketBuckets'
 import { TicketNode } from '../components/TicketNode'
 import { TicketTaskCard } from '../components/TicketTaskCard'
 import { TicketCard } from '../components/TicketCard'
@@ -64,11 +67,15 @@ export function TicketsPage({
   const [tickets, setTickets] = useState<Ticket[]>([])
   const [configured, setConfigured] = useState<boolean>(true)
   const [instances, setInstances] = useState<Array<{
-    name: string; base_url: string
+    name: string; base_url: string; email: string
   }>>([])
   const [error, setError] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [selected, setSelected] = useState<Ticket | null>(null)
+  // Tabs by assignment + JIRA status_category: Open / In Progress /
+  // Resolved are my tickets; Triaged (last) is everything that left
+  // my plate (reassigned or unassigned). See utils/ticketBuckets.
+  const [tab, setTab] = useState<TicketTab>('open')
 
   const refresh = useCallback(async () => {
     try {
@@ -196,6 +203,29 @@ export function TicketsPage({
     }
   }, [refresh, instances])
 
+  // Partition every cached ticket into its tab. Counts come from the
+  // full list (independent of the active tab) so each tab label can
+  // show how many tickets it holds.
+  const mine = useMemo(() => myEmails(instances), [instances])
+  const byTab = useMemo(() => {
+    const out: Record<TicketTab, Ticket[]> = {
+      open: [], in_progress: [], resolved: [], triaged: [],
+    }
+    for (const t of tickets) out[tabForTicket(t, mine)].push(t)
+    return out
+  }, [tickets, mine])
+  const visibleTickets = byTab[tab]
+
+  // Sync-on-open (mirrors the PRs page): one JIRA sync per mount,
+  // fired as soon as the instances list confirms JIRA is configured
+  // (waiting avoids a spurious 422 when nothing is configured).
+  const autoSynced = useRef(false)
+  useEffect(() => {
+    if (autoSynced.current || instances.length === 0) return
+    autoSynced.current = true
+    onSync()
+  }, [instances, onSync])
+
   const onSelect = useCallback(async (t: Ticket) => {
     if (selected?.key === t.key && selected?.instance_name === t.instance_name) {
       setSelected(null)
@@ -274,8 +304,49 @@ export function TicketsPage({
           </div>
         )}
 
+        {/* Tabs: Open / In Progress / Resolved are my tickets split
+            by JIRA status; Triaged (last) holds reassigned +
+            unassigned tickets that left my plate. */}
+        {tickets.length > 0 && (
+          <div data-testid="tickets-tabs" style={{
+            display: 'flex', gap: 4, marginBottom: 12,
+            borderBottom: '1px solid var(--border)',
+          }}>
+            {TICKET_TABS.map(({ key, label }) => (
+              <button
+                key={key}
+                data-testid={`tickets-tab-${key}`}
+                onClick={() => setTab(key)}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  padding: '6px 10px', fontSize: 12,
+                  fontWeight: tab === key ? 700 : 500,
+                  color: tab === key ? 'var(--text)' : 'var(--text-dim)',
+                  borderBottom: tab === key
+                    ? '2px solid var(--accent)' : '2px solid transparent',
+                  marginBottom: -1,
+                }}
+              >
+                {label}{' '}
+                <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>
+                  ({byTab[key].length})
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {configured && tickets.length > 0 && visibleTickets.length === 0 && (
+          <div data-testid="tickets-empty-tab"
+               style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+            {`No ${TICKET_TABS.find((t) => t.key === tab)
+              ?.label.toLowerCase()} tickets.`}
+          </div>
+        )}
+
         <TicketsGroupedList
-          tickets={tickets}
+          tickets={visibleTickets}
+          tab={tab}
           selected={selected}
           onSelect={onSelect}
         />
@@ -309,48 +380,24 @@ export function TicketsPage({
 }
 
 
-/** Bucket a ticket into a human-readable category for the grouped
- * queue. Order of preference:
- *   1. testman-automation labels  -> "Flaky tests"
- *   2. Project prefix on the key (`EX-`, `SC-`, `EX-`, etc.) ->
- *      that prefix becomes the group name. Most JIRA installs use
- *      stable project codes so this gives a clean "ES tickets" /
- *      "SC tickets" / "EX tickets" split.
- *   3. Issue type (Bug / Task / Story / ...) -> last-resort bucket
- *      so anything without a recognisable prefix still groups.
- *
- * Returns `(group_label, sort_priority)`. Lower sort_priority sorts
- * first; flaky tests deserve top placement because they're often the
- * highest-actionability bucket. */
-function _categorize(t: Ticket): [string, number] {
-  const labels = t.labels ?? []
-  const isFlaky = labels.some((l) => /flaky|testman|test-?failure/i.test(l))
-    || /flaky|test failure|failing target/i.test(t.summary || '')
-  if (isFlaky) return ['Flaky tests', 0]
-  // Pull the project code (`ES`, `SC`, `EX`) from the ticket key.
-  const m = (t.key || '').match(/^([A-Z][A-Z0-9_]*)-\d+/)
-  if (m) return [`${m[1]} tickets`, 1]
-  // Fallback: use issue_type so the ticket still shows up somewhere.
-  return [(t.issue_type || 'Other').trim() || 'Other', 9]
-}
-
-
 function TicketsGroupedList({
-  tickets, selected, onSelect,
+  tickets, tab, selected, onSelect,
 }: {
   tickets: Ticket[]
+  tab: TicketTab
   selected: Ticket | null
   onSelect: (t: Ticket) => void
 }) {
-  // Group + sort: each bucket carries its sort_priority + alphabetic
+  // Group + sort: each bucket carries its sort priority + alphabetic
   // name as a stable secondary key. Within a bucket, tickets sort by
-  // updated_at desc (newest first).
+  // updated_at desc (newest first). Kind classification lives in
+  // utils/ticketBuckets; the Triaged tab adds an Unassigned group.
   const groups = new Map<string, { tickets: Ticket[]; priority: number }>()
   for (const t of tickets) {
-    const [name, prio] = _categorize(t)
+    const { name, priority } = groupForTicket(t, tab)
     let g = groups.get(name)
     if (!g) {
-      g = { tickets: [], priority: prio }
+      g = { tickets: [], priority }
       groups.set(name, g)
     }
     g.tickets.push(t)

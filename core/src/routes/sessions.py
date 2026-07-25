@@ -6,7 +6,9 @@ from adapters.tmux import (
     capture_output,
     send_keys,
     launch_session,
+    launch_session_argv,
     graceful_kill_session,
+    line_is_prompt,
 )
 import time as _time
 from datetime import datetime
@@ -69,6 +71,13 @@ def list_project_sessions(project_id: str):
             "running": session_exists(s["tmux_name"]),
         })
     return {"sessions": result}
+
+
+@app_state.app.get("/api/project-managers")
+def list_project_managers():
+    """List live project-manager sessions for the Live Tasks page."""
+    from common.sessions import list_project_manager_sessions as _list
+    return {"sessions": _list(live_only=True)}
 
 
 # build_background moved to core/common.sessions.py
@@ -244,7 +253,7 @@ def rebuild_sessions():
     skipped = []
     failed = []
     from common import agent as _agent
-    binary = _agent.get_active_agent().binary
+    from common import sessions as _sessions
     for s in all_sessions:
         session_name = s["tmux_name"]
         if session_exists(session_name):
@@ -252,13 +261,22 @@ def rebuild_sessions():
             continue
         project_id = s["project"]
         working_dir = config.get("projects", {}).get(project_id, {}).get("working_dir", "~")
+        # Resume with the agent that launched this session (empty
+        # agent_impl -> default agent), not the global active agent -- codex
+        # ids and Claude UUIDs aren't interchangeable. Prefer the
+        # recorded UUID (cwd-sensitive local resume); fall back to a
+        # fresh launch when we never captured one.
+        sess_agent = _agent.get_agent_by_id(s.get("agent_impl", "") or "")
+        uuid = (s.get("agent_session_id") or "").strip()
         try:
-            launch_session(session_name, working_dir,
-                           f'{binary} --resume "{session_name}"')
-            # Note: `background_sent` flag no longer gates anything
-            # (context is now injected via `--append-system-prompt`
-            # at launch). Column kept in schema for back-compat with
-            # existing DBs.
+            if uuid:
+                transcript_cwd = _sessions._local_transcript_cwd(uuid)
+                if transcript_cwd:
+                    working_dir = transcript_cwd
+                argv = sess_agent.resume_argv(uuid)
+            else:
+                argv = sess_agent.launch_argv(session_name)
+            launch_session_argv(session_name, working_dir, argv)
             rebuilt.append(session_name)
         except Exception as e:
             failed.append({"session": session_name, "error": str(e)})
@@ -379,6 +397,21 @@ def resume_session_route(session_name: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app_state.app.post("/api/sessions/{session_name}/restart")
+def restart_session_route(session_name: str):
+    """Kill the live tmux and resume the SAME agent session by UUID.
+
+    For picking up an agent-binary or config update without losing the
+    conversation. Keeps the DB row (and agent_session_id) across the
+    restart. Raises 404 if there's no DB row for this session.
+    """
+    from common.sessions import restart_session as _restart
+    try:
+        return _restart(session_name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # -- Hook-driven session state --
 
 # Hook event -> (new_state, default_detail, emitted event name, title prefix,
@@ -485,6 +518,24 @@ def _apply_review_session_hook(session: str, event: str, new_state: str,
     return True
 
 
+def _apply_ticket_session_hook(session: str, event: str, _new_state: str,
+                               data: dict) -> bool:
+    """Persist the agent UUID for ticket sessions.
+
+    Ticket sessions are stored in the `sessions` table for recovery,
+    but they are not project tasks. Handling the prefix explicitly
+    keeps SessionStart persistence while preventing ticket rows from
+    falling through into the generic task path as ordinary work items.
+    """
+    if not session.startswith("ticket-"):
+        return False
+    if event == "SessionStart":
+        sid = data.get("session_id") or ""
+        if sid and app_state._db.get_session(session):
+            app_state._db.update_session(session, agent_session_id=sid)
+    return True
+
+
 def _apply_task_session_hook(session: str, event: str, _new_state: str,
                               data: dict) -> bool:
     """Persist the agent's session UUID for a regular task session so a
@@ -565,6 +616,8 @@ def receive_hook(request_body: dict):
         return {"ok": True}
     if _apply_review_session_hook(session, event, new_state, data):
         return {"ok": True}
+    if _apply_ticket_session_hook(session, event, new_state, data):
+        return {"ok": True}
     _apply_task_session_hook(session, event, new_state, data)
     return {"ok": True}
 
@@ -608,16 +661,11 @@ async def wait_for_ready(session_name: str, timeout: int = 30):
             all_lines = lines.split("\n")
             for line in all_lines:
                 stripped = line.strip()
-                # The agent TUI separates the `\u276f` prompt arrow from
-                # its content with a non-breaking space (U+00A0), not a
-                # regular space. Match the bare arrow OR arrow + ANY
-                # whitespace so we don't have to enumerate the exact
-                # codepoint claude happens to use in this release.
-                if (
-                    stripped == "\u276f"
-                    or (stripped.startswith("\u276f")
-                        and len(stripped) > 1 and stripped[1].isspace())
-                ):
+                # Match either agent family's input-prompt arrow (Claude's
+                # `\u276f`, Codex's `\u203a`), each of which may be followed
+                # by content separated by a normal space or a non-breaking
+                # space (U+00A0). `line_is_prompt` centralizes both.
+                if line_is_prompt(stripped):
                     print(f"[wait-ready] {session_name}: idle via tmux prompt detection", flush=True)
                     return {"ready": True, "state": "idle"}
                 if "? for shortcuts" in stripped:
@@ -644,13 +692,11 @@ def _parse_session_state(tmux_output: str):
     """
     all_lines = tmux_output.split("\n")
     all_text = tmux_output.lower()
-    # Match `\u276f` standalone OR followed by ANY whitespace (claude's
-    # TUI uses U+00A0 between the arrow and the typed text, not U+0020).
-    def _is_prompt(s: str) -> bool:
-        return s == "\u276f" or (
-            s.startswith("\u276f") and len(s) > 1 and s[1].isspace()
-        )
-    has_prompt = any(_is_prompt(l.strip()) for l in all_lines)
+    # Match either agent family's prompt arrow (Claude `\u276f`, Codex
+    # `\u203a`), standalone or followed by whitespace. `line_is_prompt`
+    # is the shared detector used by wait_until_ready + the wait-ready
+    # route so all three stay consistent across agent TUIs.
+    has_prompt = any(line_is_prompt(l.strip()) for l in all_lines)
     needs_permission = "esc to cancel" in all_text and "1. yes" in all_text
 
     if has_prompt:
@@ -726,5 +772,3 @@ def get_session_status(session_name: str):
 # (re)connect time. See routes/events.py:event_stream and
 # core/session_state.py:rebuild_from_tmux. There is no separate
 # pull endpoint for state any more -- the cache is the only source.
-
-

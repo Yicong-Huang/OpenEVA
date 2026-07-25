@@ -14,7 +14,7 @@ import { SessionDot } from './SessionDot'
  * ReviewsPage with the review URL selected).
  */
 export interface LiveSessionChipProps {
-  kind: 'cron' | 'review'
+  kind: 'cron' | 'review' | 'manager'
   label: string
   /** Optional secondary line, e.g. PR title for reviews. Truncated. */
   sublabel?: string
@@ -29,6 +29,7 @@ export interface LiveSessionChipProps {
 const KIND_BADGE = {
   cron: { label: 'CRON', bg: 'rgba(20,184,166,0.18)', fg: 'var(--teal, #14b8a6)' },
   review: { label: 'REVIEW', bg: 'rgba(168,85,247,0.18)', fg: 'var(--purple)' },
+  manager: { label: 'PM', bg: 'rgba(59,130,246,0.18)', fg: 'var(--blue)' },
 } as const
 
 export function LiveSessionChip({

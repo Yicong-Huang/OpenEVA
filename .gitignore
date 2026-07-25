@@ -67,3 +67,6 @@ tasks.bak/
 # can `git update-index --skip-worktree core/src/plugins/<id>/plugin.conf`.
 
 # Extensions self-ignore via an in-folder `.gitignore` containing `/*`.
+
+# Local isaac CLI state (per-user)
+.isaac/

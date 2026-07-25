@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import type { Project, Task, ActionDef, PR } from '../types'
-import type { CronJob, Ticket } from '../api'
+import type { CronJob, ProjectManagerSession, Ticket } from '../api'
 import { useApi } from '../hooks/useApi'
 import { useLayoutRatios } from '../hooks/useLayoutRatios'
 import { useSessionStatus } from '../hooks/SessionStatusProvider'
@@ -12,6 +12,7 @@ import { LiveSessionChip } from '../components/LiveSessionChip'
 import { ReviewCard } from '../components/ReviewCard'
 import { TicketNode } from '../components/TicketNode'
 import { TicketTaskCard } from '../components/TicketTaskCard'
+import { ProjectSessionCard } from '../components/ProjectSessionCard'
 import { CronCard } from './CronJobsPage'
 import { useAlert } from '../components/Alert'
 import { api } from '../api'
@@ -65,7 +66,7 @@ export function SessionsPage({
   const {
     sessions: sessionStateMap,
     projectSessions: sessionsData,
-    liveCronJobs, liveReviews, liveTickets,
+    liveCronJobs, liveReviews, liveTickets, liveProjectManagers,
     refetchSessions, refetchCron,
   } = useSessionStatus()
   const [sessListRatio, sessDetailRatio, sessTaskRatio] = useLayoutRatios(
@@ -86,6 +87,7 @@ export function SessionsPage({
   const [openingSession, setOpeningSession] = useState(false)
   const { alert } = useAlert()
   const [externalAction, setExternalAction] = useState<{ actionId: string; taskId?: string; prNumber?: number; prRepo?: string; customPrompt?: string; ts: number } | null>(null)
+  const [ticketDetails, setTicketDetails] = useState<Record<string, Ticket>>({})
 
   const actions = actionsData?.actions || []
 
@@ -184,6 +186,7 @@ export function SessionsPage({
     | { kind: 'cron'; jobId: number }
     | { kind: 'review'; url: string }
     | { kind: 'ticket'; key: string; instance: string }
+    | { kind: 'manager'; projectId: string }
     | null
   >(null)
 
@@ -197,14 +200,31 @@ export function SessionsPage({
     onSelectPR?.(null)
     setSelectedExtra({ kind: 'cron', jobId: job.id })
   }, [selectedExtra, onSelectLiveTask, onSelectPR])
+  // Derive the unified task_id for a review row from its PR URL --
+  // mirrors `EvaDB._review_task_id_from_url` (`review-<slug>-<n>`) so
+  // clicking a review chip surfaces in the URL as `?task=review-...`,
+  // same as any other live task. Returns '' for unparseable URLs.
+  const _reviewTaskId = (url: string): string => {
+    const m = (url || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
+    if (!m) return ''
+    const slug = `${m[1]}/${m[2]}`.replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '').toLowerCase()
+    return `review-${slug}-${m[3]}`
+  }
+
   const handleClickReview = useCallback((pr: PR) => {
     if (selectedExtra?.kind === 'review' && selectedExtra.url === pr.url) {
       setSelectedExtra(null)
+      onSelectLiveTask?.(null, null)
       return
     }
-    onSelectLiveTask?.(null, null)
     onSelectPR?.(null)
     setSelectedExtra({ kind: 'review', url: pr.url })
+    // Reviews are now real tasks (type='review'); push the task_id
+    // into the URL so refresh / share-link works AND the address bar
+    // reflects the selection. project param stays empty (review-type
+    // tasks live in the unsorted bucket).
+    onSelectLiveTask?.(null, _reviewTaskId(pr.url) || null)
   }, [selectedExtra, onSelectLiveTask, onSelectPR])
   const handleClickTicket = useCallback((ticket: Ticket) => {
     const inst = ticket.instance_name || ''
@@ -212,17 +232,88 @@ export function SessionsPage({
         && selectedExtra.key === ticket.key
         && selectedExtra.instance === inst) {
       setSelectedExtra(null)
+      onSelectLiveTask?.(null, null)
+      return
+    }
+    onSelectPR?.(null)
+    setSelectedExtra({ kind: 'ticket', key: ticket.key, instance: inst })
+    // Ticket tasks use the JIRA key as task_id (post-merge). Push it
+    // into the URL so the address bar tracks the selection.
+    onSelectLiveTask?.(null, ticket.key || null)
+  }, [selectedExtra, onSelectLiveTask, onSelectPR])
+
+  const handleClickManager = useCallback((manager: ProjectManagerSession) => {
+    if (selectedExtra?.kind === 'manager'
+        && selectedExtra.projectId === manager.project_id) {
+      setSelectedExtra(null)
       return
     }
     onSelectLiveTask?.(null, null)
     onSelectPR?.(null)
-    setSelectedExtra({ kind: 'ticket', key: ticket.key, instance: inst })
+    setSelectedExtra({ kind: 'manager', projectId: manager.project_id })
   }, [selectedExtra, onSelectLiveTask, onSelectPR])
+
+  const selectedTicketKey = selectedExtra?.kind === 'ticket' ? selectedExtra.key : ''
+  const selectedTicketInstance = selectedExtra?.kind === 'ticket' ? selectedExtra.instance : ''
+  const selectedTicketCacheKey = selectedTicketKey
+    ? `${selectedTicketInstance}:${selectedTicketKey}`
+    : ''
+  const selectedLiveTicket = useMemo(() => {
+    if (!selectedTicketKey) return null
+    return liveTickets.find((t) =>
+      t.key === selectedTicketKey
+      && (t.instance_name || '') === selectedTicketInstance,
+    ) || null
+  }, [selectedTicketKey, selectedTicketInstance, liveTickets])
+  useEffect(() => {
+    if (!selectedTicketKey) return
+    let cancelled = false
+    api.getTicket(selectedTicketKey, selectedTicketInstance || undefined)
+      .then((fresh) => {
+        if (cancelled) return
+        setTicketDetails((prev) => ({
+          ...prev,
+          [selectedTicketCacheKey]: fresh,
+        }))
+      })
+      .catch(() => {
+        // Keep rendering the live ticket row if the detail cache was
+        // pruned or JIRA sync races the selection.
+      })
+    return () => { cancelled = true }
+  }, [
+    selectedTicketKey,
+    selectedTicketInstance,
+    selectedTicketCacheKey,
+    selectedLiveTicket?.updated_at,
+  ])
   // Selecting a project-task chip should clear any cron / review
   // selection so the middle pane shows the right card.
   useEffect(() => {
     if (selectedTask) setSelectedExtra(null)
   }, [selectedTask])
+
+  // URL -> selectedExtra restore. On page reload, the App pulls
+  // `task=<id>` from the URL into `selectedTaskId`. Review/ticket
+  // tasks live outside the project flat-session list, so the normal
+  // chip-select flow can't restore them; match the task_id against
+  // the live review / ticket caches and re-populate selectedExtra.
+  useEffect(() => {
+    if (!selectedTaskId || selectedProjectId) return
+    if (selectedTaskId.startsWith("review-")) {
+      const r = liveReviews.find((p) => _reviewTaskId(p.url) === selectedTaskId)
+      if (r) setSelectedExtra({ kind: 'review', url: r.url })
+      return
+    }
+    // Ticket-task: task_id == JIRA key (no review- prefix).
+    const t = liveTickets.find((tk) => tk.key === selectedTaskId)
+    if (t) {
+      setSelectedExtra({
+        kind: 'ticket', key: t.key, instance: t.instance_name || '',
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskId, selectedProjectId, liveReviews, liveTickets])
 
   // Flattened list of all live (project, task) pairs. Sort by
   // `(projectId, taskId)` so the order is STABLE across refetches.
@@ -301,6 +392,9 @@ export function SessionsPage({
     if (selectedExtra?.kind === 'ticket') {
       return `ticket:${selectedExtra.instance}:${selectedExtra.key}`
     }
+    if (selectedExtra?.kind === 'manager') {
+      return `manager:${selectedExtra.projectId}`
+    }
     return null
   }, [selectedTask, selectedExtra])
 
@@ -361,12 +455,29 @@ export function SessionsPage({
   // project id on the outer level and by task_id inside each group so
   // chips stay put while their status dots light up.
   const groupsWithSessions = Object.entries(sessionsData)
+    .map(([projectId, group]): [string, ProjectGroup] => [
+      projectId,
+      {
+        ...group,
+        sessions: group.sessions.filter((s) => !s.task_id.startsWith('ticket-')),
+      },
+    ])
     .filter(([, g]) => g.sessions.length > 0)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([projectId, group]): [string, ProjectGroup] => [
       projectId,
       { ...group, sessions: [...group.sessions].sort((a, b) => a.task_id.localeCompare(b.task_id)) },
     ])
+
+  const projectFromGroup = (group: ProjectGroup): Project => ({
+    id: group.id,
+    name: group.name,
+    description: '',
+    progress: 0,
+    task_counts: {},
+    has_tickets: group.has_tickets,
+    tasks: group.tasks,
+  })
 
   // One-stop chip renderer shared by both view modes. Pulling it out
   // keeps the by-project and by-attention branches structurally
@@ -490,19 +601,47 @@ export function SessionsPage({
         {groupsWithSessions.length === 0
             && liveCronJobs.length === 0
             && liveReviews.length === 0
-            && liveTickets.length === 0 ? (
+            && liveTickets.length === 0
+            && liveProjectManagers.length === 0 ? (
           <div style={{ color: 'var(--text-dim)', fontSize: 13 }}>No active sessions.</div>
         ) : viewMode === 'by-project' ? (
           <div style={{ position: 'relative' }}>
+            {liveProjectManagers.length > 0 && (
+              <div data-testid="live-section-manager" style={{ marginBottom: 16 }}>
+                <div
+                  style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: 'var(--accent)', cursor: 'pointer' }}
+                  onClick={() => onNavigate?.('', 'all-tasks')}
+                >
+                  Project Managers
+                  <span style={{ fontSize: 10, color: 'var(--text-dim)', marginLeft: 6 }}>({liveProjectManagers.length})</span>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {liveProjectManagers.map((manager) => {
+                    const isSel = selectedExtra?.kind === 'manager'
+                      && selectedExtra.projectId === manager.project_id
+                    return (
+                      <LiveSessionChip
+                        key={`manager-${manager.project_id}`}
+                        kind="manager"
+                        label={manager.project_name || manager.project_id}
+                        sublabel={manager.project_id}
+                        status={sessionStateMap[manager.tmux_name]?.state || manager.status || ''}
+                        selected={isSel}
+                        dimmed={!!selectedExtra && !isSel || !!selectedTask}
+                        onClick={() => handleClickManager(manager)}
+                      />
+                    )
+                  })}
+                </div>
+              </div>
+            )}
             {groupsWithSessions.map(([projectId, group]) => {
               // Build a minimal `Project` from the group payload so TaskCard
               // and its helpers see the same shape they do in ProjectPage.
               // Fields the chip / task card don't touch (description /
               // progress / task_counts) default to empty -- TaskCard never
               // reads them on this page.
-              const project: Project | null = group
-                ? { id: group.id, name: group.name, description: '', progress: 0, task_counts: {}, has_tickets: group.has_tickets, tasks: group.tasks }
-                : null
+              const project: Project | null = group ? projectFromGroup(group) : null
               return (
                 <div key={projectId} style={{ marginBottom: 16 }}>
                   <div
@@ -622,10 +761,12 @@ export function SessionsPage({
             liveCronJobs={liveCronJobs}
             liveReviews={liveReviews}
             liveTickets={liveTickets}
+            liveProjectManagers={liveProjectManagers}
             sessionStateMap={sessionStateMap}
             onClickCron={handleClickCron}
             onClickReview={handleClickReview}
             onClickTicket={handleClickTicket}
+            onClickManager={handleClickManager}
           />
         )}
       </div>
@@ -648,15 +789,60 @@ export function SessionsPage({
         {flatSessions.length === 0
             && liveCronJobs.length === 0
             && liveReviews.length === 0
-            && liveTickets.length === 0 && (
+            && liveTickets.length === 0
+            && liveProjectManagers.length === 0 && (
           <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No live tasks.</div>
         )}
         {/* Top spacer so the first card can scroll to vertical center */}
         {(flatSessions.length > 0
           || liveCronJobs.length > 0
           || liveReviews.length > 0
-          || liveTickets.length > 0) && <div style={{ height: '50vh' }} />}
+          || liveTickets.length > 0
+          || liveProjectManagers.length > 0) && <div style={{ height: '50vh' }} />}
         <div style={{ position: 'relative' }}>
+          {/* Project-manager cards. These are live sessions even though
+              they do not belong to a task row, so render them alongside
+              cron/review/ticket extras. */}
+          {liveProjectManagers.map((manager) => {
+            const key = `manager:${manager.project_id}`
+            const isSelected = selectedExtra?.kind === 'manager'
+              && selectedExtra.projectId === manager.project_id
+            const dimmed = (!isSelected
+              && (!!selectedExtra || !!selectedTask))
+            return (
+              <div
+                key={key}
+                ref={el => { cardRefs.current[key] = el }}
+                data-testid={`live-card-manager-${manager.project_id}`}
+                onClick={() => {
+                  if (!isSelected) handleClickManager(manager)
+                }}
+                style={{
+                  position: 'relative',
+                  marginBottom: 12, scrollMarginTop: 8,
+                  borderRadius: 8, padding: 8,
+                  border: '1px solid var(--border)',
+                  outline: isSelected ? '2px solid var(--accent)' : undefined,
+                  cursor: isSelected ? 'default' : 'pointer',
+                  background: isSelected ? 'var(--panel-bg)' : 'var(--card-bg)',
+                  opacity: dimmed ? 0.35 : 1,
+                  transition: 'opacity 0.15s',
+                }}
+              >
+                <div style={{
+                  fontSize: 10, color: 'var(--text-dim)',
+                  padding: '0 0 4px 0',
+                }}>
+                  Project Manager
+                </div>
+                <ProjectSessionCard
+                  projectId={manager.project_id}
+                  projectName={manager.project_name || manager.project_id}
+                />
+              </div>
+            )
+          })}
+
           {flatSessions.map(({ projectId, projectName, taskId }) => {
             const group = sessionsData?.[projectId] || null
             const project: Project | null = group
@@ -808,6 +994,10 @@ export function SessionsPage({
             const isSelected = selectedExtra?.kind === 'ticket'
               && selectedExtra.key === t.key
               && selectedExtra.instance === inst
+            const detailKey = `${inst}:${t.key}`
+            const ticketForCard = isSelected
+              ? (ticketDetails[detailKey] || t)
+              : t
             const dimmed = (!isSelected
               && (!!selectedExtra || !!selectedTask))
             return (
@@ -836,7 +1026,7 @@ export function SessionsPage({
                 }}>
                   Ticket {t.key}
                 </div>
-                <TicketTaskCard ticket={t} />
+                <TicketTaskCard ticket={ticketForCard} />
               </div>
             )
           })}
@@ -845,7 +1035,8 @@ export function SessionsPage({
         {(flatSessions.length > 0
           || liveCronJobs.length > 0
           || liveReviews.length > 0
-          || liveTickets.length > 0) && <div style={{ height: '50vh' }} />}
+          || liveTickets.length > 0
+          || liveProjectManagers.length > 0) && <div style={{ height: '50vh' }} />}
       </div>
 
       {/* Right: PR detail (35% in the 3-col layout). */}
@@ -901,25 +1092,28 @@ export function SessionsPage({
 // confirm "yes, nothing here" rather than wondering if it's missing.
 function AttentionView({
   groups, renderChip,
-  liveCronJobs, liveReviews, liveTickets,
+  liveCronJobs, liveReviews, liveTickets, liveProjectManagers,
   sessionStateMap,
-  onClickCron, onClickReview, onClickTicket,
+  onClickCron, onClickReview, onClickTicket, onClickManager,
 }: {
   groups: Array<[string, ProjectGroup]>
   renderChip: (s: SessionEntry, projectId: string, project: Project | null) => ReactNode
   liveCronJobs: CronJob[]
   liveReviews: Array<PR & { repo: string; source?: string }>
   liveTickets: Ticket[]
+  liveProjectManagers: ProjectManagerSession[]
   sessionStateMap: Record<string, { state: string }>
   onClickCron: (job: CronJob) => void
   onClickReview: (pr: PR) => void
   onClickTicket: (t: Ticket) => void
+  onClickManager: (m: ProjectManagerSession) => void
 }) {
   type TaskFlat = { kind: 'task'; projectId: string; project: Project; session: SessionEntry; status: string }
   type CronFlat = { kind: 'cron'; job: CronJob; status: string }
   type ReviewFlat = { kind: 'review'; pr: PR & { repo: string; source?: string }; status: string }
   type TicketFlat = { kind: 'ticket'; ticket: Ticket; status: string }
-  type FlatEntry = TaskFlat | CronFlat | ReviewFlat | TicketFlat
+  type ManagerFlat = { kind: 'manager'; manager: ProjectManagerSession; status: string }
+  type FlatEntry = TaskFlat | CronFlat | ReviewFlat | TicketFlat | ManagerFlat
   const flat: FlatEntry[] = []
   for (const [projectId, group] of groups) {
     const project: Project = {
@@ -949,6 +1143,9 @@ function AttentionView({
   for (const t of liveTickets) {
     flat.push({ kind: 'ticket', ticket: t, status: lookupState(t.session_name) })
   }
+  for (const m of liveProjectManagers) {
+    flat.push({ kind: 'manager', manager: m, status: lookupState(m.tmux_name) })
+  }
   // Each chip renders to one of four flavours -- task / cron / review
   // use the same chip family; ticket gets its richer TicketNode for
   // parity with the Tickets page (priority, type, etc.).
@@ -972,6 +1169,16 @@ function AttentionView({
           label={`#${e.pr.number} ${e.pr.repo || ''}`}
           sublabel={e.pr.title}
           status={e.status} onClick={() => onClickReview(e.pr)}
+        />
+      )
+    }
+    if (e.kind === 'manager') {
+      return (
+        <LiveSessionChip
+          key={`manager-${e.manager.project_id}`} kind="manager"
+          label={e.manager.project_name || e.manager.project_id}
+          sublabel={e.manager.project_id}
+          status={e.status} onClick={() => onClickManager(e.manager)}
         />
       )
     }

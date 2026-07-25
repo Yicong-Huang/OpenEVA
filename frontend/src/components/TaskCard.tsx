@@ -211,6 +211,12 @@ export function TaskCard({
   // (graph/side panel). Fire-and-forget -- events from the server update
   // the UI when fetches land.
   //
+  // The DB is a cache: the background pr_sync job keeps open PRs fresh, so
+  // most opens read current data with no gh call. We only refresh PRs whose
+  // cache is invalid (dirty=1, set by the notification poller and not yet
+  // swept) -- that covers the "just marked dirty, background tick hasn't run
+  // yet" window without re-fetching already-fresh PRs.
+  //
   // 300ms debounce: if the user scrolls through cards quickly we don't
   // want N HTTP calls per second. `prs` is intentionally left out of the
   // dep array so changes to PR data don't trigger extra refreshes.
@@ -221,7 +227,9 @@ export function TaskCard({
     if (!isActive || prs.length === 0) return
     const timer = setTimeout(() => {
       for (const pr of prs) {
-        api.refreshPR(pr.number).catch(() => {})
+        if (pr.dirty) {
+          api.refreshPR(pr.number).catch(() => {})
+        }
       }
     }, 300)
     return () => clearTimeout(timer)

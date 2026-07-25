@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { SessionStatusProvider } from '../hooks/SessionStatusProvider'
 
@@ -30,6 +30,16 @@ vi.mock('../components/TaskCard', () => ({
 vi.mock('../components/PRCard', () => ({
   PRCard: ({ number }: { number: number }) => <div data-testid="pr-detail">pr:{number}</div>,
 }))
+vi.mock('../components/ProjectSessionCard', () => ({
+  ProjectSessionCard: ({ projectId, projectName }: { projectId: string; projectName: string }) => (
+    <div data-testid={`project-session-card-${projectId}`}>manager:{projectName}</div>
+  ),
+}))
+vi.mock('../components/SessionCard', () => ({
+  SessionCard: ({ sessionName }: { sessionName: string }) => (
+    <div data-testid="session-component">session:{sessionName}</div>
+  ),
+}))
 vi.mock('../hooks/useEventBus', () => ({
   useEventBus: (pattern: string, handler: (event: Record<string, unknown>) => void) => {
     eventBusHandlers.push({ pattern, handler })
@@ -52,6 +62,26 @@ function makeTask(tid: string, project: string) {
 
 function makeTasks(project: string, taskIds: string[]) {
   return Object.fromEntries(taskIds.map(tid => [tid, makeTask(tid, project)]))
+}
+
+function makeTicket(key: string, overrides: Record<string, unknown> = {}) {
+  return {
+    key,
+    summary: `${key} summary`,
+    description: '',
+    status: 'Open',
+    priority: 'Major',
+    issue_type: 'Bug',
+    project_key: key.split('-')[0],
+    assignee_email: '',
+    reporter_email: '',
+    url: `https://jira.example/browse/${key}`,
+    created_at: '',
+    updated_at: '2026-07-08T00:00:00',
+    synced_at: '',
+    session_name: `ticket-${key}`,
+    ...overrides,
+  }
 }
 
 // /api/all-sessions now embeds per-group `tasks` + project metadata so the
@@ -109,6 +139,7 @@ beforeEach(() => {
   mockFetch.mockImplementation((url: string) => {
     if (typeof url !== 'string') return Promise.reject(new Error('bad url'))
     if (url.includes('/api/all-sessions')) return jsonResponse(sessionsFixture)
+    if (url.includes('/api/project-managers')) return jsonResponse({ sessions: [] })
     if (url.includes('/api/actions')) return jsonResponse({ actions: [] })
     // /api/projects/{pid} no longer called by SessionsPage; retained as a
     // safety net for any follow-up fetches and to avoid 404 noise in tests.
@@ -127,6 +158,92 @@ describe('SessionsPage', () => {
     })
     // Groups with zero live sessions must not render.
     expect(screen.queryByText(/Empty/)).not.toBeInTheDocument()
+  })
+
+  it('renders live project manager sessions in Live Tasks', async () => {
+    mockFetch.mockImplementation((url: string) => {
+      if (typeof url !== 'string') return Promise.reject(new Error('bad url'))
+      if (url.includes('/api/all-sessions')) return jsonResponse({})
+      if (url.includes('/api/project-managers')) {
+        return jsonResponse({
+          sessions: [{
+            project_id: 'proj-1',
+            project_name: 'Project One',
+            tmux_name: 'pm-proj-1',
+            running: true,
+            status: 'idle',
+          }],
+        })
+      }
+      if (url.includes('/api/actions')) return jsonResponse({ actions: [] })
+      return jsonResponse({})
+    })
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage />)
+    await waitFor(() => {
+      expect(screen.getByTestId('live-section-manager')).toBeInTheDocument()
+      expect(screen.getByTestId('live-chip-manager-Project One')).toBeInTheDocument()
+      expect(screen.getByTestId('project-session-card-proj-1')).toBeInTheDocument()
+    })
+  })
+
+  it('does not render ticket-prefixed sessions as project tasks', async () => {
+    const payload = {
+      'proj-1': {
+        id: 'proj-1',
+        name: 'Project One',
+        has_tickets: true,
+        sessions: [
+          { task_id: 'ticket-MYPROJ-123', project: 'proj-1', tmux_name: 'ticket-MYPROJ-123', running: true, status: 'idle' },
+        ],
+        tasks: {},
+      },
+    }
+    mockFetch.mockImplementation((url: string) => {
+      if (typeof url !== 'string') return Promise.reject(new Error('bad url'))
+      if (url.includes('/api/all-sessions')) return jsonResponse(payload)
+      if (url.includes('/api/project-managers')) return jsonResponse({ sessions: [] })
+      if (url.includes('/api/actions')) return jsonResponse({ actions: [] })
+      return jsonResponse({})
+    })
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage />)
+    await waitFor(() => {
+      expect(screen.getByText('No active sessions.')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Project One')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('task-node-chip-ticket-MYPROJ-123')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('live-section-ticket-task')).not.toBeInTheDocument()
+    expect(screen.queryByText('Ticket Tasks')).not.toBeInTheDocument()
+  })
+
+  it('does not classify ordinary tasks with ticket_id as Ticket Tasks', async () => {
+    const task = makeTask('ordinary-task', 'proj-1')
+    task.ticket_id = 'MYPROJ-123'
+    const payload = {
+      'proj-1': {
+        id: 'proj-1',
+        name: 'Project One',
+        has_tickets: true,
+        sessions: [
+          { task_id: 'ordinary-task', project: 'proj-1', tmux_name: 'ordinary-task', running: true, status: 'idle' },
+        ],
+        tasks: { 'ordinary-task': task },
+      },
+    }
+    mockFetch.mockImplementation((url: string) => {
+      if (typeof url !== 'string') return Promise.reject(new Error('bad url'))
+      if (url.includes('/api/all-sessions')) return jsonResponse(payload)
+      if (url.includes('/api/project-managers')) return jsonResponse({ sessions: [] })
+      if (url.includes('/api/actions')) return jsonResponse({ actions: [] })
+      return jsonResponse({})
+    })
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage />)
+    await waitFor(() => {
+      expect(screen.getByTestId('task-node-chip-ordinary-task')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('live-section-ticket-task')).not.toBeInTheDocument()
   })
 
   it('shows "No active sessions." when every group is empty', async () => {
@@ -454,5 +571,47 @@ describe('SessionsPage', () => {
     // is exercised by the handleClickPR implementation. A separate unit would
     // require replacing the TaskCard mock, which we cover in the AllPRs tests.
     expect(onSelectPR).not.toHaveBeenCalled()
+  })
+
+  it('fetches enriched ticket detail before rendering a selected live ticket card history', async () => {
+    const liveTicket = makeTicket('LIVE-1')
+    const detailTicket = makeTicket('LIVE-1', {
+      history: [{ ts: '2026-07-08T12:00:00Z', text: 'history from detail endpoint' }],
+    })
+    mockFetch.mockImplementation((url: string) => {
+      if (typeof url !== 'string') return Promise.reject(new Error('bad url'))
+      if (url.includes('/api/tickets/LIVE-1')) return jsonResponse(detailTicket)
+      if (url.includes('/api/tickets')) {
+        return jsonResponse({ tickets: [liveTicket], configured: true, instances: [] })
+      }
+      if (url.includes('/api/all-sessions')) return jsonResponse({})
+      if (url.includes('/api/actions')) return jsonResponse({ actions: [] })
+      return jsonResponse({})
+    })
+
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage onSelectLiveTask={vi.fn()} />)
+
+    await waitFor(() => {
+      expect(eventBusHandlers.find(h => h.pattern === 'session.state')).toBeTruthy()
+    })
+    const stateHandler = eventBusHandlers.find(h => h.pattern === 'session.state')!
+    await act(async () => {
+      stateHandler.handler({
+        type: 'session.state',
+        session: 'ticket-LIVE-1',
+        kind: 'ticket',
+        state: 'idle',
+      })
+    })
+
+    fireEvent.click(await screen.findByTestId('ticket-row-LIVE-1'))
+
+    await waitFor(() => {
+      expect(mockFetch.mock.calls.some(
+        (c: unknown[]) => String(c[0]).includes('/api/tickets/LIVE-1'),
+      )).toBe(true)
+      expect(screen.getByText('history from detail endpoint')).toBeInTheDocument()
+    })
   })
 })

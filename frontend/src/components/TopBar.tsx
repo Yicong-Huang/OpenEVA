@@ -15,6 +15,8 @@ interface TopBarProps {
   onNavigate?: (projectId: string | null, view: string) => void
   onSelectTask?: (taskId: string | null) => void
   onSelectPR?: (pr: { repo: string; number: number; taskId?: string; projectId?: string } | null) => void
+  onSelectReview?: (url: string | null) => void
+  onSelectTicket?: (ticket: { key: string; instance?: string } | null) => void
 }
 
 function MenuDropdown() {
@@ -96,6 +98,8 @@ export function TopBar({
   onNavigate,
   onSelectTask,
   onSelectPR,
+  onSelectReview,
+  onSelectTicket,
 }: TopBarProps) {
   return (
     <div className="top-bar" data-testid="top-bar">
@@ -109,6 +113,8 @@ export function TopBar({
             onNavigate={onNavigate}
             onSelectTask={onSelectTask}
             onSelectPR={onSelectPR}
+            onSelectReview={onSelectReview}
+            onSelectTicket={onSelectTicket}
           />
         </div>
       )}

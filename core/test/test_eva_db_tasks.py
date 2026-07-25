@@ -605,3 +605,45 @@ def test_project_stats_all_done(db):
     assert stats["total"] == 3
     assert stats["counts"]["done"] == 3
     assert stats["progress"] == 100.0
+
+
+# ------------------------------------------------------------------
+# Ticket-task project (shared model: history/PR key on project+task_id)
+# ------------------------------------------------------------------
+
+def test_upsert_ticket_new_row_gets_prefix_project(db):
+    """A freshly tracked ticket becomes a task row whose `project` is the
+    JIRA prefix (INTKEY-14736 -> INTKEY), so it shares the same
+    history/PR model as regular tasks instead of an empty project."""
+    db.upsert_ticket(key="INTKEY-14736", summary="pin bug")
+    t = db.get_task("INTKEY", "INTKEY-14736")
+    assert t is not None
+    assert t["project"] == "INTKEY"
+
+
+def test_upsert_ticket_es_prefix_project(db):
+    db.upsert_ticket(key="EX-999", summary="an EX ticket")
+    t = db.get_task("EX", "EX-999")
+    assert t is not None
+    assert t["project"] == "EX"
+
+
+def test_ticket_task_supports_history_and_prs(db):
+    """With a non-empty project, a ticket task can carry history + PRs
+    through the ordinary task APIs -- proving the shared data model."""
+    db.upsert_ticket(key="INTKEY-2000", summary="x")
+    # task_id is the bare key; project is the prefix.
+    db.append_task_history("INTKEY", "INTKEY-2000", "started investigating")
+    db.add_pr("INTKEY", "INTKEY-2000", 12345, url="https://gh/pr/12345")
+    t = db.get_task("INTKEY", "INTKEY-2000")
+    assert any("started investigating" in h["text"] for h in t["history"])
+    assert any(p["number"] == 12345 for p in t["prs"])
+
+
+def test_upsert_ticket_no_dash_key_empty_project(db):
+    """Defensive: a key with no dash has no prefix -> empty project
+    (won't happen for real JIRA keys, but must not crash)."""
+    db.upsert_ticket(key="NODASH", summary="weird")
+    t = db.get_task("", "NODASH")
+    assert t is not None
+    assert t["project"] == ""

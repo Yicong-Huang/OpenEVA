@@ -3,6 +3,15 @@
 from unittest.mock import patch, MagicMock
 
 
+def _strip_env_prefix(argv):
+    if argv[0] != "env":
+        return argv
+    i = 1
+    while i < len(argv) and "=" in argv[i]:
+        i += 1
+    return argv[i:]
+
+
 class TestReceiveHook:
     def test_hook_stop_event(self, client):
         resp = client.post("/api/hook", json={
@@ -188,6 +197,16 @@ class TestParseSessionState:
         out = "hello\n\u276f"
         assert self._call(out) == ("idle", "Waiting for input")
 
+    def test_codex_prompt_glyph_is_idle(self):
+        # Codex's TUI input arrow is U+203A (\u203a), not Claude's U+276F.
+        # State detection must treat it as an idle prompt too.
+        out = "some log\n\u203a Write tests for @filename"
+        assert self._call(out) == ("idle", "Waiting for input")
+
+    def test_codex_prompt_glyph_alone_is_idle(self):
+        out = "hello\n\u203a"
+        assert self._call(out) == ("idle", "Waiting for input")
+
     def test_only_whitespace_lines_is_unknown(self):
         assert self._call("\n  \n\t\n") == ("unknown", "")
 
@@ -364,11 +383,15 @@ class TestResumeSessionRoute:
         assert resp.status_code == 200
         d = resp.json()
         assert d["action"] == "resumed"
-        # argv must use the `agent resume <uuid>` subcommand (not
-        # --resume passthrough to claude) so agent owns session discovery.
+        # A transcript UUID resumes the LOCAL conversation via
+        # `--resume` (reads the on-disk transcript, independent of the
+        # cloud session registry). The cloud `resume` subcommand is
+        # reserved for numeric cloud ids.
         call = mock_tmux["launch_argv"].call_args
         argv = call.args[2] if len(call.args) >= 3 else call.kwargs.get("argv")
-        assert argv[0] in ("agent", "claude") and argv[1] == "resume"
+        argv = _strip_env_prefix(argv)
+        # Legacy row (empty agent_impl) resumes with the default agent.
+        assert argv[0] == "claude" and argv[1] == "--resume"
         assert argv[2] == "deadbeef-1234-5678-90ab-cdef01234567"
 
     def test_resume_is_noop_when_tmux_alive(
@@ -379,6 +402,47 @@ class TestResumeSessionRoute:
         assert resp.status_code == 200
         assert resp.json()["action"] == "noop"
         mock_tmux["launch_argv"].assert_not_called()
+
+
+class TestRestartSessionRoute:
+    """POST /api/sessions/{name}/restart kills the live tmux and resumes
+    the SAME agent session by UUID (keeps the DB row + conversation)."""
+
+    def test_restart_missing_session_returns_404(self, client, mock_tmux):
+        resp = client.post("/api/sessions/ghost/restart")
+        assert resp.status_code == 404
+
+    def test_restart_kills_then_resumes_same_uuid(
+            self, client, patched_server, mock_tmux):
+        # Session starts alive, then tmux is gone after the kill so
+        # resume proceeds. Sequence session_exists accordingly.
+        calls = {"n": 0}
+
+        def _exists(_name):
+            calls["n"] += 1
+            return calls["n"] == 1  # alive on first check, gone after
+
+        mock_tmux["exists"].side_effect = _exists
+        patched_server._db.create_session("live-sess", "test-proj", "live-sess")
+        patched_server._db.update_session(
+            "live-sess", agent_session_id="abcdef01-2345-6789-abcd-ef0123456789",
+        )
+        with patch("common.sessions.graceful_kill_session") as gk:
+            resp = client.post("/api/sessions/live-sess/restart")
+        assert resp.status_code == 200
+        d = resp.json()
+        assert d["action"] == "resumed"
+        assert d["restarted"] is True
+        # tmux was killed (graceful, not the DB-deleting kill_session)...
+        gk.assert_called_once_with("live-sess")
+        # ...and the DB row (with the UUID) survives the restart.
+        assert patched_server._db.get_session("live-sess") is not None
+        # resumed by the same UUID via local --resume
+        call = mock_tmux["launch_argv"].call_args
+        argv = call.args[2] if len(call.args) >= 3 else call.kwargs.get("argv")
+        argv = _strip_env_prefix(argv)
+        assert argv[1] == "--resume"
+        assert argv[2] == "abcdef01-2345-6789-abcd-ef0123456789"
 
 
 class TestHookCapturesAgentSessionId:
@@ -398,6 +462,24 @@ class TestHookCapturesAgentSessionId:
         assert resp.status_code == 200
         row = patched_server._db.get_session("hk-sess")
         assert row["agent_session_id"] == "feedface-1111-2222-3333-aabbccddeeff"
+
+    def test_ticket_session_start_persists_session_id(
+            self, client, patched_server):
+        patched_server._db.create_session(
+            "ticket-OPS-99", "", "ticket-OPS-99",
+        )
+        resp = client.post("/api/hook", json={
+            "session": "ticket-OPS-99",
+            "event": "SessionStart",
+            "data": {
+                "session_id": "ticket-feedface-1111",
+                "source": "startup",
+                "hook_event_name": "SessionStart",
+            },
+        })
+        assert resp.status_code == 200
+        row = patched_server._db.get_session("ticket-OPS-99")
+        assert row["agent_session_id"] == "ticket-feedface-1111"
 
     def test_non_session_start_hook_does_not_overwrite_uuid(
             self, client, patched_server):
@@ -472,19 +554,28 @@ class TestRebuildSessions:
         mock_tmux["launch"].assert_not_called()
 
     def test_dead_sessions_are_rebuilt(self, client, mock_tmux, patched_server):
-        """When tmux is dead for a session, it should be rebuilt."""
+        """A dead session with a recorded UUID is rebuilt via the
+        launching agent's `--resume` (argv path, per-session agent)."""
         mock_tmux["exists"].return_value = False
         patched_server._db.create_session("dead-sess", "test-proj", "dead-sess")
+        # A recorded transcript UUID drives the local `--resume` path.
+        patched_server._db.update_session(
+            "dead-sess",
+            agent_session_id="deadbeef-1234-5678-90ab-cdef01234567",
+        )
         resp = client.post("/api/sessions/rebuild")
         assert resp.status_code == 200
         data = resp.json()
         assert "dead-sess" in data["rebuilt"]
         assert data["skipped"] == []
         assert data["failed"] == []
-        mock_tmux["launch"].assert_called_once()
-        # Verify it was called with resume command
-        call_args = mock_tmux["launch"].call_args
-        assert "--resume" in call_args[0][2]
+        # Rebuild launches via argv (per-session agent), not a shell
+        # string command.
+        mock_tmux["launch_argv"].assert_called_once()
+        call_args = mock_tmux["launch_argv"].call_args
+        argv = (call_args[0][2] if len(call_args[0]) >= 3
+                else call_args.kwargs["argv"])
+        assert "--resume" in argv
 
     def test_mixed_alive_and_dead_sessions(self, client, mock_tmux, patched_server):
         """Mix of alive and dead sessions should be sorted correctly."""
@@ -500,9 +591,9 @@ class TestRebuildSessions:
         assert data["failed"] == []
 
     def test_launch_failure_is_recorded(self, client, mock_tmux, patched_server):
-        """When adapters.tmux.launch_session raises, session goes to failed list."""
+        """When the argv launch raises, session goes to failed list."""
         mock_tmux["exists"].return_value = False
-        mock_tmux["launch"].side_effect = RuntimeError("tmux not found")
+        mock_tmux["launch_argv"].side_effect = RuntimeError("tmux not found")
         patched_server._db.create_session("fail-sess", "test-proj", "fail-sess")
         resp = client.post("/api/sessions/rebuild")
         assert resp.status_code == 200
@@ -523,16 +614,15 @@ class TestRebuildSessions:
         assert data["failed"] == []
 
     def test_rebuild_launches_tmux_for_dead_sessions(self, client, mock_tmux, patched_server):
-        """Sessions whose tmux died are relaunched via `agent --resume`.
-        The old `background_sent` flag no longer gates anything (context
-        is re-injected via --append-system-prompt on every launch), so
-        rebuild is just: detect dead tmux -> launch agent --resume."""
+        """Sessions whose tmux died are relaunched via the argv path.
+        A recorded UUID resumes; a row without one is relaunched fresh.
+        Either way rebuild goes through `launch_session_argv`."""
         mock_tmux["exists"].return_value = False
         patched_server._db.create_session("reset-sess", "test-proj", "reset-sess")
         resp = client.post("/api/sessions/rebuild")
         assert resp.status_code == 200
         assert "reset-sess" in resp.json()["rebuilt"]
-        mock_tmux["launch"].assert_called()
+        mock_tmux["launch_argv"].assert_called()
 
 
 class TestKillSessionsByStatus:

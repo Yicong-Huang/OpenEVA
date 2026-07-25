@@ -103,7 +103,11 @@ def get_usage():
     if data:
         _usage_cache["data"] = data
         _usage_cache["ts"] = _time.time()
-    return data or {"daily": None, "weekly": None, "monthly": None, "tier": None}
+    return data or {
+        "daily": None, "weekly": None, "monthly": None, "tier": None,
+        "claude_cost": None, "claude_tokens": None,
+        "codex_cost": None, "codex_tokens": None,
+    }
 
 
 def get_usage_history(days=7):

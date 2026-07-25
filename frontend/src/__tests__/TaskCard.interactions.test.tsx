@@ -493,14 +493,15 @@ describe('TaskCard interactions', () => {
     })
   })
 
-  it('refreshes related PRs when card becomes active (sessionExpanded)', async () => {
-    // When the user selects a card in SessionsPage we want fresh CI / review
-    // state for its PRs without making the user click each PR's refresh
-    // button. Fire-and-forget; debounced 300ms to dodge scroll/click bursts.
+  it('refreshes only dirty PRs when card becomes active (sessionExpanded)', async () => {
+    // The background pr_sync job keeps the DB fresh; the DB is a cache and
+    // the `dirty` flag is the cache-invalidation signal. On open we only
+    // hit gh for PRs whose cache is stale (dirty=1). Clean PRs are already
+    // current from the background job -- zero gh calls. Debounced 300ms.
     const project = makeProject({
       prs: [
-        { number: 100, status: 'open', url: 'https://github.com/o/r/pull/100' },
-        { number: 200, status: 'open', url: 'https://github.com/o/r/pull/200' },
+        { number: 100, status: 'open', url: 'https://github.com/o/r/pull/100', dirty: 1 },
+        { number: 200, status: 'open', url: 'https://github.com/o/r/pull/200', dirty: 0 },
       ] as Task['prs'],
     })
     render(
@@ -508,14 +509,27 @@ describe('TaskCard interactions', () => {
     )
     await waitFor(() => {
       expect(api.refreshPR).toHaveBeenCalledWith(100)
-      expect(api.refreshPR).toHaveBeenCalledWith(200)
     }, { timeout: 1000 })
-    expect(vi.mocked(api.refreshPR).mock.calls.length).toBe(2)
+    // #200 is clean -- must not be refreshed.
+    expect(api.refreshPR).not.toHaveBeenCalledWith(200)
+    expect(vi.mocked(api.refreshPR).mock.calls.length).toBe(1)
+  })
+
+  it('does NOT refresh clean PRs even when card is active', async () => {
+    const project = makeProject({
+      prs: [{ number: 100, status: 'open', url: 'x', dirty: 0 }] as Task['prs'],
+    })
+    render(
+      <TaskCard project={project} taskId="task-1" actions={[]} sessionExpanded={true} />,
+    )
+    // Wait past the debounce; a clean PR must trigger no gh call.
+    await new Promise(r => setTimeout(r, 500))
+    expect(api.refreshPR).not.toHaveBeenCalled()
   })
 
   it('does NOT refresh PRs when card is rendered but not active', async () => {
     const project = makeProject({
-      prs: [{ number: 100, status: 'open', url: 'x' }] as Task['prs'],
+      prs: [{ number: 100, status: 'open', url: 'x', dirty: 1 }] as Task['prs'],
     })
     render(
       <TaskCard project={project} taskId="task-1" actions={[]} sessionExpanded={false} />,
@@ -525,9 +539,9 @@ describe('TaskCard interactions', () => {
     expect(api.refreshPR).not.toHaveBeenCalled()
   })
 
-  it('refreshes PRs in graph/side panel mode (forceFullRender)', async () => {
+  it('refreshes dirty PRs in graph/side panel mode (forceFullRender)', async () => {
     const project = makeProject({
-      prs: [{ number: 555, status: 'open', url: 'x' }] as Task['prs'],
+      prs: [{ number: 555, status: 'open', url: 'x', dirty: 1 }] as Task['prs'],
     })
     render(
       <TaskCard project={project} taskId="task-1" actions={[]} forceFullRender />,

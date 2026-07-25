@@ -1,7 +1,6 @@
 """Work log routes: auto-generate daily logs from eva.db, editable."""
 
 import common
-import re
 # pysqlite3 fallback -- see app_state.py for why mixing engines corrupts the WAL.
 try:
     from pysqlite3 import dbapi2 as sqlite3
@@ -14,24 +13,12 @@ from pydantic import BaseModel
 import app_state
 
 
-# Matches titles / ticket ids that carry an ES ticket prefix, with or without
-# brackets. Examples: "EX-1001", "[EX-1001]", "[EX-1001] Fix flaky ...".
-# The brackets themselves are preserved in rendered output -- this regex is
-# only for classifying an entry as "ES ticket" so it lands in its own section.
-_ES_PREFIX_RE = re.compile(r"^\[?(EX-\d+)\]?\s*", re.IGNORECASE)
-
-
 def _status_suffix(status: str) -> str:
     """Emoji suffix that matches the user's Slack worklog style.
     Only `merged` PRs get a tag (`:white_check_mark:`); other statuses stay terse."""
     if (status or "").lower() == "merged":
         return " :white_check_mark:"
     return ""
-
-
-def _is_es_title(text: str) -> bool:
-    """True when a PR title or ticket id starts with an EX-xxxxxx prefix."""
-    return bool(_ES_PREFIX_RE.match(text or ""))
 
 
 def _pr_title_line(pr: dict, indent: str = "            ") -> str:
@@ -75,7 +62,13 @@ def _task_line(task: dict, indent: str = "            ") -> tuple[str, list[str]
     standup, so we no longer emit sub-bullets here. The user's manual
     edits stay -- they just don't need to be pre-populated with noise.
     """
-    desc = (task.get("description") or "").strip()
+    # For a synced ticket the `description` is the full (often huge,
+    # multi-line) JIRA body -- use the one-line `ticket_summary` instead
+    # so the standup line stays scannable. Reviews / plain tasks keep
+    # their description. Collapse whitespace so a multi-line body never
+    # spills across bullets, then clamp length.
+    raw_desc = (task.get("ticket_summary") or task.get("description") or "")
+    desc = " ".join(raw_desc.split())
     if len(desc) > 100:
         desc = desc[:97] + "..."
     ticket = task.get("ticket_id") or ""
@@ -107,8 +100,36 @@ _WORKLOG_PR_COLS = (
 _WORKLOG_PR_OUTPUT_COLS = _WORKLOG_PR_COLS + ("project",)
 _WORKLOG_TASK_COLS = (
     "project", "task_id", "description", "ticket_id", "ticket_url",
-    "notes", "status",
+    "notes", "status", "type", "ticket_summary", "ticket_synced_at",
 )
+
+
+def _resolve_agent_sessions(sessions: set) -> set:
+    """Map agent tmux session names to the task_ids they belong to.
+
+    Naming conventions across the unified tasks table:
+      - plain task + review sessions are named BY their task_id
+        (`review-apache-spark-55552` is both the session and the
+        task_id), so they match directly.
+      - ticket sessions are `ticket-<instance>-<ticket_id>`, which is
+        NOT the task_id -- we recover the task_id by reconstructing that
+        composite from the `tasks` row and matching.
+
+    `cron-` sessions are dropped (cron jobs aren't tasks). One DB query
+    handles all three shapes."""
+    sessions = {s for s in sessions if s and not s.startswith("cron-")}
+    if not sessions:
+        return set()
+    ph = ",".join("?" for _ in sessions)
+    params = tuple(sessions)
+    rows = app_state._db._conn.execute(
+        "SELECT task_id FROM tasks "
+        f"WHERE task_id IN ({ph}) "
+        "   OR ('ticket-' || COALESCE(ticket_instance, '') || '-' "
+        f"       || COALESCE(ticket_id, '')) IN ({ph})",
+        params + params,
+    ).fetchall()
+    return {r["task_id"] for r in rows}
 
 
 def _collect_active_task_ids(start: str, end: str) -> set:
@@ -119,14 +140,12 @@ def _collect_active_task_ids(start: str, end: str) -> set:
          task_id parsed from the title prefix.
       2. `agent.*` events (prompt_submit / task_done / needs_input /
          needs_permission / session_start) -- the tmux session name in
-         the `session` column equals the task_id for task sessions.
-         Skip cron / review / ticket sessions (those have their own
-         worklog story).
-
-    The previous implementation only used #1, which silently dropped
-    every task the user worked on via the agent without triggering a
-    CRUD event -- i.e. most of the actual work. Adding #2 catches
-    "I had a long claude session on task X today, no metadata edits".
+         the `session` column, resolved back to its task_id. This
+         INCLUDES ticket-fixing and PR-review sessions (they're tasks in
+         the unified table); only cron sessions are dropped. Earlier this
+         skipped `ticket-` / `review-` sessions entirely, which is why
+         "I spent today fixing EX-1234 / reviewing a PR" never made it
+         into the standup.
     """
     conn = app_state._notif_db()
     conn.row_factory = sqlite3.Row
@@ -139,6 +158,7 @@ def _collect_active_task_ids(start: str, end: str) -> set:
     ).fetchall()
     conn.close()
     out: set = set()
+    agent_sessions: set = set()
     for e in rows:
         ev_type = e["type"] or ""
         if ev_type.startswith("task."):
@@ -149,12 +169,9 @@ def _collect_active_task_ids(start: str, end: str) -> set:
                 out.add(tid)
         elif ev_type.startswith("agent."):
             sess = (e["session"] or "").strip()
-            # Skip non-task sessions; they have their own surfaces.
-            if not sess or sess.startswith(
-                ("cron-", "review-", "ticket-")
-            ):
-                continue
-            out.add(sess)
+            if sess:
+                agent_sessions.add(sess)
+    out |= _resolve_agent_sessions(agent_sessions)
     return out
 
 
@@ -171,13 +188,19 @@ def _query_status_changed_prs(start: str, end: str) -> list:
     """
     cols = ", ".join(f"p.{c}" for c in _WORKLOG_PR_COLS)
     rows = app_state._db._conn.execute(
-        f"SELECT {cols}, t.project AS project FROM prs p "
+        f"SELECT {cols}, t.project AS project, t.type AS task_type, "
+        "  t.ticket_synced_at AS task_ticket_synced_at FROM prs p "
         "  JOIN tasks t ON t.task_id = p.task_id "
         "WHERE p.status_changed_at >= ? AND p.status_changed_at < ? "
         "ORDER BY t.project, p.number",
         (start, end),
     ).fetchall()
-    return [{c: r[c] for c in _WORKLOG_PR_OUTPUT_COLS} for r in rows]
+    return [
+        {**{c: r[c] for c in _WORKLOG_PR_OUTPUT_COLS},
+         "task_type": r["task_type"],
+         "task_ticket_synced_at": r["task_ticket_synced_at"]}
+        for r in rows
+    ]
 
 
 def _task_prs_for_worklog(project: str, task_id: str) -> list:
@@ -199,17 +222,50 @@ def _task_prs_for_worklog(project: str, task_id: str) -> list:
     return [{c: r[c] for c in _WORKLOG_PR_OUTPUT_COLS} for r in rows]
 
 
+def _task_bucket_kind(task: dict) -> str:
+    """Which worklog section a task belongs to: 'reviews' (PR reviews),
+    'tickets' (a ticket SYNCED from JIRA -- EX / INTKEY / MYPROJ ...), or
+    'project' (everything else, grouped by project).
+
+    The discriminator for Tickets is `ticket_synced_at`, NOT a bare
+    ticket_id: the user's own OSS PRs carry a manually-attached
+    `SPARK-xxx` id but aren't synced escalations, and belong under their
+    project, not the Tickets section."""
+    if (task.get("type") == "review"
+            or (task.get("task_id") or "").startswith("review-")):
+        return "reviews"
+    if (task.get("ticket_synced_at") or "").strip():
+        return "tickets"
+    return "project"
+
+
+def _pr_bucket_kind(pr: dict) -> str:
+    """Section for a status-changed PR -- mirrors `_task_bucket_kind`,
+    keyed off the PR's TASK: a review task's PR is review work; a PR on a
+    JIRA-synced ticket task is ticket work; everything else (including
+    the user's own `[SPARK-...]` feature PRs) stays under its project."""
+    if (pr.get("task_type") == "review"
+            or (pr.get("task_id") or "").startswith("review-")):
+        return "reviews"
+    if (pr.get("task_ticket_synced_at") or "").strip():
+        return "tickets"
+    return "project"
+
+
 def _build_worklog_buckets(task_ids: set, prs: list) -> tuple:
     """Split active tasks + status-changed PRs into per-project buckets
-    and a single `es_bucket` that pulls every EX-ticket out into its
-    own section (matches the user's Slack standup convention).
+    plus two dedicated sections: `tickets` (every JIRA ticket the user
+    touched) and `reviews` (PR reviews). Matches the user's standup
+    convention of calling those out separately.
 
-    Then promote each task's PRs into the bucket so the rendered line
-    is the PR (which carries title + url) rather than a bare task
-    restatement -- the user wants the PR link.
+    Then promote each task's PRs into its bucket so the rendered line is
+    the PR (title + url) rather than a bare task restatement -- the user
+    wants the PR link (the reviewed PR for a review, the fix PR for a
+    ticket).
     """
     by_project: dict = {}
-    es_bucket: dict = {"tasks": {}, "prs": []}
+    tickets: dict = {"tasks": {}, "prs": []}
+    reviews: dict = {"tasks": {}, "prs": []}
 
     for tid in task_ids:
         row = app_state._db._conn.execute(
@@ -220,16 +276,22 @@ def _build_worklog_buckets(task_ids: set, prs: list) -> tuple:
         if not row:
             continue
         task = dict(zip(_WORKLOG_TASK_COLS, row))
-        if _is_es_title(task.get("ticket_id") or ""):
-            es_bucket["tasks"][tid] = task
+        kind = _task_bucket_kind(task)
+        if kind == "reviews":
+            reviews["tasks"][tid] = task
+        elif kind == "tickets":
+            tickets["tasks"][tid] = task
         else:
             proj = task.get("project", "other")
             by_project.setdefault(proj, {"tasks": {}, "prs": []})
             by_project[proj]["tasks"][tid] = task
 
     for pr in prs:
-        if _is_es_title(pr.get("title") or ""):
-            es_bucket["prs"].append(pr)
+        kind = _pr_bucket_kind(pr)
+        if kind == "reviews":
+            reviews["prs"].append(pr)
+        elif kind == "tickets":
+            tickets["prs"].append(pr)
         else:
             proj = pr["project"]
             by_project.setdefault(proj, {"tasks": {}, "prs": []})
@@ -239,8 +301,9 @@ def _build_worklog_buckets(task_ids: set, prs: list) -> tuple:
     # change in the window). A task touched today usually means PR work,
     # and the standup should link the PR, not re-describe the ticket.
     seen = {p["number"] for proj in by_project.values() for p in proj["prs"]}
-    seen.update(p["number"] for p in es_bucket["prs"])
-    for bucket in [*by_project.values(), es_bucket]:
+    seen.update(p["number"] for p in tickets["prs"])
+    seen.update(p["number"] for p in reviews["prs"])
+    for bucket in [*by_project.values(), tickets, reviews]:
         promoted: set = set()
         for tid, task in bucket["tasks"].items():
             pr_rows = _task_prs_for_worklog(task["project"], tid)
@@ -255,10 +318,11 @@ def _build_worklog_buckets(task_ids: set, prs: list) -> tuple:
         for tid in promoted:
             bucket["tasks"].pop(tid, None)
 
-    return by_project, es_bucket
+    return by_project, tickets, reviews
 
 
-def _render_worklog_lines(header: str, by_project: dict, es_bucket: dict) -> list:
+def _render_worklog_lines(header: str, by_project: dict,
+                          tickets: dict, reviews: dict) -> list:
     """Format the bucketed data as the standup-style markdown."""
     proj_names = app_state.project_name_map()
     lines = [header, "    - Status:"]
@@ -275,16 +339,19 @@ def _render_worklog_lines(header: str, by_project: dict, es_bucket: dict) -> lis
             lines.append(main)
             lines.extend(subs)
 
-    has_es = bool(es_bucket["tasks"] or es_bucket["prs"])
-    if not by_project and not has_es:
+    has_tickets = bool(tickets["tasks"] or tickets["prs"])
+    has_reviews = bool(reviews["tasks"] or reviews["prs"])
+    if not by_project and not has_tickets and not has_reviews:
         lines.append("        - No activity recorded")
     else:
         for pid, data in sorted(by_project.items()):
-            pname = proj_names.get(pid, pid)
+            pname = proj_names.get(pid, pid) or "Other"
             _emit_group(f"        - {pname}:", data)
-        # ES tickets always land last under their own section header.
-        if has_es:
-            _emit_group("        - ES tickets:", es_bucket)
+        # Tickets + Reviews always land last under their own headers.
+        if has_tickets:
+            _emit_group("        - Tickets:", tickets)
+        if has_reviews:
+            _emit_group("        - Reviews:", reviews)
 
     lines.append("    - Meeting Notes:")
     return lines
@@ -311,8 +378,9 @@ def _generate_worklog_content(start: str, end: str, header: str) -> str:
     """
     task_ids = _collect_active_task_ids(start, end)
     prs = _query_status_changed_prs(start, end)
-    by_project, es_bucket = _build_worklog_buckets(task_ids, prs)
-    return "\n".join(_render_worklog_lines(header, by_project, es_bucket))
+    by_project, tickets, reviews = _build_worklog_buckets(task_ids, prs)
+    return "\n".join(
+        _render_worklog_lines(header, by_project, tickets, reviews))
 
 
 def _generate_worklog_markdown(date: str) -> str:

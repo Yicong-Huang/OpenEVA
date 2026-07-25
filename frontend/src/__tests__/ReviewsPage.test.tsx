@@ -8,6 +8,7 @@ vi.mock('../api', () => ({
     addReviewWatch: vi.fn(),
     removeReviewWatch: vi.fn(),
     syncReviewRequests: vi.fn().mockResolvedValue({ status: 'sync started' }),
+    setSetting: vi.fn().mockResolvedValue({}),
     markReviewSeen: vi.fn().mockResolvedValue({}),
     waitReady: vi.fn(),
     sendTerminalInput: vi.fn(),
@@ -89,9 +90,8 @@ describe('ReviewsPage', () => {
     // Repo headers present (alphabetical for stability).
     expect(screen.getByText('example/repo')).toBeInTheDocument()
     expect(screen.getByText('myorg/svc')).toBeInTheDocument()
-    // Count pill reflects visible-PR count (merged-and-already-reviewed
-    // PRs would be filtered out, but none of these mocks are merged).
-    expect(screen.getByText('3 shown')).toBeInTheDocument()
+    // Active-tab count reflects the visible PRs (none merged+reviewed here).
+    expect(screen.getByTestId('reviews-tab-active')).toHaveTextContent('Reviews (3)')
   })
 
   it('shows empty-state when backend returns no PRs', async () => {
@@ -102,10 +102,9 @@ describe('ReviewsPage', () => {
     })
   })
 
-  it('hides merged PRs that I already approved or commented on, and surfaces the count', async () => {
-    // 4 PRs: 1 open, 1 merged-but-untouched (folded), 1 merged+approved
-    // (hidden), 1 merged+commented (hidden). Header should read
-    // "2 shown (2 hidden)" -- the open one + the folded one.
+  it('moves merged PRs I reviewed to the Completed tab; keeps others in Active', async () => {
+    // 4 PRs: 1 open, 1 merged-but-untouched (folded, stays Active),
+    // 1 merged+approved (Completed), 1 merged+commented (Completed).
     vi.mocked(api.getReviewRequests).mockResolvedValue({
       prs: [
         MOCK_PR({ number: 1, title: 'open one', repo: 'a/b', status: 'open' }),
@@ -118,14 +117,69 @@ describe('ReviewsPage', () => {
     await waitFor(() => {
       expect(screen.getByText('open one')).toBeInTheDocument()
     })
-    // Hidden: my_review_state in (approved, commented) on merged PRs.
+    // Active tab: open + folded-merged-untouched; reviewed-merged are gone.
+    expect(screen.getByText('merged untouched')).toBeInTheDocument()
     expect(screen.queryByText('merged i approved')).not.toBeInTheDocument()
     expect(screen.queryByText('merged i commented')).not.toBeInTheDocument()
-    // Folded but visible: untouched merged PR.
-    expect(screen.getByText('merged untouched')).toBeInTheDocument()
-    // Header counts.
-    expect(screen.getByText('2 shown')).toBeInTheDocument()
-    expect(screen.getByText('(2 hidden)')).toBeInTheDocument()
+    // Tab buttons carry the counts: Active (2), Completed (2).
+    expect(screen.getByTestId('reviews-tab-active')).toHaveTextContent('Reviews (2)')
+    expect(screen.getByTestId('reviews-tab-completed')).toHaveTextContent('Completed (2)')
+
+    // Switch to Completed: the two reviewed-merged PRs show; Active ones gone.
+    fireEvent.click(screen.getByTestId('reviews-tab-completed'))
+    await waitFor(() => {
+      expect(screen.getByText('merged i approved')).toBeInTheDocument()
+    })
+    expect(screen.getByText('merged i commented')).toBeInTheDocument()
+    expect(screen.queryByText('open one')).not.toBeInTheDocument()
+    expect(screen.queryByText('merged untouched')).not.toBeInTheDocument()
+  })
+
+  it('sorts apache/texera to the bottom regardless of alphabetical order', async () => {
+    vi.mocked(api.getReviewRequests).mockResolvedValue({
+      prs: [
+        MOCK_PR({ number: 1, title: 'texera pr', repo: 'apache/texera', status: 'open' }),
+        MOCK_PR({ number: 2, title: 'zzz pr', repo: 'zzz/repo', status: 'open' }),
+        MOCK_PR({ number: 3, title: 'aaa pr', repo: 'aaa/repo', status: 'open' }),
+      ],
+    })
+    render(<ReviewsPage />)
+    await waitFor(() => {
+      expect(screen.getByText('aaa/repo')).toBeInTheDocument()
+    })
+    // Repo headers, in DOM order. apache/texera must be last even though
+    // 'apache' sorts first alphabetically.
+    const headers = screen.getAllByTestId(/^reviews-repo-header-/)
+      .map((el) => el.getAttribute('data-testid'))
+    expect(headers).toEqual([
+      'reviews-repo-header-aaa/repo',
+      'reviews-repo-header-zzz/repo',
+      'reviews-repo-header-apache/texera',
+    ])
+  })
+
+  it('collapses/expands a repo group and remembers it via settings', async () => {
+    vi.mocked(api.getReviewRequests).mockResolvedValue({
+      prs: [MOCK_PR({ number: 1, title: 'visible pr', repo: 'a/b', status: 'open' })],
+    })
+    render(<ReviewsPage />)
+    await waitFor(() => {
+      expect(screen.getByText('visible pr')).toBeInTheDocument()
+    })
+    // Click the repo header to collapse -> the row disappears...
+    fireEvent.click(screen.getByTestId('reviews-repo-header-a/b'))
+    await waitFor(() => {
+      expect(screen.queryByText('visible pr')).not.toBeInTheDocument()
+    })
+    // ...and the collapse state is persisted.
+    expect(api.setSetting).toHaveBeenCalledWith(
+      'ui.reviews.collapsed_repos', expect.arrayContaining(['a/b']),
+    )
+    // Click again to expand -> the row comes back.
+    fireEvent.click(screen.getByTestId('reviews-repo-header-a/b'))
+    await waitFor(() => {
+      expect(screen.getByText('visible pr')).toBeInTheDocument()
+    })
   })
 
   it('flags merged-but-visible PRs as folded so the row can dim itself', async () => {
@@ -238,8 +292,13 @@ describe('ReviewsPage', () => {
           'https://github.com/a/b/pull/1',
         )
       })
-      // Triggers a refetch so the new entry shows up.
-      expect(api.getReviewRequests).toHaveBeenCalledTimes(2)
+      // Add triggers a refetch (>=2 -- selecting the new PR also fires a
+      // markReviewSeen-driven reload).
+      expect(vi.mocked(api.getReviewRequests).mock.calls.length).toBeGreaterThanOrEqual(2)
+      // ...and jumps straight to the added PR's detail view.
+      await waitFor(() => {
+        expect(screen.getByTestId('pr-detail')).toHaveTextContent('a/b#1')
+      })
     } finally {
       window.prompt = origPrompt
     }

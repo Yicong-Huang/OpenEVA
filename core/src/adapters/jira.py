@@ -42,6 +42,61 @@ AUTH_BASIC = "basic"
 AUTH_BEARER = "bearer"
 VALID_AUTH_TYPES = {AUTH_BASIC, AUTH_BEARER}
 
+# The standard field-set we pull for every issue. `search_issues` and
+# `fetch_issue` share it so a single ticket fetched on the auto-track
+# path normalises identically to one pulled by the JQL sync. Callers
+# can append instance-specific custom fields (e.g. the Severity
+# customfield id) via the `extra_fields` argument.
+_BASE_FIELDS = [
+    "summary", "status", "priority", "issuetype", "assignee",
+    "reporter", "created", "updated", "project", "description",
+    "labels", "components", "fixVersions", "parent", "resolution",
+]
+
+
+def _fields_list(extra_fields: list[str] | None) -> list[str]:
+    """Return `_BASE_FIELDS` plus any non-empty, de-duplicated extras
+    (preserving order). Used to build the `fields` request param."""
+    out = list(_BASE_FIELDS)
+    for f in (extra_fields or []):
+        if f and f not in out:
+            out.append(f)
+    return out
+
+
+def fetch_fields(
+    *,
+    base_url: str,
+    auth_type: str = AUTH_BASIC,
+    email: str = "",
+    api_token: str,
+    http_get: Callable[..., dict] | None = None,
+) -> list[dict]:
+    """Return JIRA's field catalogue (`[{"id","name",...}]`).
+
+    Used to auto-detect instance-specific custom fields by name -- e.g.
+    mapping "Severity" to its `customfield_XXXXX` id without the user
+    having to look it up. Tries the v3 endpoint first, falls back to v2
+    on 404/405/410 so both Cloud and Server installs work. Returns []
+    on any failure (caller treats a missing catalogue as "no custom
+    field" rather than erroring the whole sync)."""
+    auth_header = _build_auth_header(auth_type, email=email, token=api_token)
+    base = base_url.rstrip("/")
+    headers = {"Authorization": auth_header, "Accept": "application/json"}
+    fn = http_get or _http_get
+    for path in ("/rest/api/3/field", "/rest/api/2/field"):
+        try:
+            body = fn(f"{base}{path}", headers)
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405, 410):
+                continue
+            return []
+        except (urllib.error.URLError, ValueError):
+            return []
+        if isinstance(body, list):
+            return body
+    return []
+
 
 def _basic_auth_header(email: str, token: str) -> str:
     raw = f"{email}:{token}".encode("utf-8")
@@ -72,6 +127,11 @@ def _build_auth_header(auth_type: str, *, email: str, token: str) -> str:
     raise ValueError(f"unknown JIRA auth_type: {auth_type!r}")
 
 
+# Page-walk safety cap for `search_issues`: 20 pages x maxResults=100
+# bounds a runaway JQL at 2000 issues per sync tick.
+MAX_SEARCH_PAGES = 20
+
+
 def _default_search_path(auth_type: str) -> str:
     # Bearer is conventional on Apache server-style installs (v2);
     # Basic is conventional on Atlassian Cloud (v3). Override-able
@@ -88,6 +148,7 @@ def search_issues(
     jql: str,
     max_results: int = 100,
     api_path: str | None = None,
+    extra_fields: list[str] | None = None,
     http_get: Callable[..., dict] | None = None,
     http_post: Callable[..., dict] | None = None,
 ) -> list[dict]:
@@ -115,51 +176,81 @@ def search_issues(
     auth_header = _build_auth_header(auth_type, email=email, token=api_token)
     base = base_url.rstrip("/")
     path = api_path or _default_search_path(auth_type)
-    fields = (
-        "summary,status,priority,issuetype,assignee,reporter,"
-        "created,updated,project,description,labels,components,"
-        "fixVersions,parent,resolution"
-    )
+    field_list = _fields_list(extra_fields)
+    fields = ",".join(field_list)
     headers = {
         "Authorization": auth_header,
         "Accept": "application/json",
     }
-    qs = urllib.parse.urlencode({
-        "jql": jql, "maxResults": max_results, "fields": fields,
-    })
-    url = f"{base}{path}?{qs}"
     fn_get = http_get or _http_get
     fn_post = http_post or _http_post
-    try:
-        body = fn_get(url, headers)
-    except urllib.error.HTTPError as e:
-        # Atlassian Cloud deprecated `GET /rest/api/3/search` in
-        # April 2025; the replacement is `POST /rest/api/3/search/jql`
-        # with a JSON body + cursor-based pagination. Auto-fall-back
-        # so existing installs Just Work.
-        if e.code in (404, 405, 410) and path == SEARCH_PATH_V3:
-            new_url = f"{base}{SEARCH_PATH_V3_JQL}"
-            payload = {
-                "jql": jql,
-                "maxResults": max_results,
-                "fields": fields.split(","),
-            }
-            try:
-                body = fn_post(new_url, headers, payload)
-            except urllib.error.HTTPError as e2:
-                raise RuntimeError(
-                    f"JIRA returned {e2.code}: {e2.reason}"
-                ) from e2
-            except urllib.error.URLError as e2:
-                raise RuntimeError(
-                    f"JIRA connection failed: {e2.reason}") from e2
-        else:
+
+    def _post_page(token):
+        # `POST /rest/api/3/search/jql` -- cursor pagination via
+        # `nextPageToken` / `isLast`.
+        payload = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": field_list,
+        }
+        if token:
+            payload["nextPageToken"] = token
+        try:
+            return fn_post(f"{base}{SEARCH_PATH_V3_JQL}", headers, payload)
+        except urllib.error.HTTPError as e2:
             raise RuntimeError(
-                f"JIRA returned {e.code}: {e.reason}"
-            ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"JIRA connection failed: {e.reason}") from e
-    return body.get("issues") or []
+                f"JIRA returned {e2.code}: {e2.reason}"
+            ) from e2
+        except urllib.error.URLError as e2:
+            raise RuntimeError(
+                f"JIRA connection failed: {e2.reason}") from e2
+
+    issues: list[dict] = []
+    use_post = False
+    start_at = 0
+    token = None
+    for _page in range(MAX_SEARCH_PAGES):
+        if not use_post:
+            qs = urllib.parse.urlencode({
+                "jql": jql, "maxResults": max_results, "fields": fields,
+                "startAt": start_at,
+            })
+            url = f"{base}{path}?{qs}"
+            try:
+                body = fn_get(url, headers)
+            except urllib.error.HTTPError as e:
+                # Atlassian Cloud deprecated `GET /rest/api/3/search`
+                # in April 2025; the replacement is
+                # `POST /rest/api/3/search/jql` with a JSON body +
+                # cursor-based pagination. Auto-fall-back so existing
+                # installs Just Work.
+                if e.code in (404, 405, 410) and path == SEARCH_PATH_V3:
+                    use_post = True
+                    body = _post_page(token)
+                else:
+                    raise RuntimeError(
+                        f"JIRA returned {e.code}: {e.reason}"
+                    ) from e
+            except urllib.error.URLError as e:
+                raise RuntimeError(
+                    f"JIRA connection failed: {e.reason}") from e
+        else:
+            body = _post_page(token)
+        page = body.get("issues") or []
+        issues.extend(page)
+        if use_post:
+            token = body.get("nextPageToken")
+            if not token or body.get("isLast"):
+                break
+        else:
+            # Legacy offset pagination: keep walking `startAt` until
+            # `total` is covered. A missing `total` (some servers,
+            # most test fakes) means "single page" -- stop.
+            total = body.get("total")
+            start_at += len(page)
+            if not page or total is None or start_at >= int(total):
+                break
+    return issues
 
 
 def issue_url(base_url: str, key: str) -> str:
@@ -175,6 +266,7 @@ def fetch_issue(
     email: str = "",
     api_token: str,
     key: str,
+    extra_fields: list[str] | None = None,
     http_get: Callable[..., dict] | None = None,
 ) -> dict | None:
     """Fetch a single issue by key. Returns the raw JIRA REST issue
@@ -189,9 +281,7 @@ def fetch_issue(
     auth_header = _build_auth_header(auth_type, email=email, token=api_token)
     base = base_url.rstrip("/")
     qs = urllib.parse.urlencode({
-        "fields": "summary,status,priority,issuetype,assignee,reporter,"
-                  "created,updated,project,description,labels,components,"
-                  "fixVersions,parent,resolution",
+        "fields": ",".join(_fields_list(extra_fields)),
     })
     url = f"{base}/rest/api/2/issue/{key}?{qs}"
     headers = {

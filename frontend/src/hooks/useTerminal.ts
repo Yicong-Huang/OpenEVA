@@ -18,18 +18,33 @@ function isMouseSequence(data: string): boolean {
 }
 
 /**
- * Strip alternate screen buffer escape sequences from terminal output.
- * This keeps xterm in normal buffer mode so scrollback and the native
- * scrollbar work. Without this, TUI apps (tmux, agent) switch to the
- * alternate screen which has no scrollback.
+ * Strip escape sequences that would change how the BROWSER xterm
+ * handles the buffer / the mouse, so the embedded terminal behaves like
+ * a normal scrollable, selectable web terminal:
+ *
+ *   - Alternate screen (`?1049/1047/47`): without stripping, TUI apps
+ *     (tmux, the agent) switch to the alt-screen, which has no
+ *     scrollback.
+ *   - Mouse tracking (`?1000/1001/1002/1003/1004/1005/1006/1015`):
+ *     without stripping, the agent's mouse-enable puts xterm into
+ *     mouse-report mode, where a plain drag becomes a mouse report
+ *     instead of a TEXT SELECTION -- so the user can't highlight/copy.
+ *     We keep xterm out of mouse mode (selection works) and instead
+ *     drive the agent's own scroll out-of-band via POST /scroll, which
+ *     feeds it synthesized wheel reports server-side.
+ *
+ * The real tmux pane still tracks the agent's mouse-enable, so the
+ * server-side wheel forwarding still reaches the agent -- we only
+ * suppress mouse mode in the browser xterm.
  */
-const ALT_SCREEN_RE = /\x1b\[\?(?:1049|1047|47)[hl]/g
+const TERMINAL_STRIP_RE =
+  /\x1b\[\?(?:1049|1047|47|1000|1001|1002|1003|1004|1005|1006|1015)[hl]/g
 
-function stripAltScreenBytes(bytes: Uint8Array): Uint8Array {
+function filterTerminalBytes(bytes: Uint8Array): Uint8Array {
   // Decoding to latin-1 preserves byte values 0..255 roundtrip.
   let s = ''
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i])
-  const filtered = s.replace(ALT_SCREEN_RE, '')
+  const filtered = s.replace(TERMINAL_STRIP_RE, '')
   const out = new Uint8Array(filtered.length)
   for (let i = 0; i < filtered.length; i++) out[i] = filtered.charCodeAt(i)
   return out
@@ -138,27 +153,70 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
       // pane + locks the parent's `overflow-y: auto` -- the user
       // perceives "can't scroll the page when my cursor is over the
       // terminal".
+      // Wheel-to-history: when xterm's own buffer is exhausted in the
+      // wheel direction, drive the tmux pane's scrollback via copy-mode
+      // instead of letting the wheel escape to the parent pane. The
+      // agent's interactive TUI redraws in place (its history lives in
+      // tmux, not xterm's buffer), so without this the terminal "won't
+      // scroll" and the parent card list jumps instead. Requests are
+      // coalesced to one in-flight call so a fast wheel can't flood the
+      // backend with tmux subprocesses.
+      let scrollInFlight = false
+      let pendingLines = 0
+      let pendingDir: 'up' | 'down' = 'up'
+      const flushScroll = () => {
+        if (scrollInFlight || pendingLines <= 0) return
+        scrollInFlight = true
+        const dir = pendingDir
+        const lines = pendingLines
+        pendingLines = 0
+        fetch(`/api/terminal/${encodeURIComponent(sessionName)}/scroll`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dir, lines }),
+        }).catch(() => { /* best-effort */ })
+          .finally(() => { scrollInFlight = false; flushScroll() })
+      }
+
       const wheelHandler = (e: WheelEvent) => {
+        // The terminal OWNS the wheel: never let the browser's default
+        // scroll bubble out to the parent card list. `stopPropagation`
+        // alone isn't enough -- the parent's `overflow-y: auto` scroll
+        // is the browser's DEFAULT action, which only `preventDefault`
+        // suppresses (hence the listener is `{ passive: false }`).
+        // Without this the agent's alt-screen terminal has no xterm
+        // scrollback to consume, so the wheel fell through and scrolled
+        // the task-node list instead.
+        e.preventDefault()
+        e.stopPropagation()
         try {
           const buf = term.buffer.active
           // viewportY is the top-of-screen line within the scrollback
           // buffer; baseY is the bottom-most viewport position (i.e.
-          // "live tail"). Equality at either end means the wheel has
-          // no slack in that direction.
+          // "live tail"). Equality at either end means xterm has no
+          // slack in that direction -- drive the tmux scrollback / the
+          // agent's own viewport via POST /scroll instead.
           const atTop = buf.viewportY <= 0
           const atBottom = buf.viewportY >= buf.baseY
           const goingUp = e.deltaY < 0
           const goingDown = e.deltaY > 0
           if ((goingUp && atTop) || (goingDown && atBottom)) {
-            return  // let it bubble; parent pane scrolls
+            const dir: 'up' | 'down' = goingUp ? 'up' : 'down'
+            // ~1 line per 24px of wheel delta, capped so a trackpad
+            // fling doesn't request a huge jump in one call.
+            const lines = Math.max(1, Math.min(10,
+              Math.round(Math.abs(e.deltaY) / 24)))
+            if (dir !== pendingDir) { pendingDir = dir; pendingLines = 0 }
+            pendingLines += lines
+            flushScroll()
           }
         } catch {
           // term not yet open (race during teardown / SSR-ish init):
-          // fall through to the conservative stopPropagation path.
+          // the preventDefault above already kept the parent from
+          // scrolling, which is the important part.
         }
-        e.stopPropagation()
       }
-      container.addEventListener('wheel', wheelHandler, { passive: true })
+      container.addEventListener('wheel', wheelHandler, { passive: false })
 
       onStatusChange?.('')
       const apiBase = `/api/terminal/${encodeURIComponent(sessionName)}`
@@ -190,11 +248,16 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
           // is what guarantees no leftover bytes survive a reconnect.
           try { term.reset() } catch { /* xterm not yet open in tests */ }
         }
-        term.write(stripAltScreenBytes(bytes))
+        term.write(filterTerminalBytes(bytes))
       })
       term.focus()
 
       term.onData((data) => {
+        // Drop any stray mouse report. We strip mouse-tracking-enable
+        // from the output stream (see filterTerminalBytes) so xterm
+        // never grabs the mouse -- that keeps plain-drag text selection
+        // working in the browser. Wheel scrolling is handled out-of-band
+        // by `wheelHandler` -> POST /scroll instead.
         if (isMouseSequence(data)) return
         fetch(`${apiBase}/input`, { method: 'POST', body: data })
       })

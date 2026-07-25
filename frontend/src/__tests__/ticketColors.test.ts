@@ -1,5 +1,51 @@
 import { describe, it, expect } from 'vitest'
-import { colorForPriority, colorForStatus } from '../utils/ticketColors'
+import {
+  colorForPriority, colorForStatus, colorForSeverity, shortSeverity,
+} from '../utils/ticketColors'
+
+describe('colorForSeverity', () => {
+  it('Sev1 / critical / blocker -> red', () => {
+    expect(colorForSeverity('Sev. 1').fg).toBe('var(--red)')
+    expect(colorForSeverity('SEV1').fg).toBe('var(--red)')
+    expect(colorForSeverity('Severity 0').fg).toBe('var(--red)')
+    expect(colorForSeverity('Critical').fg).toBe('var(--red)')
+    expect(colorForSeverity('Blocker').fg).toBe('var(--red)')
+  })
+
+  it('Sev2 / major -> orange', () => {
+    expect(colorForSeverity('Sev. 2').fg).toBe('var(--orange)')
+    expect(colorForSeverity('Major').fg).toBe('var(--orange)')
+  })
+
+  it('Sev3 / moderate -> yellow', () => {
+    expect(colorForSeverity('Sev 3').fg).toBe('var(--yellow)')
+    expect(colorForSeverity('Moderate').fg).toBe('var(--yellow)')
+  })
+
+  it('Sev4+ / minor -> dim', () => {
+    expect(colorForSeverity('Sev. 4').fg).toBe('var(--text-dim)')
+    expect(colorForSeverity('Sev5').fg).toBe('var(--text-dim)')
+    expect(colorForSeverity('Minor').fg).toBe('var(--text-dim)')
+  })
+
+  it('empty / unknown -> dim panel', () => {
+    expect(colorForSeverity('').fg).toBe('var(--text-dim)')
+    expect(colorForSeverity('???').fg).toBe('var(--text-dim)')
+    expect(colorForSeverity(null as unknown as string).fg).toBe('var(--text-dim)')
+  })
+})
+
+describe('shortSeverity', () => {
+  it('extracts the digit into SEVn', () => {
+    expect(shortSeverity('Sev. 2')).toBe('SEV2')
+    expect(shortSeverity('Severity 1')).toBe('SEV1')
+    expect(shortSeverity('S3')).toBe('SEV3')
+  })
+  it('passes non-numeric through upper-cased', () => {
+    expect(shortSeverity('critical')).toBe('CRITICAL')
+    expect(shortSeverity('')).toBe('')
+  })
+})
 
 describe('colorForPriority', () => {
   it('Highest / Critical / P0 / P1 -> red', () => {

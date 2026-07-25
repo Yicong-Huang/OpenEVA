@@ -625,6 +625,14 @@ class TestDefaultExecutor:
         # argv, sidestepping the input-box autocomplete race.
         captured = {}
 
+        # Pin the new-session agent to a Claude-family binary so this
+        # mechanics test keeps asserting the `--append-system-prompt`
+        # shape, independent of whatever new-session default an install
+        # is covered in test_agent.py).
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
+
         monkeypatch.setattr("adapters.tmux.session_exists",
                             lambda name: False)
         monkeypatch.setattr(
@@ -652,7 +660,7 @@ class TestDefaultExecutor:
         assert captured["launched"]["name"] == expected_session
         # argv: ["agent", "-n", <name>, "--append-system-prompt", <ctx>, <prompt>]
         argv = captured["launched"]["argv"]
-        assert argv[0] in ("agent", "claude")  # active agent binary
+        assert "agent" in argv or "claude" in argv  # active agent binary
         assert argv[-1] == "/yh-sync-repos"
         sys_prompt = argv[argv.index("--append-system-prompt") + 1]
         assert "ping" in sys_prompt
@@ -666,6 +674,12 @@ class TestDefaultExecutor:
         # then tmux is killed; afterwards we relaunch with the same
         # session name.
         captured = {}
+        # Pin Claude-family so the command rides as its own argv element
+        # (Codex folds the cron context + command into one positional
+        # message -- a different, agent-specific shape).
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         monkeypatch.setattr("adapters.tmux.session_exists",
                             lambda name: True)
         monkeypatch.setattr(

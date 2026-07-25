@@ -1,6 +1,8 @@
 """PR management core logic."""
 
+import concurrent.futures as _futures
 import json as _json
+import re as _re
 import time as _time
 
 import app_state
@@ -385,17 +387,59 @@ def sync_review_requests(limit: int | None = None) -> dict:
     }
 
 
+def _apply_review_detail(url: str, data: dict, detail: dict,
+                         my_logins: set) -> None:
+    """Fold one PR's `gh` detail (REST `gh pr view` or GraphQL-parsed)
+    into the working row `data` dict, in place."""
+    # Reuse the all-PRs mapper so review_prs.status (plus CI / diff
+    # / branches / last_updated) updates exactly the same way the
+    # `prs` table does. `existing` lets the mapper preserve a once-
+    # backfilled status_changed_at across polls.
+    existing = app_state._db.get_review_pr(url)
+    updates = map_gh_pr_to_updates(detail, data["repo"], data["number"], existing)
+    # `url` is provided separately to the upsert call -- keeping
+    # it in `data` would crash with "multiple values for keyword
+    # argument 'url'".
+    updates.pop("url", None)
+    data.update(updates)
+    # my_review_state is review-queue-specific (not in the all-PRs
+    # mapper), so compute it separately.
+    data["my_review_state"] = _compute_my_review_state(detail, my_logins)
+
+
 def _enrich_review_rows(rows: dict) -> None:
-    """Fan out `gh pr view` across the working rows dict (url -> data).
-    Mutates each row dict in place with ci/review/diff/branch +
-    my_review_state fields."""
+    """Enrich the working rows dict (url -> data) in place with
+    ci/review/diff/branch + my_review_state fields.
+
+    Fast path: one batched `gh api graphql` per gh account (dozens of
+    PRs per round-trip). Any PR the batch couldn't resolve (private repo
+    not in schema, transient error) falls back to a per-PR `gh pr view`.
+    This mirrors the task-PR sync path and keeps the scarce gh call
+    budget low -- the old code issued one `gh pr view` per queue row
+    every full-sync tick."""
     if not rows:
         return
 
     # Snapshot my_logins once for the whole batch -- the underlying set
-    # doesn't change during one sync pass, and each _one() iteration
-    # would otherwise re-read `app_state._gh_tokens` needlessly.
+    # doesn't change during one sync pass.
     my_logins = _my_gh_logins()
+
+    # 1. Batched GraphQL fetch for everything we can.
+    pr_list = [{"number": d["number"], "url": url} for url, d in rows.items()]
+    fetched = _fetch_prs_via_graphql(pr_list)  # {(repo, number): item}
+    resolved_numbers = {num for (_repo, num) in fetched}
+    for url, data in rows.items():
+        item = fetched.get((data["repo"], data["number"]))
+        if item is not None:
+            _apply_review_detail(url, data, item, my_logins)
+
+    # 2. Per-PR `gh pr view` fallback for the GraphQL misses only.
+    misses = [
+        (url, data) for url, data in rows.items()
+        if data["number"] not in resolved_numbers
+    ]
+    if not misses:
+        return
 
     def _one(item):
         url, data = item
@@ -408,27 +452,14 @@ def _enrich_review_rows(rows: dict) -> None:
             )
         except Exception:
             return
-        if not isinstance(detail, dict):
+        if not isinstance(detail, dict) or not detail:
             return
-        # Reuse the all-PRs mapper so review_prs.status (plus CI / diff
-        # / branches / last_updated) updates exactly the same way the
-        # `prs` table does. `existing` lets the mapper preserve a once-
-        # backfilled status_changed_at across polls.
-        existing = app_state._db.get_review_pr(url)
-        updates = map_gh_pr_to_updates(detail, data["repo"], data["number"], existing)
-        # `url` is provided separately to the upsert call -- keeping
-        # it in `data` would crash with "multiple values for keyword
-        # argument 'url'".
-        updates.pop("url", None)
-        data.update(updates)
-        # my_review_state is review-queue-specific (not in the all-PRs
-        # mapper), so compute it separately.
-        data["my_review_state"] = _compute_my_review_state(detail, my_logins)
+        _apply_review_detail(url, data, detail, my_logins)
 
     import concurrent.futures as _cf
-    max_workers = min(6, len(rows))
+    max_workers = min(6, len(misses))
     with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        list(ex.map(_one, rows.items()))
+        list(ex.map(_one, misses))
 
 
 def list_review_requests() -> list:
@@ -1072,6 +1103,228 @@ def _refresh_pr_from_gh(pr_number, pr_url):
     return True
 
 
+# Mirror of `_SYNC_VIEW_FIELDS` in GraphQL form. Keep the two in sync.
+# `comments` and `reviews` use totalCount (cheap server-side count) and
+# we synthesize fake list-of-N items in the parser so the consumer's
+# `len(comments) + len(reviews)` arithmetic still works -- avoids
+# round-tripping the actual nodes when we only need the count.
+_PR_GRAPHQL_FRAGMENT = """
+  number title state url updatedAt mergedAt closedAt
+  additions deletions
+  headRefName baseRefName
+  author { login }
+  reviewDecision
+  reviewRequests(first: 20) {
+    nodes { requestedReviewer { ... on User { login } } }
+  }
+  latestReviews(first: 20) {
+    nodes { author { login } state }
+  }
+  comments { totalCount }
+  reviews(first: 0) { totalCount }
+  statusCheckRollup {
+    contexts(first: 100) {
+      nodes {
+        __typename
+        ... on StatusContext { state context }
+        ... on CheckRun { name status conclusion }
+      }
+    }
+  }
+"""
+
+
+def _graphql_alias(repo: str, number: int) -> str:
+    """Build a GraphQL-safe alias for one PR. Aliases must match
+    /[_A-Za-z][_0-9A-Za-z]*/ -- replace any other char with `_`."""
+    raw = f"pr_{repo}_{number}"
+    safe = _re.sub(r"[^A-Za-z0-9_]", "_", raw)
+    # Ensure leading char is alpha/underscore.
+    if not safe or not (safe[0].isalpha() or safe[0] == "_"):
+        safe = "_" + safe
+    return safe
+
+
+def _parse_graphql_pr(node: dict) -> dict | None:
+    """Reshape a GraphQL pullRequest node into the dict shape that
+    `_update_pr_from_gh` / `map_gh_pr_to_updates` expect (matches the
+    `gh pr view --json ...` output)."""
+    if not node:
+        return None
+    rollup = node.get("statusCheckRollup") or {}
+    contexts = (rollup.get("contexts") or {}).get("nodes") or []
+    comments_total = (node.get("comments") or {}).get("totalCount", 0) or 0
+    reviews_total = (node.get("reviews") or {}).get("totalCount", 0) or 0
+    # Reshape the reviewer fields into the `gh pr view --json` shape that
+    # `_compute_my_review_state` consumes: reviewRequests -> [{login}],
+    # latestReviews -> [{author: {login}, state}]. GraphQL nests the
+    # requested reviewer under `requestedReviewer` and wraps both in
+    # `{nodes: [...]}`, so unwrap here.
+    req_nodes = (node.get("reviewRequests") or {}).get("nodes") or []
+    review_requests = [
+        {"login": ((rn or {}).get("requestedReviewer") or {}).get("login", "")}
+        for rn in req_nodes
+    ]
+    latest_nodes = (node.get("latestReviews") or {}).get("nodes") or []
+    latest_reviews = [
+        {"author": (ln or {}).get("author") or {"login": ""},
+         "state": (ln or {}).get("state", "") or ""}
+        for ln in latest_nodes
+    ]
+    return {
+        "number": node.get("number"),
+        "title": node.get("title", "") or "",
+        "state": node.get("state", "") or "",
+        "url": node.get("url", "") or "",
+        "updatedAt": node.get("updatedAt", "") or "",
+        "mergedAt": node.get("mergedAt", "") or "",
+        "closedAt": node.get("closedAt", "") or "",
+        "additions": node.get("additions", 0) or 0,
+        "deletions": node.get("deletions", 0) or 0,
+        "headRefName": node.get("headRefName", "") or "",
+        "baseRefName": node.get("baseRefName", "") or "",
+        "author": node.get("author") or {"login": ""},
+        "reviewDecision": node.get("reviewDecision", "") or "",
+        "reviewRequests": review_requests,
+        "latestReviews": latest_reviews,
+        # Reconstruct list-shaped placeholders so existing
+        # `len(comments) + len(reviews)` arithmetic in
+        # map_gh_pr_to_updates still works.
+        "comments": [None] * comments_total,
+        "reviews": [None] * reviews_total,
+        "statusCheckRollup": contexts,
+    }
+
+
+def _batch_refresh_prs_via_graphql(pr_list, batch_size=40):
+    """Refresh many PRs in one round-trip via `gh api graphql`.
+
+    Takes a list of `{number, url}` dicts. Groups PRs by the gh account
+    that has access to their repo (so the right `GH_TOKEN` gets set per
+    batch -- a single GraphQL call can only auth as one account), builds
+    aliased queries in chunks of `batch_size`, ships them via
+    `gh api graphql -f query=...`, and persists each PR via the shared
+    `_update_pr_from_gh` helper.
+
+    Returns `(updated_count, succeeded_numbers)` where succeeded_numbers
+    is the set of PR numbers we got a node for. Anything missing falls
+    through to the parallel `gh pr view` fallback path in the caller.
+    """
+    items = _fetch_prs_via_graphql(pr_list, batch_size=batch_size)
+
+    succeeded = set()
+    updated = 0
+    for (repo, number), item in items.items():
+        try:
+            _update_pr_from_gh(number, item, repo)
+            succeeded.add(number)
+            updated += 1
+        except Exception:
+            pass
+    return updated, succeeded
+
+
+def _fetch_prs_via_graphql(pr_list, batch_size=40) -> dict:
+    """Fetch many PRs in batched `gh api graphql` round-trips WITHOUT
+    persisting anything. Returns `{(repo, number): parsed_item}` where
+    `parsed_item` matches the `gh pr view --json ...` shape (via
+    `_parse_graphql_pr`).
+
+    Groups PRs by the gh account that can see their repo (one GraphQL
+    call authenticates as a single account), aliases up to `batch_size`
+    PRs per query, and drops any PR whose repo isn't allow-listed or
+    whose node came back null (private/deleted/transient error) -- the
+    caller decides how to handle the misses.
+    """
+    from adapters.github import gh_account_for_repo
+
+    # Bucket by account so each `gh api graphql` invocation sets the
+    # token that has access to all the repos in that bucket.
+    buckets = {}  # account -> list[(repo, number)]
+    for pr in pr_list:
+        url = pr.get("url", "") or ""
+        number = pr.get("number")
+        if not number or not url:
+            continue
+        repo = repo_from_pr_url(url)
+        if not repo or not app_state.is_repo_allowed(repo):
+            continue
+        account = gh_account_for_repo(repo) or ""
+        buckets.setdefault(account, []).append((repo, int(number)))
+
+    out = {}
+    if not buckets:
+        return out
+
+    for account, entries in buckets.items():
+        # Pick any repo in this bucket as the `repo=` hint so gh_run sets
+        # the right GH_TOKEN. The repo name itself isn't used by graphql,
+        # just the token side-channel.
+        repo_hint = entries[0][0] if entries else ""
+        for start in range(0, len(entries), batch_size):
+            chunk = entries[start:start + batch_size]
+            alias_map = {}
+            parts = []
+            for repo, number in chunk:
+                owner, _, name = repo.partition("/")
+                if not owner or not name:
+                    continue
+                alias = _graphql_alias(repo, number)
+                if alias in alias_map:
+                    continue
+                alias_map[alias] = (repo, number)
+                parts.append(
+                    f'{alias}: repository(owner: "{owner}", name: "{name}") {{'
+                    f"  pullRequest(number: {number}) {{ {_PR_GRAPHQL_FRAGMENT} }} "
+                    "}"
+                )
+            if not parts:
+                continue
+            query = "query { " + " ".join(parts) + " }"
+            try:
+                resp = app_state.gh_run_json(
+                    ["gh", "api", "graphql", "-f", f"query={query}"],
+                    repo=repo_hint, timeout=30,
+                )
+            except Exception:
+                resp = None
+            data = (resp or {}).get("data") or {}
+            for alias, (repo, number) in alias_map.items():
+                entry = data.get(alias) or {}
+                node = entry.get("pullRequest") if isinstance(entry, dict) else None
+                item = _parse_graphql_pr(node)
+                if item is None:
+                    continue
+                out[(repo, number)] = item
+    return out
+
+
+def _parallel_refresh_prs(pr_list, concurrency=6):
+    """Fan out per-PR `gh pr view` calls across a thread pool. Used as
+    the fallback when GraphQL batch couldn't resolve a PR (private repo
+    not in the schema, transient API error, etc.). Returns the number
+    of rows updated."""
+    if not pr_list:
+        return 0
+    updated = 0
+    with _futures.ThreadPoolExecutor(
+        max_workers=max(1, concurrency),
+        thread_name_prefix="pr-sync",
+    ) as ex:
+        futs = {
+            ex.submit(_refresh_pr_from_gh, pr["number"], pr.get("url", "")): pr
+            for pr in pr_list
+            if pr.get("number") and pr.get("url")
+        }
+        for fut in _futures.as_completed(futs):
+            try:
+                if fut.result():
+                    updated += 1
+            except Exception:
+                pass
+    return updated
+
+
 def sync_prs_generator(full=False):
     """Generator that yields progress dicts during PR sync.
 
@@ -1086,20 +1339,44 @@ def sync_prs_generator(full=False):
     repo_authors = app_state._build_repo_authors()
     updated = 0
 
-    # Phase 1: dirty PRs
+    # Phase 1: dirty PRs. Batch via GraphQL when possible, fall back to
+    # parallel `gh pr view` for any PRs the batch couldn't resolve.
     dirty_prs = app_state._db.list_dirty_prs()
-    yield {"phase": "dirty", "count": len(dirty_prs)}
+    total_dirty = len(dirty_prs)
+    yield {"phase": "dirty", "count": total_dirty}
 
-    for i, pr in enumerate(dirty_prs):
-        pr_number = pr["number"]
-        pr_url = pr.get("url", "")
-        try:
-            if _refresh_pr_from_gh(pr_number, pr_url):
-                app_state._db.clear_pr_dirty(pr_number)
-                updated += 1
-        except Exception:
-            pass
-        yield {"phase": "dirty_update", "current": i + 1, "total": len(dirty_prs)}
+    if dirty_prs:
+        batch_updated, batch_ok = _batch_refresh_prs_via_graphql(dirty_prs)
+        updated += batch_updated
+        for pr in dirty_prs:
+            if pr["number"] in batch_ok:
+                try:
+                    app_state._db.clear_pr_dirty(pr["number"])
+                except Exception:
+                    pass
+        yield {
+            "phase": "dirty_update",
+            "current": len(batch_ok),
+            "total": total_dirty,
+        }
+
+        leftover = [pr for pr in dirty_prs if pr["number"] not in batch_ok]
+        if leftover:
+            # Run each fallback request in its own thread (concurrency 6).
+            # Don't try to stream per-PR progress -- ThreadPool ordering is
+            # nondeterministic and the UI only needs to see the final count.
+            fb_updated = _parallel_refresh_prs(leftover, concurrency=6)
+            updated += fb_updated
+            for pr in leftover:
+                try:
+                    app_state._db.clear_pr_dirty(pr["number"])
+                except Exception:
+                    pass
+            yield {
+                "phase": "dirty_update",
+                "current": total_dirty,
+                "total": total_dirty,
+            }
 
     # Phase 2: discover new PRs
     discovered = 0
@@ -1128,21 +1405,27 @@ def sync_prs_generator(full=False):
 
     yield {"phase": "discover", "discovered": discovered}
 
-    # Phase 3: update details
+    # Phase 3: update details. Same two-stage strategy as Phase 1 --
+    # one GraphQL roundtrip for the bulk of PRs, parallel fallback for
+    # repos / PRs the batch can't resolve.
     detail_prs = app_state._db.list_all_prs() if full else newly_discovered
+    detail_prs = [pr for pr in detail_prs if pr.get("number") and pr.get("url")]
     total = len(detail_prs)
 
-    for i, pr in enumerate(detail_prs):
-        pr_number = pr.get("number")
-        pr_url = pr.get("url", "")
-        if not pr_number or not pr_url:
-            continue
-        try:
-            if _refresh_pr_from_gh(pr_number, pr_url):
-                updated += 1
-        except Exception:
-            pass
-        if (i + 1) % 6 == 0 or i + 1 == total:
-            yield {"phase": "update", "current": i + 1, "total": total, "updated": updated}
+    if total:
+        batch_updated, batch_ok = _batch_refresh_prs_via_graphql(detail_prs)
+        updated += batch_updated
+        yield {
+            "phase": "update", "current": len(batch_ok),
+            "total": total, "updated": updated,
+        }
+        leftover = [pr for pr in detail_prs if pr["number"] not in batch_ok]
+        if leftover:
+            fb_updated = _parallel_refresh_prs(leftover, concurrency=6)
+            updated += fb_updated
+            yield {
+                "phase": "update", "current": total,
+                "total": total, "updated": updated,
+            }
 
     yield {"phase": "done", "discovered": discovered, "updated": updated, "total": total}

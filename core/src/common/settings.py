@@ -62,6 +62,26 @@ KEY_GIT_LOCAL_REPO_PATHS = "service.git.local_repo_paths"
 # id. Empty default; configure via yaml on first boot or the Settings UI.
 KEY_JIRA_TICKET_URL_PREFIXES = "service.jira.ticket_url_prefixes"
 
+# Allow-list of JIRA project prefixes that may enter the Tickets page
+# queue, e.g. ["EX", "INTKEY"]. Empty default means "no scope
+# restriction" -- every synced project prefix is allowed. Configure via
+# yaml on first boot or the Settings UI so no org-specific prefix is
+# hardcoded in the source.
+KEY_TICKET_ALLOWED_PREFIXES = "service.jira.ticket_allowed_prefixes"
+
+
+def get_ticket_allowed_prefixes() -> tuple[str, ...]:
+    """Return the configured ticket project-prefix allow-list as an
+    upper-cased tuple. Empty tuple means "allow every prefix" -- callers
+    treat that as "no scope restriction". Accepts a JSON/yaml list or a
+    comma-separated string; anything else falls back to empty."""
+    raw = get_value(KEY_TICKET_ALLOWED_PREFIXES, default=None)
+    if isinstance(raw, str):
+        raw = [p for p in (s.strip() for s in raw.split(",")) if p]
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(p).strip().upper() for p in raw if str(p).strip())
+
 # Page width-ratio settings. Each lives at `ui.layout.<page>_col_ratios`
 # and stores a list of pane widths in percent. Validation contract is
 # shared (`_get_layout_ratios`): list of N positive numbers, otherwise
@@ -318,6 +338,10 @@ KEY_INTERVAL_GITHUB_POLL = "service.intervals.github_poll_seconds"
 KEY_INTERVAL_CERT_CHECK = "service.intervals.cert_check_seconds"
 KEY_INTERVAL_USAGE_REFRESH = "service.intervals.usage_refresh_seconds"
 KEY_INTERVAL_SLACK_MONITOR = "service.intervals.slack_monitor_seconds"
+KEY_INTERVAL_REVIEW_SYNC_DIRTY = "service.intervals.review_sync_dirty_seconds"
+KEY_INTERVAL_REVIEW_SYNC_FULL = "service.intervals.review_sync_full_seconds"
+KEY_INTERVAL_PR_SYNC_DIRTY = "service.intervals.pr_sync_dirty_seconds"
+KEY_INTERVAL_PR_SYNC_FULL = "service.intervals.pr_sync_full_seconds"
 
 
 def get_interval_seconds(

@@ -311,6 +311,18 @@ describe('SettingsModal', () => {
     })
   })
 
+  it('Intervals tab shows the task PR sync cadence rows', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    await screen.findByTestId('settings-modal')
+    fireEvent.click(screen.getByTestId('sidebar-intervals'))
+    expect(await screen.findByTestId(
+      'settings-interval-input-service_intervals_pr_sync_dirty_seconds',
+    )).toBeInTheDocument()
+    expect(await screen.findByTestId(
+      'settings-interval-input-service_intervals_pr_sync_full_seconds',
+    )).toBeInTheDocument()
+  })
+
   it('Themes tab shows all 16 palette swatches', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     await screen.findByTestId('settings-modal')

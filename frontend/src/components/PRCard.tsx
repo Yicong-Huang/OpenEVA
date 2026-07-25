@@ -3,7 +3,7 @@ import type { PRDetail as PRDetailType, ActionDef, PR, PendingReviewComment } fr
 import { api } from '../api'
 import { ghAvatar, renderMarkdown } from '../utils'
 import { useLiveClock } from '../hooks/useLiveClock'
-import { useEventBus } from '../hooks/useEventBus'
+import { useEventBus, emitLocalEvent } from '../hooks/useEventBus'
 import { CISection } from './pr/CISection'
 import { ciResult, isFailed, isNonBlocking } from './pr/ciHelpers'
 import { ReviewSection } from './pr/ReviewSection'
@@ -266,7 +266,13 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
   const [pendingComments, setPendingComments] = useState<PendingReviewComment[]>([])
 
   // Show "has update" badge when github events arrive
-  useEventBus('github.*', useCallback(() => { setHasUpdate(true) }, []))
+  // `github.pr.seen` is our own client-side "badge cleared" nudge, not
+  // a real PR change -- ignore it here so opening a PR doesn't make the
+  // open card flag itself as having an update.
+  useEventBus('github.*', useCallback((event: Record<string, unknown>) => {
+    if (event.type === 'github.pr.seen') return
+    setHasUpdate(true)
+  }, []))
 
   // Load the action-button set for the current context. Review mode
   // pulls the review-only set (Review PR / Draft Reply / Sync Status);
@@ -302,6 +308,21 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
       .then((detail) => {
         setPr(detail)
         setLoading(false)
+        // Opening the detail view counts as reading this PR's comments:
+        // snapshot comment_count into last_seen so the "N new" badge
+        // clears. Fire-and-forget -- the badge reset is not worth
+        // blocking render on. Dispatch by surface: the review queue
+        // (reviewUrl set) and task PRs live in separate tables. On
+        // success, broadcast a local github.* event so pages that
+        // already subscribe (ProjectPage / PRsPage / ReviewsPage)
+        // refetch and clear the list badge immediately, instead of
+        // waiting for the next sync tick.
+        const seen = reviewUrl
+          ? api.markReviewSeen(reviewUrl)
+          : api.markPrSeen(number)
+        seen
+          .then(() => emitLocalEvent('github.pr.seen', { type: 'github.pr.seen', number }))
+          .catch(() => {})
       })
       .catch((e: Error) => {
         setError(e.message || 'Failed to load PR detail')
@@ -310,7 +331,7 @@ export function PRCard({ repo, number, projectId, taskId, reviewUrl, onOpenActio
     // Pending review state lives separately on GitHub; fetch in
     // parallel so the inline diff knows which comments to badge.
     fetchPending()
-  }, [repo, number, fetchPending])
+  }, [repo, number, reviewUrl, fetchPending])
 
   useEffect(() => {
     fetchDetail()

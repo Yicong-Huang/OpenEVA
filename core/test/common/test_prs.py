@@ -395,6 +395,82 @@ class TestRefreshPrFromGh:
         assert args[2] == "example/repo"
 
 
+class TestBatchRefreshViaGraphQL:
+    """`_batch_refresh_prs_via_graphql` is the bulk fast-path for
+    sync_prs: one HTTP roundtrip refreshes many PRs at once. Verify
+    grouping by account, response parsing, and graceful handling of
+    missing/null nodes."""
+
+    def test_skips_unparseable_and_disallowed(self, prs_db):
+        from common.prs import _batch_refresh_prs_via_graphql
+        import app_state
+        with patch.object(app_state, "is_repo_allowed", return_value=False):
+            with patch.object(app_state, "gh_run_json") as mock_gh:
+                updated, ok = _batch_refresh_prs_via_graphql([
+                    {"number": 1, "url": "not a url"},
+                    {"number": 2, "url": "https://github.com/blocked/repo/pull/2"},
+                    {"number": 0, "url": "https://github.com/example/repo/pull/0"},
+                ])
+        assert updated == 0
+        assert ok == set()
+        mock_gh.assert_not_called()
+
+    def test_parses_response_and_persists(self, prs_db):
+        from common.prs import _batch_refresh_prs_via_graphql
+        import app_state
+        from common import prs as prs_core
+
+        # Mimic the GraphQL response shape: aliased data keys, each with
+        # a `pullRequest` node that has totalCount + statusCheckRollup.
+        resp = {"data": {
+            "pr_example_repo_42": {"pullRequest": {
+                "number": 42, "title": "T", "state": "OPEN",
+                "url": "https://github.com/example/repo/pull/42",
+                "additions": 5, "deletions": 1,
+                "comments": {"totalCount": 3},
+                "reviews": {"totalCount": 2},
+                "statusCheckRollup": {"contexts": {"nodes": [
+                    {"__typename": "CheckRun", "name": "build",
+                     "status": "COMPLETED", "conclusion": "SUCCESS"},
+                ]}},
+                "author": {"login": "alice"},
+            }},
+            # null pullRequest -> skip
+            "pr_example_repo_43": {"pullRequest": None},
+        }}
+        with patch.object(app_state, "is_repo_allowed", return_value=True):
+            with patch.object(app_state, "gh_run_json", return_value=resp) as mock_gh:
+                with patch.object(prs_core, "_update_pr_from_gh") as mock_update:
+                    updated, ok = _batch_refresh_prs_via_graphql([
+                        {"number": 42, "url": "https://github.com/example/repo/pull/42"},
+                        {"number": 43, "url": "https://github.com/example/repo/pull/43"},
+                    ])
+
+        # Exactly one graphql call, one persisted PR.
+        mock_gh.assert_called_once()
+        assert updated == 1
+        assert ok == {42}
+        mock_update.assert_called_once()
+        args = mock_update.call_args.args
+        assert args[0] == 42
+        # comments/reviews reconstructed as N-length lists so consumer's
+        # `len()` arithmetic still works.
+        assert len(args[1]["comments"]) == 3
+        assert len(args[1]["reviews"]) == 2
+        assert args[2] == "example/repo"
+
+    def test_handles_failed_graphql(self, prs_db):
+        from common.prs import _batch_refresh_prs_via_graphql
+        import app_state
+        with patch.object(app_state, "is_repo_allowed", return_value=True):
+            with patch.object(app_state, "gh_run_json", return_value=None):
+                updated, ok = _batch_refresh_prs_via_graphql([
+                    {"number": 42, "url": "https://github.com/example/repo/pull/42"},
+                ])
+        assert updated == 0
+        assert ok == set()
+
+
 # ============================================================
 # sync_review_requests helpers (extracted 2026-04-25 refactor)
 # ============================================================

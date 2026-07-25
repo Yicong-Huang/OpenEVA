@@ -171,6 +171,19 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _ticket_project(key: str) -> str:
+    """JIRA project prefix of a ticket key: `INTKEY-14736` -> `INTKEY`,
+    `EX-123` -> `EX`. Empty when the key has no dash.
+
+    A ticket-backed task uses this prefix as its `project` so it shares
+    the same (project, task_id)-keyed history and PR model as ordinary
+    tasks. Kept local to eva_db (a copy of `common.tickets._project_prefix`)
+    to avoid an eva_db -> common.tickets import cycle."""
+    if not key or "-" not in key:
+        return ""
+    return key.rsplit("-", 1)[0]
+
+
 def _row_to_dict(row) -> dict:
     """Convert a sqlite3.Row to a plain dict."""
     return dict(row)
@@ -316,6 +329,9 @@ class EvaDB:
                 ticket_resolution TEXT DEFAULT '',
                 ticket_instance TEXT DEFAULT '',
                 ticket_synced_at TEXT DEFAULT '',
+                ticket_severity TEXT DEFAULT '',
+                ticket_pinned INTEGER DEFAULT 0,
+                ticket_left_jql_at TEXT DEFAULT '',
                 review_my_review_state TEXT DEFAULT '',
                 review_my_workflow_state TEXT DEFAULT '',
                 review_started_at TEXT DEFAULT '',
@@ -411,6 +427,13 @@ class EvaDB:
                 -- wrapper dies (e.g. host reboot) but the agent session file
                 -- on disk is still intact.
                 agent_session_id TEXT DEFAULT '',
+                -- Agent implementation id that launched this session
+                -- (the agent id). Resume routes off this
+                -- so a session started with one agent isn't resumed with
+                -- another (codex session ids and Claude transcript UUIDs
+                -- are not interchangeable). '' = legacy row, treated as
+                -- the default agent on resume.
+                agent_impl TEXT DEFAULT '',
                 created_at TEXT,
                 updated_at TEXT
             );
@@ -478,6 +501,22 @@ class EvaDB:
             "ON tasks(project, ticket_id) WHERE ticket_id IS NOT NULL AND ticket_id != ''"
         )
         self._conn.commit()
+
+        # Additive column migrations for pre-existing DBs. `CREATE TABLE
+        # IF NOT EXISTS` never adds columns to an already-created table,
+        # so new ticket_* columns have to be ALTERed in. Idempotent:
+        # only columns absent from PRAGMA table_info are added.
+        self._migrate_add_columns("tasks", {
+            "ticket_severity": "TEXT DEFAULT ''",
+            "ticket_pinned": "INTEGER DEFAULT 0",
+            "ticket_left_jql_at": "TEXT DEFAULT ''",
+        })
+        # Per-session agent binding: which agent launched the session,
+        # so resume uses the same one. Pre-existing rows get '' (treated
+        # as the default agent on resume).
+        self._migrate_add_columns("sessions", {
+            "agent_impl": "TEXT DEFAULT ''",
+        })
 
         # The legacy `review_prs` + `review_history` tables are gone --
         # data merged into `tasks` (type='review' + review_* columns)
@@ -552,6 +591,29 @@ class EvaDB:
         # Seed default action definitions
         self._seed_action_defaults()
 
+    def _migrate_add_columns(self, table: str, columns: dict) -> None:
+        """Add any of `columns` (name -> column-def SQL) that `table`
+        doesn't already have. Forward-only additive migration so new
+        ticket_* columns land on pre-existing `data/eva.db` files --
+        `CREATE TABLE IF NOT EXISTS` never alters an existing table.
+        Idempotent: only columns absent from PRAGMA table_info are
+        added."""
+        existing = {
+            r["name"]
+            for r in self._conn.execute_fetchall(
+                f"PRAGMA table_info({table})"
+            )
+        }
+        added = False
+        for name, decl in columns.items():
+            if name not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                )
+                added = True
+        if added:
+            self._conn.commit()
+
     def _seed_action_defaults(self):
         """Insert default action definitions (INSERT OR IGNORE for idempotency)."""
         defaults = [
@@ -577,35 +639,70 @@ class EvaDB:
             # FIRST (not buried at the end) makes it the first context
             # the model sees when it parses the prompt.
             ("review", "Review PR",
-             "IMPORTANT: Add findings as PENDING (draft) inline review "
-             "comments on GitHub via "
+             "IMPORTANT: do NOT submit a GitHub review and do NOT post "
+             "anything publicly. Findings go in ONLY as PENDING inline "
+             "comments (state='PENDING'). Never run `gh pr review`, "
+             "`gh pr comment`, or any submit command, and never POST a "
+             "review WITH an `event` field. I submit/discard the pending "
+             "review manually on GitHub.\n\n"
+             "Step 1 - Analyze with the spark-dev reviewer.\n"
+             "Invoke the Skill tool: skill='spark-dev:review', args='"
+             "<this PR's URL>' (do NOT pass --auto -- we need the manual "
+             "approval gate). It routes to /spark-dev:code-review and runs "
+             "the full analysis. Let it run to its approval gate where it "
+             "presents the summary + findings, and STOP there: do NOT let "
+             "it assemble/post its review payload (that submits a real "
+             "review with an `event`, which we do not want).\n\n"
+             "Step 2 - Show findings and wait for my confirmation in "
+             "this chat before writing anything to GitHub. I may "
+             "drop/edit findings.\n\n"
+             "Step 3 - After I confirm, create ONE pending review via "
              "`gh api -X POST repos/{owner}/{repo}/pulls/{number}/reviews` "
              "with `commit_id` and a `comments` array of "
-             "`{path, line, side, body}` -- do NOT include `event` so the "
-             "review state stays PENDING. I'll submit/discard manually. "
-             "Do NOT run `gh pr review`, `gh pr comment`, or any "
-             "submission command. Verify state=='PENDING' after creation.\n\n"
-             "Review this PR. Check code quality, test coverage, "
-             "correctness, edge cases. For each line-anchored finding, "
-             "add a pending inline comment. Then summarize in chat: TL;DR, "
-             "list of pending comments (file:line + one-line summary), and "
-             "any high-level concerns that don't fit as inline comments.",
+             "`{path, line, side, body}` and NO `event` field so the "
+             "review stays PENDING. Delete any stale pending review by me "
+             "first (one pending per user per PR). Verify state=='PENDING' "
+             "after creation. Keep comments SHORT (1-2 sentences).\n\n"
+             "Step 4 - Summarize in chat: TL;DR, list of pending comments "
+             "(file:line + one-line summary), and any high-level concerns "
+             "that don't fit as inline comments.",
              "pr", "has_pr", 11),
             ("address-comments", "Address Comments",
              "IMPORTANT: DO NOT post anything to GitHub by default. "
              "Draft replies / fixes locally; show me the diff or the "
              "draft text. I'll review and post manually unless I "
              "explicitly tell you to in this turn.\n\n"
-             "Address the review comments on this PR. Go through each "
-             "comment and either propose a code fix (as a diff) or a "
-             "reply message (as text).",
+             "Address ALL review comments on this PR. There are THREE "
+             "comment surfaces -- fetch and go through every one, do "
+             "NOT rely on `gh pr view --comments` (it drops review "
+             "bodies):\n"
+             "  1. Inline review comments: "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`\n"
+             "  2. Review-level bodies (the summary text a reviewer "
+             "writes when submitting a review -- often where the real "
+             "asks live): "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`\n"
+             "  3. Issue (Conversation) comments: "
+             "`gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`\n\n"
+             "For each unresolved comment, either propose a code fix "
+             "(as a diff) or a reply message (as text).",
              "pr", "has_pr", 12),
             ("draft-reply", "Draft Reply",
              "IMPORTANT: DO NOT post anything to GitHub by default. "
              "Show me the drafts in this session; I'll copy/paste or "
              "tell you to post.\n\n"
-             "Read the review comments on this PR and draft concise "
-             "reply messages for each unresolved comment thread.",
+             "Read ALL review comments on this PR and draft concise "
+             "reply messages for each unresolved comment thread. There "
+             "are THREE comment surfaces -- fetch every one, do NOT "
+             "rely on `gh pr view --comments` (it drops review "
+             "bodies):\n"
+             "  1. Inline review comments: "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`\n"
+             "  2. Review-level bodies (reviewer's summary text on "
+             "submit -- often where the real asks live): "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`\n"
+             "  3. Issue (Conversation) comments: "
+             "`gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`",
              "pr", "has_pr", 13),
             # `auto-pr-tend` (long-running PR auto-baby-sit skill) is
             # workflow-specific and ships via the optional extension
@@ -625,29 +722,39 @@ class EvaDB:
             # above so a reviewer never accidentally has the agent post
             # `/approve` or comment-spam someone else's PR.
             ("review-pr", "Review PR",
-             "IMPORTANT: do NOT post anything to GitHub. Inline findings "
-             "go in as PENDING comments only (state='PENDING'); do NOT "
-             "include `event` in the gh api call. Do NOT run "
-             "`gh pr review --approve|--request-changes|--comment`, "
-             "`gh pr comment`, or any submission command. The user "
-             "double-confirms before anything ships.\n\n"
-             "Goal: review this PR.\n\n"
-             "Rules:\n"
-             "1. Read the diff carefully. Check correctness, test "
-             "coverage, edge cases, design, performance, security.\n"
-             "2. Anchor every line-specific finding as a PENDING inline "
-             "comment via:\n"
+             "IMPORTANT: do NOT submit a GitHub review and do NOT post "
+             "anything publicly. Findings go in ONLY as PENDING inline "
+             "comments (state='PENDING'). Never run `gh pr review "
+             "--approve|--request-changes|--comment`, `gh pr comment`, or "
+             "any submit command, and never POST a review WITH an `event` "
+             "field. The user submits or discards the pending review "
+             "manually on GitHub.\n\n"
+             "Step 1 - Analyze with the spark-dev reviewer.\n"
+             "Invoke the Skill tool: skill='spark-dev:review', args='"
+             "<this PR's URL>' (do NOT pass --auto -- we need the manual "
+             "approval gate). It routes to /spark-dev:code-review and runs "
+             "the full analysis (Pass A/B, tree-verified findings). Let it "
+             "run to its approval gate, where it presents the summary and "
+             "the findings. STOP there: do NOT let it assemble/post its "
+             "review payload (that path submits a real review with an "
+             "`event`, which we do not want).\n\n"
+             "Step 2 - Show findings and wait for my confirmation.\n"
+             "Present the reviewer's summary + the line-anchored findings "
+             "in this chat and ASK me to confirm before writing anything "
+             "to GitHub. Wait for my reply. I may drop/edit findings.\n\n"
+             "Step 3 - After I confirm, create ONE pending review.\n"
+             "Take the confirmed line-anchored findings and create a "
+             "single PENDING review via:\n"
              "     gh api -X POST repos/{owner}/{repo}/pulls/{number}/reviews\n"
-             "   with `commit_id` and a `comments` array of "
-             "{path, line, side, body}. Verify with "
-             "`gh api repos/{owner}/{repo}/pulls/{number}/reviews` that "
-             "the new review's state is 'PENDING'. If a stale pending "
-             "review already exists by you, DELETE it first (GitHub "
-             "allows one pending per user per PR).\n"
-             "3. Comments must be SHORT. State the issue and propose a "
-             "fix in 1-2 sentences. No prose. No restating the diff.\n\n"
-             "After the pending comments are in, write a SUMMARY in "
-             "this chat IN ENGLISH with these sections:\n"
+             "with `commit_id` and a `comments` array of "
+             "{path, line, side, body} and NO `event` field so the review "
+             "stays PENDING. If a stale pending review by me already "
+             "exists, DELETE it first (GitHub allows one pending per user "
+             "per PR). Then verify with "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/reviews` that the "
+             "new review's state is 'PENDING'. Keep each comment SHORT: "
+             "state the issue and a fix in 1-2 sentences.\n\n"
+             "Step 4 - Final summary in this chat (English):\n"
              "  - One-line TL;DR\n"
              "  - Pending comments I added (each: file:line + one-line note)\n"
              "  - Cross-file / high-level issues (not suitable for inline)\n"
@@ -661,8 +768,18 @@ class EvaDB:
             ("review-reply", "Draft Reply",
              "IMPORTANT: DO NOT post anything to GitHub by default. "
              "Show me the drafts in this session only.\n\n"
-             "Read the review comments on this PR and draft concise "
-             "reply messages for each unresolved comment thread.",
+             "Read ALL review comments on this PR and draft concise "
+             "reply messages for each unresolved comment thread. There "
+             "are THREE comment surfaces -- fetch every one, do NOT "
+             "rely on `gh pr view --comments` (it drops review "
+             "bodies):\n"
+             "  1. Inline review comments: "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`\n"
+             "  2. Review-level bodies (reviewer's summary text on "
+             "submit -- often where the real asks live): "
+             "`gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`\n"
+             "  3. Issue (Conversation) comments: "
+             "`gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`",
              "review", "", 21),
             ("review-sync", "Sync Status",
              "IMPORTANT: DO NOT post anything to GitHub. This action "
@@ -1345,7 +1462,7 @@ class EvaDB:
         "head_branch", "base_branch",
         "last_updated", "source",
         # Review-workflow columns (added when a user starts reviewing).
-        "session_name", "agent_session_id", "started_at",
+        "session_name", "agent_session_id", "agent_impl", "started_at",
         "my_workflow_state",
     })
 
@@ -1401,9 +1518,12 @@ class EvaDB:
         Row from `tasks` (type='review'); `pr_row` is the matching prs
         row (may be None if a review task has no PR attached)."""
         url = pr_row["url"] if pr_row else ""
-        # Pull session_name + agent_session_id from sessions if open.
+        # Pull session_name + agent_session_id + agent_impl from
+        # sessions if open (agent_impl lets resume use the launching
+        # agent).
         sess = self._conn.execute_fetchone(
-            "SELECT tmux_name, agent_session_id FROM sessions WHERE task_id=?",
+            "SELECT tmux_name, agent_session_id, agent_impl "
+            "FROM sessions WHERE task_id=?",
             (task_row["task_id"],),
         )
         return {
@@ -1429,6 +1549,7 @@ class EvaDB:
             "last_seen_comment_count": task_row["review_last_seen_comment_count"] or 0,
             "session_name": (sess["tmux_name"] if sess else ""),
             "agent_session_id": (sess["agent_session_id"] if sess else ""),
+            "agent_impl": (sess["agent_impl"] if sess else ""),
             "started_at": task_row["review_started_at"] or "",
             "my_workflow_state": task_row["review_my_workflow_state"] or "queued",
         }
@@ -1546,7 +1667,8 @@ class EvaDB:
         # agent_session_id='') means "clear the session reference"
         # (callers use this on kill); a non-empty value writes through
         # to the sessions table.
-        if "session_name" in fields or "agent_session_id" in fields:
+        if ("session_name" in fields or "agent_session_id" in fields
+                or "agent_impl" in fields):
             clearing = (
                 fields.get("session_name", None) == ""
                 and fields.get("agent_session_id", None) == ""
@@ -1563,18 +1685,21 @@ class EvaDB:
                              or (sess["tmux_name"] if sess else task_id))
                 agent_sid = (fields.get("agent_session_id")
                              or (sess["agent_session_id"] if sess else ""))
+                agent_impl = (fields.get("agent_impl")
+                              or (sess["agent_impl"] if sess else ""))
                 if sess is None:
                     self._conn.execute(
                         "INSERT INTO sessions (task_id, project, tmux_name, "
-                        "agent_session_id, created_at, updated_at) "
-                        "VALUES (?, '', ?, ?, ?, ?)",
-                        (task_id, tmux_name, agent_sid, now, now),
+                        "agent_session_id, agent_impl, created_at, "
+                        "updated_at) "
+                        "VALUES (?, '', ?, ?, ?, ?, ?)",
+                        (task_id, tmux_name, agent_sid, agent_impl, now, now),
                     )
                 else:
                     self._conn.execute(
                         "UPDATE sessions SET tmux_name=?, agent_session_id=?, "
-                        "updated_at=? WHERE task_id=?",
-                        (tmux_name, agent_sid, now, task_id),
+                        "agent_impl=?, updated_at=? WHERE task_id=?",
+                        (tmux_name, agent_sid, agent_impl, now, task_id),
                     )
         self._conn.commit()
         return self.get_review_pr(url) or {}
@@ -1950,22 +2075,27 @@ class EvaDB:
     # ------------------------------------------------------------------
 
     def create_session(self, task_id: str, project: str,
-                       tmux_name: str | None = None) -> dict:
+                       tmux_name: str | None = None,
+                       agent_impl: str = "") -> dict:
         """INSERT OR REPLACE a session row and return the created session dict.
 
         `tmux_name` defaults to `task_id`. In practice every production caller
         uses the same value for both, so the column is kept only for
         back-compat; prefer omitting `tmux_name`.
+
+        `agent_impl` records which agent launches the session so resume
+        uses the same one; default '' means legacy/default agent.
         """
         now = _now_iso()
         name = tmux_name if tmux_name is not None else task_id
         self._conn.execute(
             """
             INSERT OR REPLACE INTO sessions
-                (task_id, project, tmux_name, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'not_started', ?, ?)
+                (task_id, project, tmux_name, status, agent_impl,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, 'not_started', ?, ?, ?)
             """,
-            (task_id, project, name, now, now),
+            (task_id, project, name, agent_impl, now, now),
         )
         self._conn.commit()
         return self.get_session(task_id)
@@ -1981,7 +2111,8 @@ class EvaDB:
 
     def update_session(self, task_id: str, **fields) -> dict:
         """Update only allowed fields and auto-stamp updated_at."""
-        allowed = {"status", "tmux_name", "project", "agent_session_id"}
+        allowed = {"status", "tmux_name", "project", "agent_session_id",
+                   "agent_impl"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return self.get_session(task_id)
@@ -2358,6 +2489,9 @@ class EvaDB:
         "status_category": "ticket_status_category",
         "instance_name": "ticket_instance",
         "synced_at": "ticket_synced_at",
+        "severity": "ticket_severity",
+        "pinned": "ticket_pinned",
+        "left_jql_at": "ticket_left_jql_at",
         "created_at": "created_at",
         "updated_at": "updated_at",
     }
@@ -2386,6 +2520,9 @@ class EvaDB:
             "parent_key": row["ticket_parent_key"] or "",
             "resolution": row["ticket_resolution"] or "",
             "status_category": row["ticket_status_category"] or "",
+            "severity": row["ticket_severity"] or "",
+            "pinned": bool(row["ticket_pinned"]),
+            "left_jql_at": row["ticket_left_jql_at"] or "",
         }
 
     def upsert_ticket(self, **fields) -> dict:
@@ -2422,28 +2559,53 @@ class EvaDB:
                 list(updates.values()) + [task_id],
             )
         else:
-            # Type classification (mirrors bin/migrate_unify_tasks.py).
-            ttype = _classify_ticket_type(
-                fields.get("summary", ""), fields.get("labels", "[]"),
-                fields.get("issue_type", ""),
-            )
-            # Pick a globally-unique task_id; collide with `-jira` suffix.
-            taken_row = self._conn.execute_fetchone(
-                "SELECT 1 FROM tasks WHERE task_id=?", (key,),
-            )
-            candidate = f"{key}-jira" if taken_row else key
-            extra = {
-                "task_id": candidate, "project": "",
-                "type": ttype, "status": "not_started",
-                "priority": 5,
-            }
-            cols = list(updates) + list(extra)
-            vals = list(updates.values()) + list(extra.values())
-            placeholders = ", ".join("?" for _ in cols)
-            self._conn.execute(
-                f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
-                vals,
-            )
+            # Re-attach first: detached "shell" rows (task_id is the
+            # JIRA key or its -jira twin, ticket_* cleared by the old
+            # grace-prune or a manual unlink) get the ticket columns
+            # filled back in. Inserting a fresh row instead would
+            # collide on the task_id UNIQUE constraint and abort the
+            # whole instance sync.
+            shell_id = None
+            for cand in (key, f"{key}-jira"):
+                row = self._conn.execute_fetchone(
+                    "SELECT task_id, ticket_id FROM tasks WHERE task_id=?",
+                    (cand,),
+                )
+                if row is not None and not row["ticket_id"]:
+                    shell_id = row["task_id"]
+                    break
+            if shell_id is not None:
+                set_clause = ", ".join(f"{c}=?" for c in updates)
+                self._conn.execute(
+                    f"UPDATE tasks SET {set_clause} WHERE task_id=?",
+                    list(updates.values()) + [shell_id],
+                )
+            else:
+                # Type classification (mirrors bin/migrate_unify_tasks.py).
+                ttype = _classify_ticket_type(
+                    fields.get("summary", ""), fields.get("labels", "[]"),
+                    fields.get("issue_type", ""),
+                )
+                # Pick a globally-unique task_id: bare key, then
+                # `-jira`, then numbered `-jira2`, `-jira3`, ...
+                candidate = key
+                n = 0
+                while self._conn.execute_fetchone(
+                        "SELECT 1 FROM tasks WHERE task_id=?", (candidate,)):
+                    n += 1
+                    candidate = f"{key}-jira" if n == 1 else f"{key}-jira{n}"
+                extra = {
+                    "task_id": candidate, "project": _ticket_project(key),
+                    "type": ttype, "status": "not_started",
+                    "priority": 5,
+                }
+                cols = list(updates) + list(extra)
+                vals = list(updates.values()) + list(extra.values())
+                placeholders = ", ".join("?" for _ in cols)
+                self._conn.execute(
+                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
+                    vals,
+                )
         self._conn.commit()
         return self.get_ticket(key, instance_name=fields["instance_name"])
 
@@ -2541,6 +2703,40 @@ class EvaDB:
         )
         self._conn.commit()
         return cur.rowcount
+
+    def set_ticket_pinned(self, key: str, *, instance_name: str = "",
+                          pinned: bool = True) -> bool:
+        """Mark a ticket-task pinned (or unpinned). Pinned tickets are
+        manually tracked by the user and are never auto-detached by the
+        JQL prune -- they survive even when they leave the instance JQL
+        (resolved, reassigned, or simply never matched it)."""
+        if instance_name:
+            cur = self._conn.execute(
+                "UPDATE tasks SET ticket_pinned=?, updated_at=? "
+                "WHERE ticket_id=? AND ticket_instance=?",
+                (1 if pinned else 0, _now_iso(), key, instance_name),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE tasks SET ticket_pinned=?, updated_at=? "
+                "WHERE ticket_id=?",
+                (1 if pinned else 0, _now_iso(), key),
+            )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def ticket_keys_for_instance(self, instance_name: str) -> set:
+        """Return the set of ticket keys currently cached for an
+        instance. Used by `sync_one` to compute which tickets dropped
+        out of the JQL result since the last tick (so they can be
+        re-fetched + badged)."""
+        rows = self._conn.execute_fetchall(
+            "SELECT ticket_id FROM tasks "
+            "WHERE ticket_id IS NOT NULL AND ticket_id != '' "
+            "  AND ticket_synced_at != '' AND ticket_instance = ?",
+            (instance_name,),
+        )
+        return {r["ticket_id"] for r in rows}
 
     def close(self):
         """Close the database connection."""

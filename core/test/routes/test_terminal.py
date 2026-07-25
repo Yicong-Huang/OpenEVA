@@ -16,6 +16,33 @@ import pytest
 from routes import terminal as mux
 
 
+class TestTerminalScroll:
+    """POST /api/terminal/{name}/scroll -> tmux copy-mode scrollback."""
+
+    def test_scroll_delegates_to_tmux(self, client):
+        with patch("adapters.tmux.scroll_pane") as mock_scroll:
+            resp = client.post("/api/terminal/sess-1/scroll",
+                               json={"dir": "up", "lines": 5})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        mock_scroll.assert_called_once_with("sess-1", "up", 5)
+
+    def test_scroll_defaults(self, client):
+        with patch("adapters.tmux.scroll_pane") as mock_scroll:
+            resp = client.post("/api/terminal/sess-1/scroll", json={})
+        assert resp.status_code == 200
+        mock_scroll.assert_called_once_with("sess-1", "up", 3)
+
+    def test_scroll_never_404s_on_missing_session(self, client):
+        # Unlike input/resize, scroll is best-effort -- a wheel event
+        # must never surface an error, so there's no PTY-alive guard.
+        with patch("adapters.tmux.scroll_pane") as mock_scroll:
+            resp = client.post("/api/terminal/ghost/scroll",
+                               json={"dir": "down", "lines": 2})
+        assert resp.status_code == 200
+        mock_scroll.assert_called_once_with("ghost", "down", 2)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_mux_state():
     """Reset module-level registries between tests so they don't leak."""

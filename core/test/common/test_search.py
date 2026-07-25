@@ -20,6 +20,8 @@ class TestParseQuery:
         from common.search import parse_query
         assert parse_query("type:task").type == "task"
         assert parse_query("type:PR").type == "pr"  # lowercased
+        assert parse_query("type:tickets").type == "ticket"
+        assert parse_query("type:reviews").type == "review"
         assert parse_query("type:session").type == "session"
 
     def test_status_filter(self):
@@ -84,6 +86,8 @@ class TestParseQuery:
     def test_bare_type_shorthand_task_plural(self):
         from common.search import parse_query
         assert parse_query("tasks").type == "task"
+        assert parse_query("tickets").type == "ticket"
+        assert parse_query("reviews").type == "review"
         assert parse_query("prs").type == "pr"
         assert parse_query("sessions").type == "session"
 
@@ -189,6 +193,24 @@ class TestSearchTasks:
         assert "task-a" not in tids
         assert "task-b" not in tids
 
+    def test_plain_task_search_excludes_ticket_and_review_rows(self, patched_server):
+        """Ticket/review task rows have their own result types."""
+        patched_server._db.upsert_ticket(
+            key="EX-780", summary="not a plain task", status="Open",
+            priority="P3", issue_type="Bug", project_key="EX",
+            url="https://issues.example.org/browse/EX-780",
+            instance_name="primary",
+        )
+        patched_server._db.upsert_review_pr(
+            url="https://github.com/example/repo/pull/904",
+            repo="example/repo", number=904,
+            title="not a plain task", author="alice", status="open",
+        )
+        from common.search import search
+        tasks = [r for r in search("type:task not a plain task") if r["type"] == "task"]
+        assert all(r["task_id"] not in {"EX-780", "review-example-repo-904"}
+                   for r in tasks)
+
 
 class TestSearchPrs:
     def test_returns_prs(self, patched_server):
@@ -239,6 +261,108 @@ class TestSearchPrs:
         # PRs on task-a / task-b (no ticket) are excluded.
         assert 100 not in numbers
         assert 200 not in numbers
+
+    def test_matches_pr_by_author_branch_and_url(self, patched_server):
+        """PR free-text search should cover more than title/task_id."""
+        patched_server._db.add_pr(
+            project="test-proj", task_id="task-a", number=888,
+            url="https://github.com/example/repo/pull/888",
+            status="open", title="ordinary title",
+            author="branch-author", head_branch="feature/search-wide",
+            base_branch="main",
+        )
+        from common.search import search
+        by_author = [r for r in search("type:pr branch-author") if r["type"] == "pr"]
+        by_branch = [r for r in search("type:pr search-wide") if r["type"] == "pr"]
+        by_url = [r for r in search("type:pr /pull/888") if r["type"] == "pr"]
+        assert any(r["pr_number"] == 888 for r in by_author)
+        assert any(r["pr_number"] == 888 for r in by_branch)
+        assert any(r["pr_number"] == 888 for r in by_url)
+
+
+class TestSearchTickets:
+    def test_returns_ticket_results(self, patched_server):
+        patched_server._db.upsert_ticket(
+            key="EX-777", summary="warehouse capacity issue",
+            status="Open", priority="P1", issue_type="Bug",
+            project_key="EX", url="https://issues.example.org/browse/EX-777",
+            labels='["capacity"]', components='["storage"]',
+            instance_name="primary",
+        )
+        from common.search import search
+        tickets = [r for r in search("type:ticket capacity") if r["type"] == "ticket"]
+        assert tickets
+        assert any(r["ticket_key"] == "EX-777" for r in tickets)
+
+    def test_ticket_result_shape(self, patched_server):
+        patched_server._db.upsert_ticket(
+            key="EX-778", summary="shape check", status="In Progress",
+            priority="P2", issue_type="Task", project_key="EX",
+            url="https://issues.example.org/browse/EX-778",
+            instance_name="primary",
+        )
+        from common.search import search
+        ticket = [r for r in search("type:ticket EX-778") if r["type"] == "ticket"][0]
+        for key in ("type", "title", "subtitle", "badge", "project_id",
+                    "task_id", "ticket_key", "ticket_instance"):
+            assert key in ticket
+        assert ticket["ticket_key"] == "EX-778"
+        assert ticket["ticket_instance"] == "primary"
+
+    def test_ticket_filter_matches_ticket_key(self, patched_server):
+        patched_server._db.upsert_ticket(
+            key="EX-779", summary="filter check", status="Open",
+            priority="P3", issue_type="Bug", project_key="EX",
+            url="https://issues.example.org/browse/EX-779",
+            instance_name="primary",
+        )
+        from common.search import search
+        tickets = [r for r in search("type:ticket ticket:EX-779")
+                   if r["type"] == "ticket"]
+        assert any(r["ticket_key"] == "EX-779" for r in tickets)
+
+
+class TestSearchReviews:
+    def test_returns_review_results(self, patched_server):
+        patched_server._db.upsert_review_pr(
+            url="https://github.com/example/repo/pull/901",
+            repo="example/repo", number=901,
+            title="please review search expansion",
+            author="review-author", status="open",
+            ci_status="success", review_status="review_required",
+            my_review_state="pending_review",
+            head_branch="review-search", base_branch="main",
+        )
+        from common.search import search
+        reviews = [r for r in search("type:review expansion") if r["type"] == "review"]
+        assert reviews
+        assert any(r["review_url"].endswith("/pull/901") for r in reviews)
+
+    def test_review_result_shape(self, patched_server):
+        patched_server._db.upsert_review_pr(
+            url="https://github.com/example/repo/pull/902",
+            repo="example/repo", number=902,
+            title="shape review", author="alice", status="open",
+        )
+        from common.search import search
+        review = [r for r in search("type:review 902") if r["type"] == "review"][0]
+        for key in ("type", "title", "subtitle", "badge", "project_id",
+                    "review_url", "pr_number", "pr_repo"):
+            assert key in review
+        assert review["pr_number"] == 902
+        assert review["pr_repo"] == "example/repo"
+
+    def test_status_filter_checks_review_workflow_fields(self, patched_server):
+        patched_server._db.upsert_review_pr(
+            url="https://github.com/example/repo/pull/903",
+            repo="example/repo", number=903,
+            title="active review", author="alice", status="open",
+            my_workflow_state="active",
+        )
+        from common.search import search
+        reviews = [r for r in search("type:review status:active")
+                   if r["type"] == "review"]
+        assert any(r["pr_number"] == 903 for r in reviews)
 
 
 class TestSearchSessions:
@@ -410,6 +534,22 @@ class TestSearchErrorHandling:
             patched_server._db, "list_all_prs", side_effect=RuntimeError("busy")
         ):
             results = search_mod.search("type:pr")
+            assert results == []
+
+    def test_list_tickets_failure_returns_empty(self, patched_server):
+        from common import search as search_mod
+        with patch.object(
+            patched_server._db, "list_tickets", side_effect=RuntimeError("busy")
+        ):
+            results = search_mod.search("type:ticket")
+            assert results == []
+
+    def test_list_reviews_failure_returns_empty(self, patched_server):
+        from common import search as search_mod
+        with patch.object(
+            patched_server._db, "list_review_prs", side_effect=RuntimeError("busy")
+        ):
+            results = search_mod.search("type:review")
             assert results == []
 
     def test_session_parent_get_task_failure_is_swallowed(self, patched_server):

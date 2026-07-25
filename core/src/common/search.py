@@ -1,9 +1,10 @@
-"""Global search over tasks, sessions, and PRs.
+"""Global search over tasks, tickets, reviews, sessions, and PRs.
 
 Free-text match against id / title / description / ticket_id / ticket_url /
 notes / branch, plus a small filter DSL:
 
-    type:task | type:pr | type:session   -- restrict entity type
+    type:task | type:ticket | type:review | type:pr | type:session
+                                         -- restrict entity type
     status:<value>                        -- match status field
     project:<id>                          -- scope to one project
     in:task                               -- PRs-only: only PRs attached
@@ -37,14 +38,27 @@ _FILTER_KEYS = frozenset({"type", "status", "project", "in", "ticket"})
 
 # Bare tokens that act as `type:<value>` shorthand. Lets users type
 # "pr in:task" instead of "type:pr in:task".
-_TYPE_SHORTHANDS = frozenset({"task", "tasks", "pr", "prs", "session", "sessions"})
+_TYPE_SHORTHANDS = frozenset({
+    "task", "tasks",
+    "ticket", "tickets",
+    "review", "reviews",
+    "pr", "prs",
+    "session", "sessions",
+})
+_TYPE_ALIASES = {
+    "tasks": "task",
+    "tickets": "ticket",
+    "reviews": "review",
+    "prs": "pr",
+    "sessions": "session",
+}
 
 
 @dataclass
 class Query:
     """Parsed search query. `text` is always lowercased."""
     text: str = ""
-    type: str | None = None     # task | pr | session
+    type: str | None = None     # task | ticket | review | pr | session
     status: str | None = None
     project: str | None = None
     in_: str | None = None      # "task" -> PRs linked to a task
@@ -69,7 +83,7 @@ def parse_query(raw: str) -> Query:
             if k in _FILTER_KEYS:
                 v = v.lower()
                 if k == "type":
-                    q.type = v
+                    q.type = _TYPE_ALIASES.get(v, v)
                 elif k == "status":
                     q.status = v
                 elif k == "project":
@@ -87,9 +101,7 @@ def parse_query(raw: str) -> Query:
         # matching "pr".
         low = tok.lower()
         if q.type is None and low in _TYPE_SHORTHANDS:
-            q.type = "task" if low in ("task", "tasks") \
-                     else "pr" if low in ("pr", "prs") \
-                     else "session"
+            q.type = _TYPE_ALIASES.get(low, low)
             continue
         text_parts.append(low)
     q.text = " ".join(text_parts).strip()
@@ -153,6 +165,60 @@ def _task_result(project_id: str, proj_name: str, t: dict) -> dict:
     }
 
 
+def _ticket_result(t: dict) -> dict:
+    """Shape a JIRA ticket row for the dropdown."""
+    key = t.get("key") or ""
+    summary = (t.get("summary") or "").strip()
+    sub_parts = []
+    if t.get("instance_name"):
+        sub_parts.append(str(t["instance_name"]))
+    if t.get("issue_type"):
+        sub_parts.append(str(t["issue_type"]))
+    if t.get("priority"):
+        sub_parts.append(str(t["priority"]))
+    if summary:
+        sub_parts.append(_truncate(summary))
+    return {
+        "type": "ticket",
+        "title": key,
+        "subtitle": " - ".join(sub_parts),
+        "badge": t.get("status") or "",
+        "project_id": t.get("project_key") or "",
+        "task_id": key,
+        "ticket_key": key,
+        "ticket_instance": t.get("instance_name") or "",
+    }
+
+
+def _review_result(r: dict) -> dict:
+    """Shape a review request row for the dropdown."""
+    repo = r.get("repo") or ""
+    number = r.get("number")
+    title = r.get("title") or ""
+    sub_parts = []
+    if repo:
+        sub_parts.append(repo)
+    if r.get("author"):
+        sub_parts.append("by " + str(r["author"]))
+    if title:
+        sub_parts.append(_truncate(title))
+    return {
+        "type": "review",
+        "title": ("#" + str(number)) if number else "(review)",
+        "subtitle": " - ".join(sub_parts),
+        "badge": (
+            r.get("my_workflow_state")
+            or r.get("my_review_state")
+            or r.get("status")
+            or ""
+        ),
+        "project_id": "",
+        "review_url": r.get("url") or "",
+        "pr_number": number,
+        "pr_repo": repo,
+    }
+
+
 def _session_result(project_id: str, proj_name: str, s: dict, t: dict) -> dict:
     """Shape a session row. `t` is the parent task for the description."""
     name = s.get("tmux_name") or s.get("task_id") or ""
@@ -210,29 +276,115 @@ def _search_tasks(q: Query, project_names: dict[str, str]) -> list[dict]:
     if q.type not in (None, "task"):
         return []
     results: list[dict] = []
-    projects = [q.project] if q.project else list(project_names.keys())
-    for pid in projects:
-        try:
-            tasks = app_state._db.list_tasks(pid)
-        except Exception:
+    try:
+        tasks = app_state._db.list_tasks(q.project if q.project else None)
+    except Exception:
+        return []
+    for t in tasks:
+        if (t.get("type") or "") == "review":
             continue
-        for t in tasks:
-            if q.status and (t.get("status") or "").lower() != q.status:
+        if t.get("ticket_synced_at"):
+            continue
+        pid = t.get("project") or ""
+        if q.project and pid != q.project:
+            continue
+        if q.status and (t.get("status") or "").lower() != q.status:
+            continue
+        if not _ticket_matches(t.get("ticket_id"), q.ticket):
+            continue
+        # Free-text haystack covers every human-searchable field on the
+        # task: id, type, description, ticket id+url, and notes. Sessions and
+        # PRs resolve their parent task so searches there hit these too.
+        hay = " ".join([
+            t.get("task_id") or "",
+            t.get("type") or "",
+            t.get("description") or "",
+            t.get("ticket_id") or "",
+            t.get("ticket_url") or "",
+            t.get("notes") or "",
+            t.get("group_name") or "",
+        ])
+        if _match_text(hay, q.text):
+            results.append(_task_result(pid, project_names.get(pid, pid), t))
+    return results
+
+
+def _search_tickets(q: Query) -> list[dict]:
+    if q.type not in (None, "ticket"):
+        return []
+    try:
+        rows = app_state._db.list_tickets(limit=1000)
+    except Exception:
+        return []
+    results: list[dict] = []
+    for t in rows:
+        if q.project and (t.get("project_key") or "").lower() != q.project:
+            continue
+        if q.status and (t.get("status") or "").lower() != q.status:
+            continue
+        if not _ticket_matches(t.get("key"), q.ticket):
+            continue
+        hay = " ".join([
+            t.get("key") or "",
+            t.get("summary") or "",
+            t.get("description") or "",
+            t.get("status") or "",
+            t.get("priority") or "",
+            t.get("issue_type") or "",
+            t.get("project_key") or "",
+            t.get("assignee_email") or "",
+            t.get("reporter_email") or "",
+            t.get("url") or "",
+            t.get("labels") or "",
+            t.get("components") or "",
+            t.get("fix_versions") or "",
+            t.get("parent_key") or "",
+            t.get("resolution") or "",
+            t.get("status_category") or "",
+            t.get("severity") or "",
+            t.get("instance_name") or "",
+        ])
+        if _match_text(hay, q.text):
+            results.append(_ticket_result(t))
+    return results
+
+
+def _search_reviews(q: Query) -> list[dict]:
+    if q.type not in (None, "review"):
+        return []
+    try:
+        rows = app_state._db.list_review_prs()
+    except Exception:
+        return []
+    results: list[dict] = []
+    for r in rows:
+        if q.status:
+            statuses = {
+                (r.get("status") or "").lower(),
+                (r.get("ci_status") or "").lower(),
+                (r.get("review_status") or "").lower(),
+                (r.get("my_review_state") or "").lower(),
+                (r.get("my_workflow_state") or "").lower(),
+            }
+            if q.status not in statuses:
                 continue
-            if not _ticket_matches(t.get("ticket_id"), q.ticket):
-                continue
-            # Free-text haystack covers every human-searchable field on the
-            # task: id, description, ticket id+url, and notes. Sessions and
-            # PRs resolve their parent task so searches there hit these too.
-            hay = " ".join([
-                t.get("task_id") or "",
-                t.get("description") or "",
-                t.get("ticket_id") or "",
-                t.get("ticket_url") or "",
-                t.get("notes") or "",
-            ])
-            if _match_text(hay, q.text):
-                results.append(_task_result(pid, project_names.get(pid, pid), t))
+        hay = " ".join([
+            r.get("url") or "",
+            r.get("repo") or "",
+            str(r.get("number") or ""),
+            r.get("title") or "",
+            r.get("author") or "",
+            r.get("status") or "",
+            r.get("ci_status") or "",
+            r.get("review_status") or "",
+            r.get("my_review_state") or "",
+            r.get("my_workflow_state") or "",
+            r.get("head_branch") or "",
+            r.get("base_branch") or "",
+            r.get("source") or "",
+        ])
+        if _match_text(hay, q.text):
+            results.append(_review_result(r))
     return results
 
 
@@ -276,11 +428,11 @@ def _search_prs(q: Query, project_names: dict[str, str]) -> list[dict]:
     if q.type not in (None, "pr"):
         return []
     try:
-        # `EvaDB.list_all_prs` already filters by status + does a simple
-        # search-substring match against title/notes/task_id.
+        # Fetch by status only; this layer owns richer text matching over
+        # repo/url/author/branches/review fields in addition to title/task_id.
         rows = app_state._db.list_all_prs(
             status=(q.status or ""),
-            search=q.text or "",
+            search="",
         )
     except Exception:
         return []
@@ -311,6 +463,22 @@ def _search_prs(q: Query, project_names: dict[str, str]) -> list[dict]:
             continue
         if q.ticket and not _ticket_matches(_pr_ticket(pr), q.ticket):
             continue
+        hay = " ".join([
+            str(pr.get("number") or ""),
+            pr.get("url") or "",
+            pr.get("title") or "",
+            pr.get("task_id") or "",
+            pr.get("task_description") or "",
+            pr.get("status") or "",
+            pr.get("ci_status") or "",
+            pr.get("review_status") or "",
+            pr.get("my_review_state") or "",
+            pr.get("author") or "",
+            pr.get("head_branch") or "",
+            pr.get("base_branch") or "",
+        ])
+        if not _match_text(hay, q.text):
+            continue
         proj_name = project_names.get(pid, pid)
         results.append(_pr_result(pr, proj_name))
     return results
@@ -318,12 +486,14 @@ def _search_prs(q: Query, project_names: dict[str, str]) -> list[dict]:
 
 def search(raw_query: str, limit: int = 20) -> list[dict]:
     """Top-level entry: parse the query, fan out to per-entity searchers,
-    and return the first `limit` rows (tasks first, then sessions,
-    then PRs -- a stable ordering callers can rely on)."""
+    and return the first `limit` rows. Keep task-like work first,
+    followed by live sessions and PRs."""
     q = parse_query(raw_query)
     project_names = _project_names()
     merged: Iterable[dict] = (
         _search_tasks(q, project_names)
+        + _search_tickets(q)
+        + _search_reviews(q)
         + _search_sessions(q, project_names)
         + _search_prs(q, project_names)
     )

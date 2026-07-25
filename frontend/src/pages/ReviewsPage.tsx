@@ -8,8 +8,18 @@ import { PRCard } from '../components/PRCard'
 import { useAlert } from '../components/Alert'
 import { useEventBus } from '../hooks/useEventBus'
 import { useLayoutRatios } from '../hooks/useLayoutRatios'
+import { useCollapsedRepos } from '../hooks/useCollapsedRepos'
 
 type ReviewPR = PR & { repo: string; source?: 'github' | 'manual' | 'both' }
+
+// The repo we always sort to the bottom of the queue (a low-signal
+// firehose). Matched exactly so a rename doesn't silently re-order it.
+const TEXERA_REPO = 'apache/texera'
+
+// Which review tab is showing. `active` = the open review queue;
+// `completed` = PRs I approved that have since merged (these were
+// previously hidden from the page entirely).
+type ReviewTab = 'active' | 'completed'
 
 /**
  * "All Reviews" -- flat list of open PRs awaiting my review, aggregated
@@ -37,6 +47,10 @@ export function ReviewsPage({ selectedReviewUrl, onSelectReview }: ReviewsPagePr
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [syncing, setSyncing] = useState(false)
+  const [tab, setTab] = useState<ReviewTab>('active')
+  // Collapse state per repo group, persisted to settings. Seed
+  // apache/texera collapsed by default (it's the bottom firehose).
+  const { collapsed, toggle: toggleRepo } = useCollapsedRepos([TEXERA_REPO])
   const [queueRatio, cardRatio, detailRatio] = useLayoutRatios(
     'ui.layout.reviews_col_ratios',
     [...DEFAULT_REVIEWS_RATIOS],
@@ -142,9 +156,17 @@ export function ReviewsPage({ selectedReviewUrl, onSelectReview }: ReviewsPagePr
       confirmLabel: 'Add',
     })
     if (!url) return
+    const trimmed = url.trim()
     try {
-      await api.addReviewWatch(url.trim())
+      await api.addReviewWatch(trimmed)
       await load()
+      // Jump straight to the newly-added PR's detail view. A fresh add
+      // is a to-review item, so make sure we're on the active tab (else
+      // the selection would land on a PR the current tab filters out).
+      // `setSelectedPR` parses owner/repo/number from the URL, so the
+      // detail panes render even before the queue reflects the new row.
+      setTab('active')
+      setSelectedPR({ repo: '', number: 0, url: trimmed })
     } catch (e) {
       await alert({
         title: 'Could not add PR',
@@ -181,31 +203,34 @@ export function ReviewsPage({ selectedReviewUrl, onSelectReview }: ReviewsPagePr
     }
   }, [confirm, confirmAt, alert, load, selectedPR])
 
-  // Merged-PR housekeeping. Two rules:
-  //   1. If a PR is merged AND I already approved or commented on it,
-  //      drop it from the UI entirely. The DB row stays so analytics
-  //      and "did I review this?" lookups still work; we just don't
-  //      pull it into the visual queue every time.
-  //   2. Other merged PRs (no review from me, or pending re-request)
-  //      stay in the list but fold to a dim, meta-less row -- they're
-  //      reference material at this point, not actionable, so they
-  //      shouldn't compete with open reviews for attention.
+  // Tab partitioning. A PR is "completed" once it's merged AND I
+  // approved it -- that's the terminal state for my review, so it
+  // moves out of the active queue into the Completed tab (previously
+  // these were hidden from the page entirely). Everything else stays
+  // in the active queue, where merged-but-unreviewed PRs still fold to
+  // a dim reference row (see `isFolded` below).
   const isMerged = (pr: ReviewPR) => pr.status === 'merged'
-  const iAmDoneWith = (pr: ReviewPR) =>
-    pr.my_review_state === 'approved' || pr.my_review_state === 'commented'
-  const visiblePrs = ((prs || []) as ReviewPR[]).filter(
-    (p) => !(isMerged(p) && iAmDoneWith(p))
-  )
-  const hiddenMergedCount = ((prs || []) as ReviewPR[]).length - visiblePrs.length
+  const isCompleted = (pr: ReviewPR) =>
+    isMerged(pr) &&
+    (pr.my_review_state === 'approved' || pr.my_review_state === 'commented')
+  const allPrs = (prs || []) as ReviewPR[]
+  const activePrs = allPrs.filter((p) => !isCompleted(p))
+  const completedPrs = allPrs.filter(isCompleted)
+  const tabPrs = tab === 'completed' ? completedPrs : activePrs
 
   // Group by org/repo so PRs from the same codebase stay together.
-  const grouped = visiblePrs.reduce<Record<string, ReviewPR[]>>((acc, p) => {
+  const grouped = tabPrs.reduce<Record<string, ReviewPR[]>>((acc, p) => {
     const k = p.repo || 'other'
     if (!acc[k]) acc[k] = []
     acc[k].push(p)
     return acc
   }, {})
-  const repoKeys = Object.keys(grouped).sort()
+  // Alphabetical, except apache/texera always sinks to the bottom.
+  const repoKeys = Object.keys(grouped).sort((a, b) => {
+    if (a === TEXERA_REPO && b !== TEXERA_REPO) return 1
+    if (b === TEXERA_REPO && a !== TEXERA_REPO) return -1
+    return a.localeCompare(b)
+  })
 
   return (
     <div
@@ -226,19 +251,27 @@ export function ReviewsPage({ selectedReviewUrl, onSelectReview }: ReviewsPagePr
           borderRight: selectedPR ? '1px solid var(--border)' : undefined,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-          <span style={{ fontSize: 14, fontWeight: 700 }}>Reviews</span>
-          <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
-            {prs ? `${visiblePrs.length} shown` : ''}
-            {hiddenMergedCount > 0 && (
-              <span
-                title={`${hiddenMergedCount} merged PR${hiddenMergedCount > 1 ? 's' : ''} I already approved or commented on are hidden`}
-                style={{ marginLeft: 6, color: 'var(--text-subtle)' }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          {/* Reviews / Completed tab switch. Completed = PRs I approved
+              that have merged (terminal review state). */}
+          {(['active', 'completed'] as ReviewTab[]).map((t) => {
+            const isActive = tab === t
+            const count = t === 'completed' ? completedPrs.length : activePrs.length
+            const label = t === 'completed' ? 'Completed' : 'Reviews'
+            return (
+              <button
+                key={t}
+                className={`btn-action${isActive ? ' accent' : ''}`}
+                style={{ fontSize: 11, padding: '2px 10px', fontWeight: isActive ? 700 : 400 }}
+                onClick={() => setTab(t)}
+                aria-pressed={isActive}
+                data-testid={`reviews-tab-${t}`}
               >
-                ({hiddenMergedCount} hidden)
-              </span>
-            )}
-          </span>
+                {label}{prs ? ` (${count})` : ''}
+              </button>
+            )
+          })}
+          <span style={{ flex: 1 }} />
           <button
             className="btn-action accent"
             style={{ fontSize: 11, padding: '2px 8px' }}
@@ -262,45 +295,66 @@ export function ReviewsPage({ selectedReviewUrl, onSelectReview }: ReviewsPagePr
             Failed to load: {error}
           </div>
         )}
-        {!error && prs && prs.length === 0 && (
-          <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>Nothing to review right now.</div>
-        )}
-        {repoKeys.map((repo) => (
-          <div key={repo} style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 600, marginBottom: 6 }}>
-              {repo}
-              <span style={{ color: 'var(--text-dim)', fontWeight: 400, marginLeft: 6 }}>
-                ({grouped[repo].length})
-              </span>
-            </div>
-            {grouped[repo].map((pr) => {
-              const isManual = pr.source === 'manual' || pr.source === 'both'
-              const isSelected = !!selectedPR
-                && selectedPR.repo === pr.repo
-                && selectedPR.number === pr.number
-              // Merged PRs that survived the filter (i.e. I haven't
-              // approved/commented yet) fold to a dim, meta-less row
-              // -- they're reference, not action, and shouldn't pull
-              // attention away from open reviews.
-              const isFolded = isMerged(pr)
-              return (
-                <ReviewNode
-                  key={`${repo}:${pr.number}`}
-                  pr={pr}
-                  isManual={isManual}
-                  isSelected={isSelected}
-                  isFolded={isFolded}
-                  // 3-pane mode (selectedPR set) collapses the queue
-                  // to ~25% -- compact flips PRCard into its 2-row
-                  // layout so pr-title isn't ellipsis-truncated.
-                  isCompact={!!selectedPR}
-                  onSelect={() => setSelectedPR({ repo: pr.repo, number: pr.number, url: pr.url })}
-                  onUnpin={(anchor) => handleRemove(pr, anchor)}
-                />
-              )
-            })}
+        {!error && prs && tabPrs.length === 0 && (
+          <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+            {tab === 'completed'
+              ? 'No approved-and-merged PRs yet.'
+              : 'Nothing to review right now.'}
           </div>
-        ))}
+        )}
+        {repoKeys.map((repo) => {
+          const isCollapsed = collapsed.has(repo)
+          return (
+            <div key={repo} style={{ marginBottom: 16 }}>
+              <div
+                onClick={() => toggleRepo(repo)}
+                role="button"
+                aria-expanded={!isCollapsed}
+                data-testid={`reviews-repo-header-${repo}`}
+                style={{
+                  fontSize: 12, color: 'var(--accent)', fontWeight: 600,
+                  marginBottom: 6, cursor: 'pointer', userSelect: 'none',
+                  display: 'flex', alignItems: 'center', gap: 4,
+                }}
+                title={isCollapsed ? 'Expand' : 'Collapse'}
+              >
+                <span style={{ fontSize: 9, width: 10, display: 'inline-block' }}>
+                  {isCollapsed ? '▶' : '▼'}
+                </span>
+                {repo}
+                <span style={{ color: 'var(--text-dim)', fontWeight: 400, marginLeft: 2 }}>
+                  ({grouped[repo].length})
+                </span>
+              </div>
+              {!isCollapsed && grouped[repo].map((pr) => {
+                const isManual = pr.source === 'manual' || pr.source === 'both'
+                const isSelected = !!selectedPR
+                  && selectedPR.repo === pr.repo
+                  && selectedPR.number === pr.number
+                // Merged PRs that survived the filter (i.e. I haven't
+                // approved yet) fold to a dim, meta-less row -- they're
+                // reference, not action, and shouldn't pull attention
+                // away from open reviews.
+                const isFolded = isMerged(pr)
+                return (
+                  <ReviewNode
+                    key={`${repo}:${pr.number}`}
+                    pr={pr}
+                    isManual={isManual}
+                    isSelected={isSelected}
+                    isFolded={isFolded}
+                    // 3-pane mode (selectedPR set) collapses the queue
+                    // to ~25% -- compact flips PRCard into its 2-row
+                    // layout so pr-title isn't ellipsis-truncated.
+                    isCompact={!!selectedPR}
+                    onSelect={() => setSelectedPR({ repo: pr.repo, number: pr.number, url: pr.url })}
+                    onUnpin={(anchor) => handleRemove(pr, anchor)}
+                  />
+                )
+              })}
+            </div>
+          )
+        })}
       </div>
 
       {/* Middle: ReviewCard -- session state, workflow state, history */}

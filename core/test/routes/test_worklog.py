@@ -159,6 +159,55 @@ class TestGeneratorContent:
             )
             conn.commit()
 
+    def _emit_agent_event(self, patched_server, session, ts):
+        """Insert an agent.* event tagged with a tmux `session` -- the
+        signal that the user worked a task/ticket/review via the agent."""
+        import sqlite3
+        with sqlite3.connect(str(patched_server._NOTIF_DB_PATH)) as conn:
+            conn.execute(
+                "INSERT INTO events (id, source, source_id, title, message, "
+                "type, severity, url, ts, read, session) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"ev-{session}-{ts}", "agent", "", f"Agent: {session}", "",
+                 "agent.task_done", "info", "", ts, 0, session),
+            )
+            conn.commit()
+
+    def test_ticket_session_work_lands_in_tickets_section(self, client, patched_server):
+        """A `ticket-<instance>-<key>` agent session (fixing a ticket)
+        must surface in the Tickets section -- previously these sessions
+        were skipped entirely, so ticket-fixing never hit the standup."""
+        patched_server._db.upsert_ticket(
+            key="EX-4242", instance_name="example",
+            summary="NullPointer in widget loader",
+            url="https://jira/EX-4242", status="In Progress",
+            synced_at="2099-01-01T00:00:00",
+        )
+        self._emit_agent_event(
+            patched_server, "ticket-example-EX-4242", "2099-01-01T10:00:00")
+
+        from routes.worklog import _generate_worklog_content
+        out = _generate_worklog_content("2099-01-01", "2099-01-02", "- header")
+        assert "Tickets:" in out
+        assert "[EX-4242]" in out
+        # The ticket's one-line summary, not its full body, is shown.
+        assert "NullPointer in widget loader" in out
+
+    def test_review_session_work_lands_in_reviews_section(self, client, patched_server):
+        """A `review-*` agent session (reviewing a PR) must surface in the
+        Reviews section."""
+        patched_server._db.create_task(
+            "", "review-apache-spark-99", type="review",
+            description="[SPARK-99] Speed up shuffle",
+        )
+        self._emit_agent_event(
+            patched_server, "review-apache-spark-99", "2099-01-01T10:00:00")
+
+        from routes.worklog import _generate_worklog_content
+        out = _generate_worklog_content("2099-01-01", "2099-01-02", "- header")
+        assert "Reviews:" in out
+        assert "Speed up shuffle" in out
+
     def test_no_activity_returns_placeholder_line(self, client, patched_server):
         """An empty date range -> content includes the literal 'No activity recorded'."""
         from routes.worklog import _generate_worklog_content
@@ -414,32 +463,36 @@ class TestGeneratorContent:
         assert "[ALT-9999]" in out
         assert ":resolved-check:" not in out
 
-    def test_es_ticket_pulled_into_own_section(self, client, patched_server):
-        """Tasks whose ticket_id begins with 'EX-' land in a dedicated
-        'ES tickets:' group, not under the task's project."""
-        db = patched_server._db
-        db.update_task("test-proj", "task-b",
-                       description="Fix flaky suite",
-                       ticket_id="EX-1001",
-                       ticket_url="https://jira/EX-1001",
-                       status="in_progress")
-        self._emit_task_event(patched_server, "task-b", "2099-01-01T10:00:00")
+    def test_ticket_pulled_into_own_section(self, client, patched_server):
+        """A JIRA-synced ticket task lands in the dedicated 'Tickets:'
+        group, not under any project."""
+        patched_server._db.upsert_ticket(
+            key="EX-1001", instance_name="example",
+            summary="Fix flaky suite", url="https://jira/EX-1001",
+            status="In Progress", synced_at="2099-01-01T00:00:00",
+        )
+        self._emit_task_event(patched_server, "EX-1001", "2099-01-01T10:00:00")
 
         from routes.worklog import _generate_worklog_content
         out = _generate_worklog_content("2099-01-01", "2099-01-02", "- header")
-        assert "ES tickets:" in out
+        assert "Tickets:" in out
         # Ticket ID still rendered with brackets -- user wants them kept.
         assert "[EX-1001]" in out
-        # The test project's own section header should NOT appear for this
-        # task, since it was re-routed into the ES bucket.
         assert "Test Project:" not in out
 
-    def test_es_pr_pulled_into_own_section(self, client, patched_server):
-        """PRs whose title starts with `[EX-xxxxxxx]` also land in the
-        ES tickets section, separate from the per-project groups."""
+    def test_ticket_pr_pulled_into_own_section(self, client, patched_server):
+        """A PR on a JIRA-synced ticket task lands in the Tickets section.
+        Classification is by the task's `ticket_synced_at`, NOT the PR
+        title -- a `[SPARK-...]` PR on a plain project task stays under
+        its project (see the next test)."""
+        patched_server._db.upsert_ticket(
+            key="EX-1001", instance_name="example",
+            summary="Await warmup", url="https://jira/EX-1001",
+            status="Open", synced_at="2099-01-01T00:00:00",
+        )
         self._seed_pr_with_last_updated(
             patched_server,
-            task_id="task-b",
+            task_id="EX-1001",
             number=9001,
             title="[EX-1001] Await client image upload before warmup",
             status="open",
@@ -450,10 +503,28 @@ class TestGeneratorContent:
 
         from routes.worklog import _generate_worklog_content
         out = _generate_worklog_content("2099-01-01", "2099-01-02", "- header")
-        assert "ES tickets:" in out
+        assert "Tickets:" in out
         assert "[EX-1001]" in out
-        # PR routed away from the project group.
-        assert "Test Project:" not in out
+
+    def test_spark_pr_on_project_task_stays_under_project(self, client, patched_server):
+        """A `[SPARK-...]` feature PR on a plain project task (no
+        ticket_id) is the user's own dev work -- it stays under the
+        project section, NOT lumped into Tickets."""
+        self._seed_pr_with_last_updated(
+            patched_server,
+            task_id="task-b",  # seeded plain task, no ticket_id
+            number=9100,
+            title="[SPARK-56758][PYTHON] Refactor SQL_MAP_PANDAS_ITER_UDF",
+            status="open",
+            ci_status="",
+            url="https://github.com/apache/spark/pull/55750",
+            ts="2099-01-01T10:00:00",
+        )
+
+        from routes.worklog import _generate_worklog_content
+        out = _generate_worklog_content("2099-01-01", "2099-01-02", "- header")
+        assert "Test Project:" in out
+        assert "Tickets:" not in out
 
     def test_task_with_pr_suppressed_in_task_list(self, client, patched_server):
         """When a task both has a PR and a task event, the PR line appears but

@@ -117,8 +117,9 @@ def run_job_now(job_id: str):
 
 @app_state.app.get("/api/search")
 def search(q: str = "", limit: int = 20):
-    """Global search across tasks, sessions, PRs. Supports filter DSL:
-    type:task|pr|session, status:<v>, project:<id>, in:task."""
+    """Global search across tasks, tickets, reviews, sessions, and PRs.
+    Supports filter DSL:
+    type:task|ticket|review|pr|session, status:<v>, project:<id>, in:task."""
     from common.search import search as core_search
     return {"results": core_search(q, limit=limit)}
 

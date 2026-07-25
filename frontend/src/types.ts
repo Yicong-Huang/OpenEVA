@@ -62,6 +62,11 @@ export interface PR {
   head_branch: string
   base_branch: string
   last_updated: string
+  // Cache-invalidation flag: set to 1 by the notification poller when a
+  // github.* event touches this PR, cleared once the background pr_sync
+  // job (or an on-open refresh) has pulled fresh state. Drives the
+  // cache-aware on-open refresh in TaskCard.
+  dirty?: number
   task_id?: string
   project?: string
   // Review-PR-only: tmux name of the agent session bound to this

@@ -411,7 +411,8 @@ def _default_executor(job: dict) -> dict:
     # this works regardless of which CLI is configured (claude /
     # agent variants).
     from . import agent as _agent
-    argv = _agent.launch_argv(session, system_prompt=bg_system, prompt=command)
+    argv = _agent.get_agent_for_new_session().launch_argv(
+        session, system_prompt=bg_system, prompt=command)
     _tmux.launch_session_argv(session, "~", argv)
     tag = "[relaunched]" if relaunched else "[launched]"
     return {

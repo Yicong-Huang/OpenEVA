@@ -254,4 +254,39 @@ describe('AIUsageStatus', () => {
       expect(countUsage()).toBeGreaterThan(before)
     })
   })
+
+  it('renders Claude Code / Codex spend rows when present', async () => {
+    mockFetchJson({
+      daily: '198.36', weekly: '198.36', monthly: '198.36', tier: 'Power User',
+      claude_cost: '1,335.84', claude_tokens: '1,397,218,343',
+      codex_cost: '197.93', codex_tokens: '233,139,581',
+    })
+    render(<AIUsageStatus />)
+    await waitFor(() => {
+      expect(screen.getByTestId('usage-topbar').querySelector('span')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByTestId('usage-topbar').querySelector('span')!)
+    await waitFor(() => {
+      expect(screen.getByText('Spend (recent)')).toBeInTheDocument()
+      expect(screen.getByText('Claude Code')).toBeInTheDocument()
+      expect(screen.getByText('$1,335.84')).toBeInTheDocument()
+      expect(screen.getByText('1.4B tok')).toBeInTheDocument()
+      expect(screen.getByText('Codex')).toBeInTheDocument()
+      expect(screen.getByText('$197.93')).toBeInTheDocument()
+      expect(screen.getByText('233.1M tok')).toBeInTheDocument()
+    })
+  })
+
+  it('omits spend section when cost fields absent', async () => {
+    mockFetchJson({ daily: '42', weekly: '200', monthly: '800' })
+    render(<AIUsageStatus />)
+    await waitFor(() => {
+      expect(screen.getByTestId('usage-topbar').querySelector('span')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByTestId('usage-topbar').querySelector('span')!)
+    await waitFor(() => {
+      expect(screen.getByText('Daily')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Spend (recent)')).not.toBeInTheDocument()
+  })
 })

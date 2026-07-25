@@ -17,6 +17,7 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
   const [expanded, setExpanded] = useState(autoExpand ?? false)
   const [termStatus, setTermStatus] = useState<string | null>(null)
   const [resuming, setResuming] = useState(false)
+  const [restarting, setRestarting] = useState(false)
   const { confirm, alert } = useAlert()
 
   // Status comes from the global session status service (single
@@ -92,6 +93,38 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
     if (ok) onKill()
   }, [sessionName, onKill, confirm])
 
+  const handleRestart = useCallback(async () => {
+    const ok = await confirm({
+      title: `Restart session "${sessionName}"?`,
+      message: 'The tmux session will be killed and immediately resumed by ' +
+               'UUID -- the conversation is kept. Use this to pick up an ' +
+               'agent or config update.',
+      confirmLabel: 'Restart',
+    })
+    if (!ok) return
+    setRestarting(true)
+    try {
+      const res = await api.restartSession(sessionName)
+      setExpanded(true)
+      if (res.action === 'relaunched') {
+        await alert({
+          title: 'Session restarted (history not resumed)',
+          message: 'No agent session id was on record for "' + sessionName +
+                   '", so a fresh agent was started. Previous conversation is lost.',
+          kind: 'warning',
+        })
+      }
+    } catch (e) {
+      await alert({
+        title: 'Failed to restart session',
+        message: e instanceof Error ? e.message : String(e),
+        kind: 'error',
+      })
+    } finally {
+      setRestarting(false)
+    }
+  }, [sessionName, confirm, alert])
+
   const handleResume = useCallback(async () => {
     setResuming(true)
     try {
@@ -154,7 +187,7 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
               died unexpectedly while we still hold the claude UUID).
               Keeps Kill as a destructive fallback. */}
           {(displayStatus === 'stopped' || displayStatus === 'stream lost'
-              || displayStatus === 'crashed') && (
+              || displayStatus === 'crashed') ? (
             <button
               className="btn-action accent"
               style={{ padding: '2px 6px', fontSize: 9 }}
@@ -163,6 +196,19 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
               title="Restart tmux and resume the existing agent session by UUID"
             >
               {resuming ? '...' : 'Resume'}
+            </button>
+          ) : (
+            /* Live session: restart the tmux and reconnect to the same
+               agent conversation -- for picking up an agent/config
+               update without losing history. */
+            <button
+              className="btn-action"
+              style={{ padding: '2px 6px', fontSize: 9 }}
+              disabled={restarting}
+              onClick={(e) => { e.stopPropagation(); handleRestart() }}
+              title="Kill and resume this session by UUID (keeps the conversation) -- use after an agent or config update"
+            >
+              {restarting ? '...' : 'Restart'}
             </button>
           )}
           <button

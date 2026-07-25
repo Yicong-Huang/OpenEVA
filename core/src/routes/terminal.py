@@ -56,6 +56,30 @@ async def terminal_resize(session_name: str, rows: int = 24, cols: int = 80):
     return {"ok": True}
 
 
+class ScrollBody(BaseModel):
+    """Wheel-to-history scroll request. `dir` is 'up' / 'down', `lines`
+    is how many lines this wheel tick moves."""
+    dir: str = "up"
+    lines: int = 3
+
+
+@app_state.app.post("/api/terminal/{session_name}/scroll")
+async def terminal_scroll(session_name: str, body: ScrollBody):
+    """Scroll the tmux pane's scrollback (wheel-to-history).
+
+    The browser terminal calls this when xterm itself has nothing left
+    to scroll in the wheel direction -- the agent's interactive TUI
+    redraws in place so its scrollback lives in tmux, not xterm. Driving
+    tmux copy-mode here lets the user page through the agent's full
+    history instead of the wheel escaping to the parent pane. The PTY
+    reader streams tmux's copy-mode redraw straight back to xterm, so
+    the scrolled view shows up in the browser. Best-effort: a missing
+    session is a silent no-op (no 404 -- the wheel must never error)."""
+    from adapters import tmux as _tmux
+    _tmux.scroll_pane(session_name, body.dir, body.lines)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Multiplex SSE transport
 # ---------------------------------------------------------------------------

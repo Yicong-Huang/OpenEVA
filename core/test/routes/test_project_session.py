@@ -75,13 +75,18 @@ class TestBuildProjectBackground:
 class TestOpenProjectSession:
     def test_new_project_launches_tmux_with_argv(self, patched_server, mock_tmux):
         from common.sessions import open_project_session
+        from common import agent as _agent
+        # Pin new-session agent to Claude-family so this mechanics test
+        # keeps asserting the `--append-system-prompt` shape.
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         info = open_project_session("test-proj")
         assert info["project_id"] == "test-proj"
         assert info["tmux_name"] == "pm-test-proj"
         # Launched via argv (not send-keys) so multi-line bg works.
         mock_tmux["launch_argv"].assert_called_once()
         argv = mock_tmux["launch_argv"].call_args.args[2]
-        assert argv[0] in ("agent", "claude")  # active agent binary
+        assert "agent" in argv or "claude" in argv  # active agent binary
         # Bg is in --append-system-prompt and contains Role marker.
         bg = argv[argv.index("--append-system-prompt") + 1]
         assert "[Role]" in bg
@@ -141,6 +146,24 @@ class TestGetProjectSession:
         mock_tmux["exists"].return_value = False
         info2 = get_project_session("test-proj")
         assert info2["running"] is False
+
+
+# ---------------------------------------------------------------------------
+# list_project_manager_sessions
+# ---------------------------------------------------------------------------
+
+class TestListProjectManagerSessions:
+    def test_lists_only_running_project_managers(self, patched_server, mock_tmux):
+        from common.sessions import list_project_manager_sessions
+
+        patched_server._db.create_project_session("test-proj", "pm-test-proj")
+        patched_server._db.create_project_session("empty-proj", "pm-empty-proj")
+        mock_tmux["exists"].side_effect = lambda name: name == "pm-test-proj"
+
+        rows = list_project_manager_sessions()
+        assert [r["project_id"] for r in rows] == ["test-proj"]
+        assert rows[0]["project_name"] == "Test Project"
+        assert rows[0]["running"] is True
 
 
 # ---------------------------------------------------------------------------

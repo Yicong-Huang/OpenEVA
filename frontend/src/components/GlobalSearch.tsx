@@ -11,15 +11,23 @@ interface Props {
   onSelectTask?: (taskId: string | null) => void
   /** Select a PR for the PRs page. */
   onSelectPR?: (pr: { repo: string; number: number; taskId?: string; projectId?: string } | null) => void
+  /** Select a review request for the Reviews page. */
+  onSelectReview?: (url: string | null) => void
+  /** Select a ticket for the Tickets page. */
+  onSelectTicket?: (ticket: { key: string; instance?: string } | null) => void
 }
 
 /** Icon shown on each result row. Kept monochrome so it inherits
  *  --text-dim; easy to theme, no extra assets. */
 function ResultIcon({ type }: { type: Result['type'] }) {
   const glyph = type === 'task' ? '\u2611'            // ballot box with check
+              : type === 'ticket' ? '\u25A3'          // square ticket-ish marker
+              : type === 'review' ? '\u25C9'          // review target
               : type === 'pr'  ? '\u229C'             // circled plus (pr-ish)
               : '\u25B6'                              // play (session)
   const color = type === 'task' ? 'var(--blue)'
+              : type === 'ticket' ? 'var(--yellow)'
+              : type === 'review' ? 'var(--orange)'
               : type === 'pr'   ? 'var(--green)'
               : 'var(--purple)'
   return (
@@ -41,7 +49,13 @@ function StatusBadge({ text }: { text: string }) {
   )
 }
 
-export function GlobalSearch({ onNavigate, onSelectTask, onSelectPR }: Props) {
+export function GlobalSearch({
+  onNavigate,
+  onSelectTask,
+  onSelectPR,
+  onSelectReview,
+  onSelectTicket,
+}: Props) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<Result[]>([])
   const [open, setOpen] = useState(false)
@@ -93,6 +107,17 @@ export function GlobalSearch({ onNavigate, onSelectTask, onSelectPR }: Props) {
     if (r.type === 'task') {
       onNavigate(r.project_id || null, 'graph')
       onSelectTask?.(r.task_id || null)
+    } else if (r.type === 'ticket') {
+      onNavigate(null, 'tickets')
+      if (r.ticket_key) {
+        onSelectTicket?.({
+          key: r.ticket_key,
+          instance: r.ticket_instance || undefined,
+        })
+      }
+    } else if (r.type === 'review') {
+      onNavigate(null, 'all-reviews')
+      onSelectReview?.(r.review_url || null)
     } else if (r.type === 'session') {
       // Live Tasks (formerly the per-project "sessions" view, which
       // was consolidated into a single global page). The page reads
@@ -115,7 +140,7 @@ export function GlobalSearch({ onNavigate, onSelectTask, onSelectPR }: Props) {
         })
       }
     }
-  }, [onNavigate, onSelectTask, onSelectPR])
+  }, [onNavigate, onSelectTask, onSelectPR, onSelectReview, onSelectTicket])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (!open) return
@@ -146,7 +171,7 @@ export function GlobalSearch({ onNavigate, onSelectTask, onSelectPR }: Props) {
         onChange={(e) => { setQuery(e.target.value); setOpen(true) }}
         onFocus={() => { if (query) setOpen(true) }}
         onKeyDown={handleKeyDown}
-        placeholder="Search tasks/sessions/PRs (type:pr, status:open, ticket:EX-123, in:task) -- Cmd+K"
+        placeholder="Search tasks/tickets/reviews/PRs (type:ticket, status:open, ticket:EX-123) -- Cmd+K"
         style={{
           width: '100%', padding: '5px 10px', fontSize: 11,
           background: 'var(--input-bg)', color: 'var(--text)',

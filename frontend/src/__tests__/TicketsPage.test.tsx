@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 vi.mock('../api', () => ({
@@ -61,22 +61,32 @@ import { api } from '../api'
 import { TicketsPage } from '../pages/TicketsPage'
 
 const TICKET = (overrides = {}) => ({
-  key: 'PROJ-1', summary: 'Fix bug', description: 'details',
-  status: 'In Progress', priority: 'Medium', issue_type: 'Bug',
-  project_key: 'PROJ', assignee_email: 'me@example.com',
+  key: 'EX-1', summary: 'Fix bug', description: 'details',
+  status: 'Open', priority: 'Medium', issue_type: 'Bug',
+  project_key: 'EX', assignee_email: 'me@example.com',
   reporter_email: 'pm@example.com',
-  url: 'https://j.example/browse/PROJ-1',
+  url: 'https://j.example/browse/EX-1',
   created_at: '2026-04-25T08:00:00Z',
   updated_at: '2026-04-25T09:00:00Z',
   synced_at: '2026-04-25T10:00:00Z',
+  status_category: 'new',
+  labels: [],
   ...overrides,
 })
+
+// Configured JIRA instances returned by listTickets. The email is
+// what tabForTicket compares assignees against ("my" tickets).
+const INSTANCES = [{
+  name: 'example', base_url: 'https://example.atlassian.net',
+  auth_type: 'basic' as const, email: 'me@example.com',
+  jql: 'assignee = currentUser()', has_token: true,
+}]
 
 beforeEach(() => {
   vi.clearAllMocks()
   eventBusHandlers.length = 0
   vi.mocked(api.listTickets).mockResolvedValue({
-    tickets: [], configured: true,
+    tickets: [], configured: true, instances: INSTANCES,
   })
   // Default `getTicket` echoes whatever the test seeded into listTickets;
   // individual tests override when they need richer enrichment.
@@ -84,7 +94,7 @@ beforeEach(() => {
     return TICKET({ key })
   })
   vi.mocked(api.syncTickets).mockResolvedValue({
-    count: 0, pruned: 0, jql: 'assignee = currentUser()',
+    count: 0, jql: 'assignee = currentUser()',
   })
   vi.mocked(api.killSession).mockResolvedValue(undefined as unknown as void)
   for (const k of Object.keys(sessionStateMap)) delete sessionStateMap[k]
@@ -101,7 +111,7 @@ describe('TicketsPage', () => {
 
   it('shows the JIRA setup hint when not configured', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: false,
+      tickets: [], configured: false, instances: [],
     })
     render(<TicketsPage />)
     expect(await screen.findByTestId('tickets-setup-hint')).toBeInTheDocument()
@@ -111,7 +121,7 @@ describe('TicketsPage', () => {
 
   it('shows empty-state hint when configured but cache is empty', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     expect(await screen.findByText(/No tickets cached yet/i))
@@ -126,19 +136,52 @@ describe('TicketsPage', () => {
         TICKET({ key: 'A-1', summary: 'first', status: 'In Progress' }),
         TICKET({ key: 'A-2', summary: 'second', status: 'Done' }),
       ],
-      configured: true,
+      configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
-    await screen.findByTestId('ticket-row-A-1')
+    const row1 = await screen.findByTestId('ticket-row-A-1')
     expect(screen.getByText('A-1')).toBeInTheDocument()
     expect(screen.getByText('first')).toBeInTheDocument()
-    expect(screen.getByText('In Progress')).toBeInTheDocument()
-    expect(screen.getByText('Done')).toBeInTheDocument()
+    // Scope status-pill checks to the rows -- the tab bar itself
+    // also contains the text "In Progress".
+    expect(within(row1).getByText('In Progress')).toBeInTheDocument()
+    expect(within(screen.getByTestId('ticket-row-A-2'))
+      .getByText('Done')).toBeInTheDocument()
+  })
+
+  it('switching to the Resolved tab shows only my done tickets', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [
+        TICKET({ key: 'A-1', summary: 'open one', status: 'In Progress',
+                 status_category: 'indeterminate' }),
+        TICKET({ key: 'A-2', summary: 'done one', status: 'Done',
+                 status_category: 'done' }),
+      ],
+      configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    fireEvent.click(await screen.findByTestId('tickets-tab-resolved'))
+    expect(screen.getByTestId('ticket-row-A-2')).toBeInTheDocument()
+    expect(screen.queryByTestId('ticket-row-A-1')).toBeNull()
+  })
+
+  it('shows an empty-tab hint when a tab has no tickets', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [
+        TICKET({ key: 'A-1', summary: 'open one', status: 'In Progress',
+                 status_category: 'indeterminate' }),
+      ],
+      configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    fireEvent.click(await screen.findByTestId('tickets-tab-resolved'))
+    expect(screen.getByTestId('tickets-empty-tab'))
+      .toHaveTextContent(/No resolved tickets/i)
   })
 
   it('opens detail panel when a ticket is clicked', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'X-7' })], configured: true,
+      tickets: [TICKET({ key: 'X-7' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-X-7'))
@@ -149,7 +192,7 @@ describe('TicketsPage', () => {
 
   it('clicking the same row again collapses the detail panel', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'X-7' })], configured: true,
+      tickets: [TICKET({ key: 'X-7' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-X-7'))
@@ -164,7 +207,7 @@ describe('TicketsPage', () => {
     // back to the supplied default on any failure / non-OK response,
     // so the assertion verifies the default branch is wired.
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'X-7' })], configured: true,
+      tickets: [TICKET({ key: 'X-7' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-X-7'))
@@ -193,7 +236,7 @@ describe('TicketsPage', () => {
 
   it('Open session button calls api.openTicketSession (the SessionCard then takes over)', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'SES-1' })], configured: true,
+      tickets: [TICKET({ key: 'SES-1' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.openTicketSession).mockResolvedValue({
       session: 'ticket-SES-1', new: true, ticket_key: 'SES-1',
@@ -213,7 +256,7 @@ describe('TicketsPage', () => {
     // undefined -> TicketTaskCard treats present as null/false and
     // shows the Open Agent button only.
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'NEW-1' })], configured: true,
+      tickets: [TICKET({ key: 'NEW-1' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-NEW-1'))
@@ -225,7 +268,7 @@ describe('TicketsPage', () => {
 
   it('renders SessionCard immediately when a tmux session already exists for the ticket', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'EXIST-1' })], configured: true,
+      tickets: [TICKET({ key: 'EXIST-1' })], configured: true, instances: INSTANCES,
     })
     // Snapshot says this ticket's session is alive and idle.
     sessionStateMap['ticket-EXIST-1'] = { state: 'idle' }
@@ -239,7 +282,7 @@ describe('TicketsPage', () => {
 
   it('Open session error surfaces to the user', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'SES-2' })], configured: true,
+      tickets: [TICKET({ key: 'SES-2' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.openTicketSession).mockRejectedValue(
       new Error('404: ticket not found in cache'))
@@ -252,7 +295,7 @@ describe('TicketsPage', () => {
 
   it('reverse-links to tasks tracking the ticket; clicking calls onSelectLinkedTask', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'LNK-1' })], configured: true,
+      tickets: [TICKET({ key: 'LNK-1' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(TICKET({
       key: 'LNK-1',
@@ -270,7 +313,7 @@ describe('TicketsPage', () => {
 
   it('renders enrichment chips: labels / components / fix versions', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'CHIP-1' })], configured: true,
+      tickets: [TICKET({ key: 'CHIP-1' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(TICKET({
       key: 'CHIP-1',
@@ -307,7 +350,7 @@ describe('TicketsPage', () => {
           parent_key: '',
         }),
       ],
-      configured: true,
+      configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     // Type chip is the new at-a-glance signal -- replaces the old
@@ -315,14 +358,9 @@ describe('TicketsPage', () => {
     // already in the key).
     expect(await screen.findByTestId('ticket-type-EX-1234'))
       .toHaveTextContent('Bug')
-    expect(await screen.findByTestId('ticket-type-INTKEY-5'))
-      .toHaveTextContent('Story')
     // Priority compresses to P0/P1/P2... so a long "High" -> "P1".
-    // P-style strings pass through unchanged.
     expect(screen.getByTestId('ticket-priority-EX-1234'))
       .toHaveTextContent('P1')
-    expect(screen.getByTestId('ticket-priority-INTKEY-5'))
-      .toHaveTextContent('P2')
     // Meta row crumbs only render when populated.
     expect(screen.getByTestId('ticket-assignee-EX-1234'))
       .toHaveTextContent('@me')
@@ -330,6 +368,13 @@ describe('TicketsPage', () => {
       .toHaveTextContent(/streaming, connect\+/)  // "+" indicates overflow
     expect(screen.getByTestId('ticket-parent-EX-1234'))
       .toHaveTextContent('EX-1000')
+    // The unassigned Story row lives on the Triaged tab now.
+    fireEvent.click(screen.getByTestId('tickets-tab-triaged'))
+    expect(await screen.findByTestId('ticket-type-INTKEY-5'))
+      .toHaveTextContent('Story')
+    // P-style strings pass through unchanged.
+    expect(screen.getByTestId('ticket-priority-INTKEY-5'))
+      .toHaveTextContent('P2')
     // The Story row has no assignee / no components / no parent ->
     // the meta row is skipped entirely.
     expect(screen.queryByTestId('ticket-meta-INTKEY-5')).toBeNull()
@@ -337,7 +382,7 @@ describe('TicketsPage', () => {
 
   it('comment box posts to api.postTicketComment', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'CMT-1' })], configured: true,
+      tickets: [TICKET({ key: 'CMT-1' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.postTicketComment).mockResolvedValue({ id: '99' })
     render(<TicketsPage />)
@@ -356,7 +401,7 @@ describe('TicketsPage', () => {
 
   it('comment submit blocks empty body', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'CMT-2' })], configured: true,
+      tickets: [TICKET({ key: 'CMT-2' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-CMT-2'))
@@ -366,7 +411,7 @@ describe('TicketsPage', () => {
 
   it('comment error surfaces to user', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'CMT-3' })], configured: true,
+      tickets: [TICKET({ key: 'CMT-3' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.postTicketComment).mockRejectedValue(
       new Error('502: jira down'))
@@ -381,7 +426,7 @@ describe('TicketsPage', () => {
 
   it('Resolve dropdown loads transitions on click and applies one', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'TRN-1' })], configured: true,
+      tickets: [TICKET({ key: 'TRN-1' })], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.listTicketTransitions).mockResolvedValue({
       transitions: [
@@ -408,7 +453,7 @@ describe('TicketsPage', () => {
 
   it('subscribes to ticket.* events and re-fetches the list', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'EVT-1' })], configured: true,
+      tickets: [TICKET({ key: 'EVT-1' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     await waitFor(() => expect(api.listTickets).toHaveBeenCalledTimes(1))
@@ -432,7 +477,7 @@ describe('TicketsPage', () => {
   it('event for selected ticket also refreshes the detail panel', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
       tickets: [TICKET({ key: 'SEL-1', instance_name: 'primary' })],
-      configured: true,
+      configured: true, instances: INSTANCES,
     })
     // getTicket must echo the instance_name so the page's
     // "is this the selected ticket?" check passes when the event
@@ -455,22 +500,23 @@ describe('TicketsPage', () => {
 
   it('event for a different ticket does not re-fetch the open detail', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'KEEP-1' })], configured: true,
+      tickets: [TICKET({ key: 'KEEP-1' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-KEEP-1'))
     await waitFor(() => expect(api.getTicket).toHaveBeenCalledTimes(1))
     // Event for some OTHER ticket -- list refreshes but detail stays.
     latestTicketHandler()({ ticket_key: 'OTHER-99', changes: ['status'] })
-    // Wait long enough for any spurious detail-fetch to fire.
-    await waitFor(() => expect(api.listTickets).toHaveBeenCalledTimes(2))
+    // Wait long enough for any spurious detail-fetch to fire. Three
+    // listTickets calls: initial + auto-sync refresh + event refresh.
+    await waitFor(() => expect(api.listTickets).toHaveBeenCalledTimes(3))
     expect(api.getTicket).toHaveBeenCalledTimes(1)
   })
 
   it('renders type-aware action buttons matching the ticket', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
       tickets: [TICKET({ key: 'FLK-1', labels: ['flaky-test'] })],
-      configured: true,
+      configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(TICKET({
       key: 'FLK-1', labels: ['flaky-test'],
@@ -491,7 +537,7 @@ describe('TicketsPage', () => {
     vi.mocked(api.listTickets).mockResolvedValue({
       tickets: [TICKET({ key: 'FLK-2', labels: ['flaky-test'],
                           summary: 'test_arrow flaky' })],
-      configured: true,
+      configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(TICKET({
       key: 'FLK-2', labels: ['flaky-test'],
@@ -518,7 +564,7 @@ describe('TicketsPage', () => {
     const writeText = vi.fn()
     Object.assign(navigator, { clipboard: { writeText } })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [TICKET({ key: 'CPY-1' })], configured: true,
+      tickets: [TICKET({ key: 'CPY-1' })], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-CPY-1'))
@@ -547,9 +593,11 @@ describe('TicketsPage', () => {
     // `requestedInstance`); the page fetches that single ticket and
     // pre-selects its detail panel without waiting for a click.
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
-    vi.mocked(api.getTicket).mockResolvedValueOnce(
+    // Persistent (not Once): the mount auto-sync re-fetches the
+    // selected ticket after syncing, so getTicket fires twice.
+    vi.mocked(api.getTicket).mockResolvedValue(
       TICKET({ key: 'DEEP-99', summary: 'deep-linked' }),
     )
     render(<TicketsPage requestedKey="DEEP-99" requestedInstance="prod" />)
@@ -568,7 +616,7 @@ describe('TicketsPage', () => {
     // pruned), getTicket throws -- the page must NOT crash; just
     // fall through with no auto-selection.
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockRejectedValueOnce(new Error('404'))
     render(<TicketsPage requestedKey="GHOST-1" />)
@@ -585,7 +633,7 @@ describe('TicketsPage', () => {
     // detail pane reflects fresh enrichment.
     const t = TICKET({ key: 'SYNC-1' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     render(<TicketsPage />)
     fireEvent.click(await screen.findByTestId('ticket-row-SYNC-1'))
@@ -602,7 +650,7 @@ describe('TicketsPage', () => {
 
   it('+ Add ticket prompts for a key, calls trackTicket, and selects it', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
     const newTicket = TICKET({ key: 'EX-1002', summary: 'flaky test' })
     vi.mocked(api.trackTicket).mockResolvedValue(newTicket)
@@ -624,7 +672,7 @@ describe('TicketsPage', () => {
 
   it('+ Add ticket extracts a JIRA key from a full URL', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.trackTicket).mockResolvedValue(
       TICKET({ key: 'MYPROJ-1886463' }),
@@ -643,12 +691,15 @@ describe('TicketsPage', () => {
 
   it('+ Add ticket surfaces an inline error when the input has no key', async () => {
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [], configured: true,
+      tickets: [], configured: true, instances: INSTANCES,
     })
     const origPrompt = window.prompt
     window.prompt = vi.fn(() => 'not a ticket reference')
     try {
       render(<TicketsPage />)
+      // Let the mount auto-sync settle first -- its setError(null)
+      // would otherwise race the add-error banner below.
+      await waitFor(() => expect(api.syncTickets).toHaveBeenCalled())
       fireEvent.click(await screen.findByTestId('tickets-add'))
       // The page surfaces the error banner; the trackTicket API
       // should NOT be called.
@@ -670,7 +721,7 @@ describe('TicketsPage', () => {
     const t = TICKET({ key: 'EX-1', summary: 'flaky test',
                        instance_name: 'primary' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(t)
 
@@ -681,7 +732,7 @@ describe('TicketsPage', () => {
       problem: 'Stack trace here',
       owner: { assignee: 'alice@example.com', reporter: 'bob@example.com',
                components: ['SQL Core'], labels: ['flaky'],
-               project_key: 'ES' },
+               project_key: 'EX' },
       files_referenced: ['src/Foo.py'],
       blame: [],
       similar_tickets: [],
@@ -718,40 +769,10 @@ describe('TicketsPage', () => {
     }
   })
 
-  it('queue groups tickets by category (Flaky tests / ES tickets / SC tickets / EX tickets)', async () => {
-    vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [
-        TICKET({ key: 'EX-100', summary: 'Failing target detected: //widget:foo',
-                 labels: ['testman-automation'] }),
-        TICKET({ key: 'EX-200', summary: 'API parity request',
-                 labels: [] }),
-        TICKET({ key: 'ALT-300', summary: 'Refactor', labels: [] }),
-        TICKET({ key: 'EX-400', summary: 'Repo feature', labels: [] }),
-      ],
-      configured: true,
-    })
-    render(<TicketsPage />)
-    // All four group headers render; the testman-automation row goes
-    // into "Flaky tests" rather than the bare ES bucket.
-    await screen.findByTestId('tickets-grouped-list')
-    expect(screen.getByTestId('tickets-group-Flaky-tests')).toBeInTheDocument()
-    expect(screen.getByTestId('tickets-group-EX-tickets')).toBeInTheDocument()
-    expect(screen.getByTestId('tickets-group-ALT-tickets')).toBeInTheDocument()
-    // Flaky tests group precedes EX (priority 0 vs 1).
-    const groups = screen.getAllByText(/^(Flaky tests|EX tickets|ALT tickets)/)
-    expect(groups[0].textContent).toMatch(/Flaky tests/)
-    // EX-100 (flaky) belongs in the Flaky group, NOT in ES tickets.
-    const flakyGroup = screen.getByTestId('tickets-group-Flaky-tests')
-    expect(flakyGroup.textContent).toContain('EX-100')
-    const esGroup = screen.getByTestId('tickets-group-EX-tickets')
-    expect(esGroup.textContent).not.toContain('EX-100')
-    expect(esGroup.textContent).toContain('EX-200')
-  })
-
   it('Triage renders Phase-3 fields: most-likely team, owner, similar tickets', async () => {
     const t = TICKET({ key: 'EX-9', instance_name: 'primary' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(t)
     const triageBody = {
@@ -760,7 +781,7 @@ describe('TicketsPage', () => {
                 instance_name: 'primary' },
       problem: 'stack trace',
       owner: { assignee: '', reporter: 'auto@x',
-               components: [], labels: [], project_key: 'ES' },
+               components: [], labels: [], project_key: 'EX' },
       files_referenced: ['widget/foo'],
       blame: [],
       similar_tickets: [
@@ -802,7 +823,7 @@ describe('TicketsPage', () => {
   it('Triage report renders git-blame rows when backend returns non-empty blame', async () => {
     const t = TICKET({ key: 'EX-3', instance_name: 'primary' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(t)
 
@@ -812,7 +833,7 @@ describe('TicketsPage', () => {
                 instance_name: 'primary' },
       problem: 'Stack trace',
       owner: { assignee: 'a@x', reporter: 'b@x',
-               components: [], labels: [], project_key: 'ES' },
+               components: [], labels: [], project_key: 'EX' },
       files_referenced: ['sql/Foo.py'],
       blame: [{
         file: 'sql/Foo.py',
@@ -854,7 +875,7 @@ describe('TicketsPage', () => {
   it('Triage button surfaces a backend error inline (no crash)', async () => {
     const t = TICKET({ key: 'EX-2', instance_name: 'primary' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockResolvedValue(t)
     const origFetch = globalThis.fetch
@@ -879,7 +900,7 @@ describe('TicketsPage', () => {
     // fall back to the row we already have in `tickets`.
     const t = TICKET({ key: 'STALE-1', summary: 'stale row' })
     vi.mocked(api.listTickets).mockResolvedValue({
-      tickets: [t], configured: true,
+      tickets: [t], configured: true, instances: INSTANCES,
     })
     vi.mocked(api.getTicket).mockRejectedValueOnce(new Error('404'))
     render(<TicketsPage />)
@@ -890,5 +911,89 @@ describe('TicketsPage', () => {
     // Multiple matches expected (queue list cell + detail header);
     // both reflect the same source row, which is the contract.
     expect(screen.getAllByText(/stale row/).length).toBeGreaterThan(0)
+  })
+})
+
+describe('TicketsPage tabs + auto-sync', () => {
+  it('auto-syncs once on mount when instances are configured', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [TICKET()], configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    await waitFor(() => expect(api.syncTickets).toHaveBeenCalledTimes(1))
+  })
+
+  it('does not auto-sync when no instances are configured', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [], configured: false, instances: [],
+    })
+    render(<TicketsPage />)
+    await waitFor(() => expect(api.listTickets).toHaveBeenCalled())
+    expect(api.syncTickets).not.toHaveBeenCalled()
+  })
+
+  it('renders four tabs in order with counts; Open is default', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [
+        TICKET({ key: 'EX-1' }),                                   // open
+        TICKET({ key: 'EX-2', status_category: 'indeterminate' }), // in progress
+        TICKET({ key: 'EX-3', status_category: 'done' }),          // resolved
+        TICKET({ key: 'EX-4', assignee_email: 'other@x.com' }),    // triaged
+        TICKET({ key: 'EX-5', assignee_email: '' }),               // triaged (unassigned)
+      ],
+      configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    const tabs = await screen.findByTestId('tickets-tabs')
+    const buttons = tabs.querySelectorAll('button')
+    expect(Array.from(buttons).map((b) => b.textContent))
+      .toEqual(['Open (1)', 'In Progress (1)', 'Resolved (1)', 'Triaged (2)'])
+    // Default tab is Open -> only EX-1 visible.
+    expect(screen.getByText('EX-1')).toBeInTheDocument()
+    expect(screen.queryByText('EX-4')).not.toBeInTheDocument()
+  })
+
+  it('triaged tab shows Unassigned group above kind groups', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [
+        TICKET({ key: 'EX-4', assignee_email: 'other@x.com' }),
+        TICKET({ key: 'EX-5', assignee_email: '' }),
+      ],
+      configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    fireEvent.click(await screen.findByTestId('tickets-tab-triaged'))
+    const list = await screen.findByTestId('tickets-grouped-list')
+    expect(screen.getByTestId('tickets-group-Unassigned'))
+      .toBeInTheDocument()
+    // Unassigned renders before the kind groups.
+    const groupIds = Array.from(
+      list.querySelectorAll('[data-testid^="tickets-group-"]'),
+    ).map((el) => el.getAttribute('data-testid'))
+    expect(groupIds[0]).toBe('tickets-group-Unassigned')
+    expect(screen.getByText('EX-5')).toBeInTheDocument()
+  })
+
+  it('groups a tab: semantic groups first, then by project prefix', async () => {
+    vi.mocked(api.listTickets).mockResolvedValue({
+      tickets: [
+        TICKET({ key: 'INTKEY-1' }),
+        TICKET({ key: 'EX-10', labels: ['testman-automation'] }),
+        TICKET({ key: 'EX-11', labels: ['benchmarking-regression'] }),
+        TICKET({ key: 'EX-12' }),
+      ],
+      configured: true, instances: INSTANCES,
+    })
+    render(<TicketsPage />)
+    const list = await screen.findByTestId('tickets-grouped-list')
+    const groupIds = Array.from(
+      list.querySelectorAll('[data-testid^="tickets-group-"]'),
+    ).map((el) => el.getAttribute('data-testid'))
+    // Flaky (prio 1) -> Performance (prio 2) -> prefix groups (prio 3,
+    // alphabetic): EX before INTKEY. No prefix is special-cased.
+    expect(groupIds).toEqual([
+      'tickets-group-Flaky-tests', 'tickets-group-Performance',
+      'tickets-group-EX', 'tickets-group-INTKEY',
+    ])
   })
 })

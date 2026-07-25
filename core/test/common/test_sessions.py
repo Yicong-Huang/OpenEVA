@@ -1,6 +1,8 @@
 """Unit tests for core/common.sessions.py -- direct calls to core functions
 with patched_server + mock_tmux fixtures (no real tmux or GitHub)."""
 
+import json
+
 import common
 from unittest.mock import patch, MagicMock
 
@@ -15,6 +17,27 @@ from common.sessions import (
     get_session_status,
     build_background,
 )
+
+
+def _strip_env_prefix(argv):
+    if argv[0] != "env":
+        return argv
+    i = 1
+    while i < len(argv) and "=" in argv[i]:
+        i += 1
+    return argv[i:]
+
+
+@pytest.fixture
+def claude_new_session(patched_server):
+    """Pin the new-session agent to a Claude-family binary so these
+    session-mechanics tests keep asserting the stable `-n` /
+    `--append-system-prompt` argv shape, independent of whatever
+    new-session default a given install configures."""
+    from common import agent as _agent
+    patched_server._db.set_setting(_agent.KEY_NEW_SESSION_AGENT_IMPL,
+                                   "claude")
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +55,7 @@ class TestOpenSession:
         idx = argv.index("--append-system-prompt")
         return argv[idx + 1]
 
-    def test_new_session_creates_and_launches(self, patched_server, mock_tmux):
+    def test_new_session_creates_and_launches(self, patched_server, mock_tmux, claude_new_session):
         """First open for a task creates session + launches agent with bg in argv."""
         result = open_session(
             task_id="task-b",
@@ -47,7 +70,7 @@ class TestOpenSession:
         assert "[Background]" in self._bg_arg(mock_tmux)
         mock_tmux["launch_argv"].assert_called_once()
 
-    def test_existing_session_tmux_dead_relaunches(self, patched_server, mock_tmux):
+    def test_existing_session_tmux_dead_relaunches(self, patched_server, mock_tmux, claude_new_session):
         """Re-opening a recorded session whose tmux died: relaunches with fresh bg."""
         patched_server._db.create_session("task-b", "test-proj", "task-b")
         mock_tmux["exists"].return_value = False
@@ -75,7 +98,7 @@ class TestOpenSession:
         # No tmux launch -- the agent is already running with the original bg
         mock_tmux["launch_argv"].assert_not_called()
 
-    def test_open_session_with_pr_context(self, patched_server, mock_tmux):
+    def test_open_session_with_pr_context(self, patched_server, mock_tmux, claude_new_session):
         """PR context (pr_number + pr_repo) appears in injected background."""
         result = open_session(
             task_id="task-b",
@@ -129,7 +152,7 @@ class TestOpenSession:
         )
         assert "Do something custom" in result["prompt"]
 
-    def test_open_session_includes_dependency_statuses(self, patched_server, mock_tmux):
+    def test_open_session_includes_dependency_statuses(self, patched_server, mock_tmux, claude_new_session):
         """Background system prompt includes dependency status."""
         open_session(
             task_id="task-b",
@@ -201,7 +224,7 @@ class TestOpenSessionEvents:
     """Event emission for open_session -- drives UI refresh without
     waiting for agent's SessionStart hook (2-5s latency)."""
 
-    def test_new_session_emits_session_opened(self, patched_server, mock_tmux):
+    def test_new_session_emits_session_opened(self, patched_server, mock_tmux, claude_new_session):
         import app_state
         mock_tmux["exists"].return_value = False
         collected = []
@@ -247,6 +270,19 @@ class TestListAllSessions:
         result = list_all_sessions()
         sess = result["test-proj"]["sessions"][0]
         assert sess["running"] is True
+
+    def test_skips_non_task_session_rows(self, patched_server, mock_tmux):
+        mock_tmux["exists"].return_value = False
+        patched_server._db.create_session("task-sess", "test-proj", "task-sess")
+        patched_server._db.create_session("ticket-OPS-1", "", "ticket-OPS-1")
+        patched_server._db.create_session("review-repo-1", "", "review-repo-1")
+        patched_server._db.create_session("cron-job-1", "", "cron-job-1")
+
+        result = list_all_sessions()
+        assert list(result.keys()) == ["test-proj"]
+        assert [s["tmux_name"] for s in result["test-proj"]["sessions"]] == [
+            "task-sess",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +402,39 @@ class TestResumeSession:
         )
         result = resume_session("u-sess")
         assert result["action"] == "resumed"
-        # Verify the exact argv: agent resume <uuid> (NOT agent --resume).
+        # A transcript UUID resumes the LOCAL conversation via
+        # `--resume` (cloud-independent), NOT the cloud `resume`
+        # subcommand -- the latter dies with "No sessions found" once
+        # the cloud entry is gone.
         call = mock_tmux["launch_argv"].call_args
         argv = call.args[2] if len(call.args) >= 3 else call.kwargs.get("argv")
-        assert argv[0] in ("agent", "claude") and argv[1:] == ["resume", "11111111-2222-3333-4444-555555555555"]
+        argv = _strip_env_prefix(argv)
+        # Legacy row (empty agent_impl) resumes with the default agent.
+        # A transcript UUID always uses `--resume` (cwd-local resume).
+        assert argv[0] == "claude"
+        assert argv[1:] == ["--resume", "11111111-2222-3333-4444-555555555555"]
+
+    def test_local_resume_launches_from_transcript_cwd(
+        self, patched_server, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """Local resume must launch from the directory the session was
+        created in (recovered from the transcript), since
+        `claude --resume` is cwd-sensitive."""
+        import common.sessions as _sessions
+        uuid = "abcdef01-2345-6789-abcd-ef0123456789"
+        proj_dir = tmp_path / "-home-yicong-huang-spark-wt"
+        proj_dir.mkdir()
+        (proj_dir / f"{uuid}.jsonl").write_text(
+            json.dumps({"cwd": "/home/yicong.huang/spark-wt", "type": "user"}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        mock_tmux["exists"].return_value = False
+        patched_server._db.create_session("wt-sess", "test-proj", "wt-sess")
+        patched_server._db.update_session("wt-sess", agent_session_id=uuid)
+        resume_session("wt-sess")
+        call = mock_tmux["launch_argv"].call_args
+        assert call.args[1] == "/home/yicong.huang/spark-wt"
 
     def test_relaunches_fresh_when_no_uuid(self, patched_server, mock_tmux):
         """Legacy session row without an agent_session_id -- start fresh
@@ -381,7 +446,9 @@ class TestResumeSession:
         assert result["action"] == "relaunched"
         call = mock_tmux["launch_argv"].call_args
         argv = call.args[2] if len(call.args) >= 3 else call.kwargs.get("argv")
-        assert argv[0] in ("agent", "claude") and argv[1] == "-n"
+        argv = _strip_env_prefix(argv)
+        # Legacy row (empty agent_impl) relaunches with the default agent.
+        assert argv[0] == "claude" and argv[1] == "-n"
         assert argv[2] == "legacy"
 
     def test_defaults_to_home_working_dir(self, patched_server, mock_tmux):

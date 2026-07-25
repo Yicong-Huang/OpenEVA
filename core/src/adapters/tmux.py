@@ -28,12 +28,39 @@ import time
 _HAS_SESSION_TIMEOUT = 5
 _CAPTURE_TIMEOUT = 5
 _SEND_KEYS_TIMEOUT = 5
+_SCROLL_TIMEOUT = 3
 _LAUNCH_TIMEOUT = 10
 _KILL_TIMEOUT = 5
 # Time we give the agent to clean up after Ctrl+C before we force-kill tmux.
 # 500ms is enough for the agent to flush its .jsonl log and close file handles,
 # short enough that the UI doesn't feel stalled on kill.
 _GRACEFUL_KILL_DELAY = 0.5
+
+# Input-prompt arrow glyphs, one per agent TUI family. Readiness /
+# idle-state detection matches a line that is exactly one of these (or
+# the glyph followed by whitespace):
+#   ❯  ❯  -- Claude Code family (e.g. claude)
+#   ›  ›  -- OpenAI Codex family
+# Matching the union is safe: neither TUI emits the other's arrow as a
+# standalone line, and keeping it agent-agnostic here avoids threading a
+# session->agent lookup into this low-level adapter.
+PROMPT_GLYPHS = ("❯", "›")
+
+
+def line_is_prompt(stripped: str) -> bool:
+    """True iff `stripped` is an agent input-prompt line.
+
+    A prompt line is exactly a prompt glyph, or a glyph immediately
+    followed by whitespace (Claude uses U+00A0 between its arrow and the
+    typed text; Codex uses a normal space). Shared by every readiness /
+    state-detection site so they stay consistent across agent TUIs."""
+    for glyph in PROMPT_GLYPHS:
+        if stripped == glyph:
+            return True
+        if (stripped.startswith(glyph) and len(stripped) > 1
+                and stripped[1].isspace()):
+            return True
+    return False
 
 
 def session_exists(name: str) -> bool:
@@ -98,6 +125,81 @@ def send_keys(session_name: str, text: str) -> None:
             check=True, timeout=_SEND_KEYS_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        pass
+
+
+def _pane_grabs_mouse(session_name: str) -> bool:
+    """True when the program in the pane enabled mouse tracking (e.g. an
+    interactive TUI like the agent). Such apps own scrolling -- they
+    redraw in tmux's alternate screen, which has no scrollback -- so the
+    only way to page their history is to feed them wheel reports."""
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", session_name,
+             "#{mouse_any_flag}"],
+            capture_output=True, timeout=_SCROLL_TIMEOUT, text=True,
+        )
+        return r.stdout.strip() == "1"
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+# SGR mouse wheel reports (mode 1006): button 64 = wheel up, 65 = down.
+# Sent at cell (1,1); the agent only needs the button to scroll.
+_WHEEL_SGR = {"up": "\x1b[<64;1;1M", "down": "\x1b[<65;1;1M"}
+
+
+def scroll_pane(session_name: str, direction: str, lines: int = 3) -> None:
+    """Scroll the terminal `lines` rows in `direction` ('up'/'down').
+
+    Two transports, picked by what the pane's program wants:
+
+      - **App grabbed the mouse** (interactive TUI / the agent): it runs
+        in the alt-screen with no tmux scrollback and scrolls its OWN
+        viewport, so we feed it synthesized wheel reports (one per
+        line). The browser xterm deliberately stays out of mouse mode
+        (so plain-drag selection works), so this server-side forwarding
+        is what makes the wheel reach the app.
+      - **Plain pane** (shell, non-mouse output): drive tmux copy-mode
+        over the pane's real scrollback. Scroll-up enters copy-mode with
+        `-e` (a later scroll past the bottom auto-exits to live tail);
+        scroll-down only acts when already in copy-mode.
+
+    `lines` is clamped 1..50. Every failure is swallowed -- a missing
+    session or not-in-a-mode state must never raise into the request."""
+    if direction not in ("up", "down"):
+        return
+    n = max(1, min(int(lines), 50))
+    try:
+        if _pane_grabs_mouse(session_name):
+            seq = _WHEEL_SGR[direction] * n
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l", seq],
+                check=False, capture_output=True, timeout=_SCROLL_TIMEOUT,
+            )
+            return
+        if direction == "up":
+            # Idempotent: re-entering copy-mode while already in it is a
+            # no-op. `-e` = exit copy-mode when a scroll-down passes the
+            # bottom, so the terminal resumes live tailing on its own.
+            subprocess.run(
+                ["tmux", "copy-mode", "-e", "-t", session_name],
+                check=False, capture_output=True, timeout=_SCROLL_TIMEOUT,
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name,
+                 "-X", "-N", str(n), "scroll-up"],
+                check=False, capture_output=True, timeout=_SCROLL_TIMEOUT,
+            )
+        else:
+            # No-op (and a harmless "not in a mode" on stderr, which
+            # capture_output discards) when the pane isn't in copy-mode.
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name,
+                 "-X", "-N", str(n), "scroll-down"],
+                check=False, capture_output=True, timeout=_SCROLL_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
         pass
 
 
@@ -201,7 +303,6 @@ def wait_until_ready(session_name: str, timeout_secs: int = 30) -> bool:
     """
     import time as _time
     deadline = _time.time() + max(1, timeout_secs)
-    PROMPT_GLYPH = "❯"  # the > triangle the agent shows in its input row
     while _time.time() < deadline:
         if not session_exists(session_name):
             _time.sleep(0.5)
@@ -209,7 +310,10 @@ def wait_until_ready(session_name: str, timeout_secs: int = 30) -> bool:
         out = capture_output(session_name, lines=10)
         for line in out.splitlines():
             stripped = line.strip()
-            if stripped == PROMPT_GLYPH or stripped.startswith(PROMPT_GLYPH + " "):
+            # Match either agent family's input-prompt arrow (Claude's
+            # `❯` or Codex's `›`) so paste lands cleanly regardless of
+            # which agent launched the session.
+            if line_is_prompt(stripped):
                 return True
             if "? for shortcuts" in stripped:
                 return True

@@ -1,5 +1,15 @@
 import type { Project, Task, PR, PRDetail, ActionDef, EvaEvent, ForkableData, GraphData, PendingReviewComment } from './types'
 
+export interface ProjectManagerSession {
+  project_id: string
+  project_name: string
+  tmux_name: string
+  running: boolean
+  status?: string
+  created_at?: string
+  updated_at?: string
+}
+
 async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(path, options)
   if (!resp.ok) {
@@ -44,6 +54,8 @@ export const api = {
   getProjectManager: (pid: string) =>
     fetchApi<{ project_id: string; tmux_name: string; running: boolean; status?: string }>(
       `/api/projects/${encodeURIComponent(pid)}/manager`),
+  listProjectManagers: () =>
+    fetchApi<{ sessions: ProjectManagerSession[] }>('/api/project-managers'),
   killProjectManager: (pid: string) =>
     fetchApi<{ killed: boolean; tmux_name?: string }>(
       `/api/projects/${encodeURIComponent(pid)}/manager`, { method: 'DELETE' }),
@@ -54,6 +66,11 @@ export const api = {
   resumeSession: (name: string) =>
     post<{ session: string; action: 'resumed' | 'relaunched' | 'noop'; running: boolean; agent_session_id?: string }>(
       `/api/sessions/${encodeURIComponent(name)}/resume`, {}),
+  // Kill the live tmux and resume the SAME agent session by UUID -- for
+  // picking up an agent/config update without losing the conversation.
+  restartSession: (name: string) =>
+    post<{ session: string; action: 'resumed' | 'relaunched' | 'noop'; running: boolean; agent_session_id?: string; restarted?: boolean }>(
+      `/api/sessions/${encodeURIComponent(name)}/restart`, {}),
   rebuildSessions: () => post<{ rebuilt: string[]; skipped: string[] }>('/api/sessions/rebuild', {}),
   killSessionsByStatus: (statuses: string[]) => post<{ killed: string[] }>('/api/sessions/kill-by-status', { statuses }),
   waitReady: (name: string, timeout = 30) => fetchApi<{ ready: boolean }>(`/api/sessions/${encodeURIComponent(name)}/wait-ready?timeout=${timeout}`),
@@ -132,12 +149,15 @@ export const api = {
   saveWorkLog: (date: string, content: string) => fetchApi<{ ok: boolean }>(`/api/worklog/${date}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) }),
   getUberEats: () => fetchApi<Record<string, unknown>>('/api/ubereats'),
   search: (q: string, limit = 20) => fetchApi<{ results: Array<{
-    type: 'task' | 'pr' | 'session'
+    type: 'task' | 'ticket' | 'review' | 'pr' | 'session'
     title: string
     subtitle: string
     badge: string
     project_id: string
     task_id?: string | null
+    ticket_key?: string
+    ticket_instance?: string
+    review_url?: string
     pr_number?: number
     pr_repo?: string
   }> }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
@@ -233,12 +253,11 @@ export const api = {
     ),
   syncTickets: () =>
     fetchApi<{
-      instances?: Array<{ name: string; count: number; pruned: number; jql: string }>
+      instances?: Array<{ name: string; count: number; jql: string }>
       total_count?: number
       errors?: Array<{ name: string; error: string }>
       // Legacy single-instance shape preserved for back-compat.
       count?: number
-      pruned?: number
       jql?: string
     }>('/api/tickets/sync', {
       method: 'POST',
@@ -345,8 +364,20 @@ export interface Ticket {
   parent_key?: string
   resolution?: string
   status_category?: string
-  category?: string  // project prefix, e.g. EX / ES / INTKEY
+  // Severity custom field (enterprise JIRA's real triage axis).
+  severity?: string
+  // True when manually pinned via "+ Add ticket" -- never auto-pruned.
+  pinned?: boolean
+  // Timestamp the ticket left its instance JQL (resolved / reassigned).
+  // Empty while the ticket is still active in the queue.
+  left_jql_at?: string
+  category?: string  // project prefix, e.g. ABC / PROJ / INTKEY
   linked_tasks?: { project: string; task_id: string; status?: string }[]
+  // A ticket IS a task row, so the detail view carries the same
+  // task-keyed history + PRs as any project task. Populated only on
+  // the single-ticket detail path (getTicket / trackTicket).
+  history?: Array<{ ts: string; text: string }>
+  prs?: PR[]
   // tmux name of the agent session bound to this ticket. Used as
   // the key into the global session-status snapshot; live state
   // (alive / status) is owned by that service, not the row.

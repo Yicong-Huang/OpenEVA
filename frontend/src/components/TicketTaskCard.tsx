@@ -4,9 +4,12 @@ import type { TaskStatus } from '../types'
 import { StatusDot } from './StatusDot'
 import { SessionCard } from './SessionCard'
 import { TicketLink } from './TicketLink'
+import { PRNode } from './PRNode'
 import { useSessionState } from '../hooks/SessionStatusProvider'
 import { isLive } from '../utils/sessionState'
 import { applicableActions, renderPrompt } from '../utils/ticketActions'
+import { classifyHistoryEntry, historyKindColor } from '../utils/taskHelpers'
+import { formatLocalShort } from '../utils'
 import { api } from '../api'
 
 /**
@@ -119,6 +122,11 @@ export function TicketTaskCard({ ticket }: Props) {
   const status = mapStatus(ticket.status)
   const actions = applicableActions(ticket)
   const updatedShort = (ticket.updated_at || '').substring(0, 10)
+  // A ticket IS a task row, so the detail view carries the same
+  // task-keyed history + PRs as a project TaskCard. Populated by the
+  // single-ticket fetch (getTicket / trackTicket).
+  const history = ticket.history ?? []
+  const prs = ticket.prs ?? []
 
   return (
     <div data-testid="ticket-task-card" className={`task-card st-${status}`}>
@@ -182,7 +190,50 @@ export function TicketTaskCard({ ticket }: Props) {
             </span>
           </div>
         )}
+        {history.length > 0 && (
+          <div className="task-card-field" style={{ alignItems: 'flex-start' }}>
+            <span className="label">History</span>
+            <span className="value" style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 10 }}>
+              {history.slice(0, 5).map((e, i) => {
+                const kind = classifyHistoryEntry(e.text)
+                const dotColor = historyKindColor(kind)
+                return (
+                  <span key={`${e.ts}-${i}`}
+                        data-history-kind={kind}
+                        style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    {dotColor && (
+                      <span aria-hidden="true" title={kind.replace('_', ' ')}
+                            style={{ width: 6, height: 6, borderRadius: '50%',
+                                     background: dotColor, flexShrink: 0 }} />
+                    )}
+                    <span style={{ color: 'var(--text-faint)', whiteSpace: 'nowrap',
+                                   fontFamily: 'monospace' }} title={e.ts}>
+                      {formatLocalShort(e.ts)}
+                    </span>
+                    <span style={{ color: kind === 'manual' ? 'var(--text-dim)' : 'var(--text)' }}>
+                      {e.text}
+                    </span>
+                  </span>
+                )
+              })}
+              {history.length > 5 && (
+                <span style={{ color: 'var(--text-faint)', fontSize: 9 }}>
+                  + {history.length - 5} older
+                </span>
+              )}
+            </span>
+          </div>
+        )}
       </div>
+
+      {/* Related PRs -- same task-keyed prs table as project tasks. */}
+      {prs.length > 0 && (
+        <div data-testid="ticket-task-prs" className="task-card-prs">
+          {prs.map((pr) => (
+            <PRNode key={pr.number} pr={pr} showMeta />
+          ))}
+        </div>
+      )}
 
       {!present && !opening && (
         <div data-testid="open-agent">

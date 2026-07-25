@@ -232,10 +232,42 @@ def _register_core_jobs():
         except Exception as e:
             print(f"[review] full sync failed: {e}", flush=True)
 
-    sched.add_job(_review_sync_dirty, "interval", seconds=60,
-                  id="review_sync_dirty", replace_existing=True)
-    sched.add_job(_review_sync_full, "interval", seconds=600,
-                  id="review_sync_full", replace_existing=True)
+    from common import settings as _review_settings
+    sched.add_job(
+        _review_sync_dirty, "interval",
+        seconds=_review_settings.get_interval_seconds(
+            _review_settings.KEY_INTERVAL_REVIEW_SYNC_DIRTY, 60),
+        id="review_sync_dirty", replace_existing=True)
+    sched.add_job(
+        _review_sync_full, "interval",
+        seconds=_review_settings.get_interval_seconds(
+            _review_settings.KEY_INTERVAL_REVIEW_SYNC_FULL, 1800),
+        id="review_sync_full", replace_existing=True)
+
+    # Task PR sync: two cadences mirroring the review-queue pattern.
+    # Fast dirty-only pass consumes the flags the notification poller
+    # sets on task PRs (cheap -- no-op when nothing is dirty); full pass
+    # is a backstop that refreshes every open task PR so a dropped
+    # notification doesn't leave a PR permanently stale. Keeps the DB
+    # fresh so opening a task reads current data (DB as cache).
+    def _pr_sync_dirty():
+        from services.pr_sync_service import sync_task_prs_dirty_once
+        sync_task_prs_dirty_once()
+
+    def _pr_sync_full():
+        from services.pr_sync_service import sync_task_prs_full_once
+        sync_task_prs_full_once()
+
+    sched.add_job(
+        _pr_sync_dirty, "interval",
+        seconds=_review_settings.get_interval_seconds(
+            _review_settings.KEY_INTERVAL_PR_SYNC_DIRTY, 60, min_s=30),
+        id="pr_sync_dirty", replace_existing=True)
+    sched.add_job(
+        _pr_sync_full, "interval",
+        seconds=_review_settings.get_interval_seconds(
+            _review_settings.KEY_INTERVAL_PR_SYNC_FULL, 1800, min_s=120),
+        id="pr_sync_full", replace_existing=True)
 
     # Session-state reaper: detects sessions that died externally
     # (machine reboot, `tmux kill-server`, host recovery recovery without socket).
@@ -255,12 +287,19 @@ def _register_core_jobs():
     # so the Tickets page feels live without manual sync clicks. The
     # tick itself is a no-op when JIRA isn't configured.
     from services import jira_sync as _jira_sync
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZoneInfo
     sched.add_job(
         _jira_sync.sync_tickets_once,
         "interval",
         seconds=_jira_sync.get_interval_seconds(),
         id=_jira_sync.JIRA_SYNC_JOB_ID,
         replace_existing=True,
+        # Run one tick immediately on boot so a freshly-restarted server
+        # reflects JIRA-side changes (resolved / reassigned tickets)
+        # without waiting out the full interval. `sync_tickets_once` is a
+        # no-op when JIRA isn't configured, so this is safe on first run.
+        next_run_time=_dt.now(_ZoneInfo("America/Los_Angeles")),
     )
 
 

@@ -37,6 +37,7 @@ const mockPRDetail: PRDetailType = {
 
 vi.mock('../hooks/useEventBus', () => ({
   useEventBus: vi.fn(),
+  emitLocalEvent: vi.fn(),
 }))
 
 // Mock the api module
@@ -53,16 +54,56 @@ vi.mock('../api', () => ({
     addPendingComment: vi.fn().mockResolvedValue({ review_id: 1, created: true }),
     deletePendingComment: vi.fn().mockResolvedValue({ ok: true }),
     submitPendingReview: vi.fn().mockResolvedValue({ ok: true, event: 'APPROVE' }),
+    markPrSeen: vi.fn().mockResolvedValue({ ok: true }),
+    markReviewSeen: vi.fn().mockResolvedValue({ ok: true }),
   },
 }))
 
 import { api } from '../api'
+import { emitLocalEvent } from '../hooks/useEventBus'
 
 const mockedGetPRDetail = vi.mocked(api.getPRDetail)
 
 describe('PRDetail', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  describe('marks comments seen on open', () => {
+    it('task-PR context (no reviewUrl): calls markPrSeen with the number', async () => {
+      mockedGetPRDetail.mockResolvedValue(mockPRDetail)
+      render(<PRDetail repo="org/repo" number={42} projectId="p1" taskId="t1" />)
+      await waitFor(() => {
+        expect(api.markPrSeen).toHaveBeenCalledWith(42)
+      })
+      // task-PR context must not touch the review-queue endpoint.
+      expect(api.markReviewSeen).not.toHaveBeenCalled()
+    })
+
+    it('broadcasts a local github event after marking seen so list badges clear', async () => {
+      mockedGetPRDetail.mockResolvedValue(mockPRDetail)
+      render(<PRDetail repo="org/repo" number={42} projectId="p1" taskId="t1" />)
+      await waitFor(() => {
+        expect(emitLocalEvent).toHaveBeenCalledWith('github.pr.seen', expect.objectContaining({ number: 42 }))
+      })
+    })
+
+    it('review-queue context (reviewUrl set): calls markReviewSeen with the url', async () => {
+      mockedGetPRDetail.mockResolvedValue(mockPRDetail)
+      const url = 'https://github.com/org/repo/pull/42'
+      render(<PRDetail repo="org/repo" number={42} reviewUrl={url} />)
+      await waitFor(() => {
+        expect(api.markReviewSeen).toHaveBeenCalledWith(url)
+      })
+      expect(api.markPrSeen).not.toHaveBeenCalled()
+    })
+
+    it('does not mark seen while the detail is still loading', () => {
+      mockedGetPRDetail.mockReturnValue(new Promise(() => {}))
+      render(<PRDetail repo="org/repo" number={42} projectId="p1" taskId="t1" />)
+      expect(api.markPrSeen).not.toHaveBeenCalled()
+      expect(api.markReviewSeen).not.toHaveBeenCalled()
+    })
   })
 
   it('shows loading state initially', () => {
@@ -759,6 +800,39 @@ describe('PRDetail', () => {
     expect(updatedRefreshBtn.querySelector('span')).toBeNull()
 
     globalThis.fetch = origFetch
+  })
+
+  it('github.pr.seen event does NOT flag the open card as having an update', async () => {
+    const { useEventBus } = await import('../hooks/useEventBus')
+    const mockedUseEventBus = vi.mocked(useEventBus)
+    let eventCallback: ((event: Record<string, unknown>) => void) | null = null
+    mockedUseEventBus.mockImplementation(((_pattern: string, cb: (event: Record<string, unknown>) => void) => {
+      eventCallback = cb
+    }) as unknown as typeof useEventBus)
+
+    mockedGetPRDetail.mockResolvedValue(mockPRDetail)
+    const { act } = await import('@testing-library/react')
+    render(<PRDetail repo="org/repo" number={42} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('pr-detail')).toBeInTheDocument()
+    })
+
+    const refreshBtn = screen.getByTestId('pr-refresh-btn')
+    expect(refreshBtn.querySelector('span')).toBeNull()
+
+    // Our own "badge cleared" nudge must be ignored by the update flag.
+    await act(async () => {
+      if (eventCallback) eventCallback({ type: 'github.pr.seen', number: 42 })
+    })
+    expect(refreshBtn.querySelector('span')).toBeNull()
+
+    // A real github event still flags the update.
+    await act(async () => {
+      if (eventCallback) eventCallback({ type: 'github.comment', number: 42 })
+    })
+    await waitFor(() => {
+      expect(refreshBtn.querySelector('span')).not.toBeNull()
+    })
   })
 
   it('title edit: Save button triggers updatePRTitle', async () => {

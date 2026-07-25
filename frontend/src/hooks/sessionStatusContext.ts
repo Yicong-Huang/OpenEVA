@@ -1,5 +1,5 @@
 import { createContext } from 'react'
-import type { CronJob, Ticket } from '../api'
+import type { CronJob, ProjectManagerSession, Ticket } from '../api'
 import type { PR, Task } from '../types'
 
 /**
@@ -95,12 +95,14 @@ export interface SessionStatusValue {
   cronJobs: CronJob[]
   reviews: LiveReview[]
   tickets: Ticket[]
+  projectManagers: ProjectManagerSession[]
 
   // Filtered to entries with a live session (state != 'stopped' &&
   // state != 'unknown'), pre-sorted for stable chip ordering.
   liveCronJobs: CronJob[]
   liveReviews: LiveReview[]
   liveTickets: Ticket[]
+  liveProjectManagers: ProjectManagerSession[]
 
   // Aggregated counts, computed from the snapshot map only.
   counts: SessionCounts
@@ -115,6 +117,7 @@ export interface SessionStatusValue {
   refetchCron: () => void
   refetchReviews: () => void
   refetchTickets: () => void
+  refetchProjectManagers: () => void
   refetchAll: () => void
 }
 
@@ -125,9 +128,11 @@ export const DEFAULT_SESSION_STATUS: SessionStatusValue = {
   cronJobs: [],
   reviews: [],
   tickets: [],
+  projectManagers: [],
   liveCronJobs: [],
   liveReviews: [],
   liveTickets: [],
+  liveProjectManagers: [],
   counts: {
     total: 0, needs: 0, flight: 0, idle: 0, other: 0,
     byKind: { task: 0, cron: 0, review: 0, ticket: 0 },
@@ -137,6 +142,7 @@ export const DEFAULT_SESSION_STATUS: SessionStatusValue = {
   refetchCron: () => {},
   refetchReviews: () => {},
   refetchTickets: () => {},
+  refetchProjectManagers: () => {},
   refetchAll: () => {},
 }
 

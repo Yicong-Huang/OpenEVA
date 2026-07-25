@@ -1,7 +1,7 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useApi } from './useApi'
 import { useEventBus } from './useEventBus'
-import type { CronJob, Ticket } from '../api'
+import type { CronJob, ProjectManagerSession, Ticket } from '../api'
 import { bucketize } from '../utils/sessionState'
 import {
   SessionStatusContext,
@@ -60,6 +60,8 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
     useApi<{ prs: LiveReview[] }>('/api/review-requests')
   const { data: ticketData, refetch: refetchTickets } =
     useApi<{ tickets: Ticket[]; configured: boolean }>('/api/tickets')
+  const { data: managerData, refetch: refetchProjectManagers } =
+    useApi<{ sessions: ProjectManagerSession[] }>('/api/project-managers')
 
   // session.snapshot.begin: open a fresh buffer. Don't touch the
   // visible map yet -- we want the previous snapshot to keep
@@ -140,12 +142,18 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   // (which carries the per-row business metadata + the `running` flag)
   // is a separate cache -- without an explicit refetch the killed
   // row keeps rendering until the next task/github/ticket event fires.
-  useEventBus('session.killed', useCallback(() => refetchSessions(), [refetchSessions]))
+  useEventBus('session.killed', useCallback(() => {
+    refetchSessions()
+    refetchProjectManagers()
+  }, [refetchSessions, refetchProjectManagers]))
   // Resume flips a `stopped` session back to live. Backend writes
   // `set_state(starting)` and emits `session.opened` -- the snapshot
   // gets patched by the former but the `running` flag from
   // `/api/all-sessions` doesn't update unless we re-fetch the list.
-  useEventBus('session.opened', useCallback(() => refetchSessions(), [refetchSessions]))
+  useEventBus('session.opened', useCallback(() => {
+    refetchSessions()
+    refetchProjectManagers()
+  }, [refetchSessions, refetchProjectManagers]))
 
   // Project visibility toggles change which rows the backend
   // includes in each per-project bundle. Refetch the lists that
@@ -154,18 +162,20 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const handler = () => {
       refetchSessions()
+      refetchProjectManagers()
       refetchReviews()
       refetchTickets()
     }
     window.addEventListener('eva:project-visibility-changed', handler)
     return () => window.removeEventListener('eva:project-visibility-changed', handler)
-  }, [refetchSessions, refetchReviews, refetchTickets])
+  }, [refetchSessions, refetchProjectManagers, refetchReviews, refetchTickets])
 
   // Memoized derived views. Each `live*` filter is by snapshot state
   // (NOT by any per-row `session_alive` -- those fields are gone).
   const cronJobs = cronData?.jobs ?? []
   const reviews = reviewData?.prs ?? []
   const tickets = ticketData?.tickets ?? []
+  const projectManagers = managerData?.sessions ?? []
 
   const isLiveByName = useCallback((name: string) => {
     const s = sessions[name]
@@ -189,6 +199,13 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
       .filter(t => t.session_name && isLiveByName(t.session_name))
       .sort((a, b) => (a.key || '').localeCompare(b.key || ''))
   }, [tickets, isLiveByName])
+
+  const liveProjectManagers = useMemo(() => {
+    return projectManagers
+      .filter(m => m.running || isLiveByName(m.tmux_name))
+      .sort((a, b) =>
+        (a.project_name || a.project_id).localeCompare(b.project_name || b.project_id))
+  }, [projectManagers, isLiveByName])
 
   const counts: SessionCounts = useMemo(() => {
     const c: SessionCounts = {
@@ -216,22 +233,24 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
     refetchCron()
     refetchReviews()
     refetchTickets()
-  }, [refetchSessions, refetchCron, refetchReviews, refetchTickets])
+    refetchProjectManagers()
+  }, [refetchSessions, refetchCron, refetchReviews, refetchTickets,
+      refetchProjectManagers])
 
   const value = useMemo(() => ({
     sessions,
     projectSessions: sessionsData ?? null,
-    cronJobs, reviews, tickets,
-    liveCronJobs, liveReviews, liveTickets,
+    cronJobs, reviews, tickets, projectManagers,
+    liveCronJobs, liveReviews, liveTickets, liveProjectManagers,
     counts,
     getSession,
     refetchSessions, refetchCron, refetchReviews,
-    refetchTickets, refetchAll,
+    refetchTickets, refetchProjectManagers, refetchAll,
   }), [
-    sessions, sessionsData, cronJobs, reviews, tickets,
-    liveCronJobs, liveReviews, liveTickets, counts, getSession,
+    sessions, sessionsData, cronJobs, reviews, tickets, projectManagers,
+    liveCronJobs, liveReviews, liveTickets, liveProjectManagers, counts, getSession,
     refetchSessions, refetchCron, refetchReviews,
-    refetchTickets, refetchAll,
+    refetchTickets, refetchProjectManagers, refetchAll,
   ])
 
   return (

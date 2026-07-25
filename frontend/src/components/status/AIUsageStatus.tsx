@@ -11,6 +11,27 @@ interface UsageData {
   monthly: string
   tier?: string
   updated?: string
+  // Real period spend / token totals from newer usage output.
+  claudeCost?: string
+  claudeTokens?: string
+  codexCost?: string
+  codexTokens?: string
+  // Account-wide monthly total (all tools) + budget cap from the
+  // AI Gateway Budgets block, and the Claude-Code-only monthly slice.
+  monthlyTotal?: string
+  monthlyBudget?: string
+  claudeMonthly?: string
+}
+
+/** Compact a comma-separated integer token count as e.g. "1.4B" / "647M". */
+function fmtTokens(raw?: string): string | undefined {
+  if (!raw) return undefined
+  const n = parseInt(raw.replace(/,/g, ''), 10)
+  if (isNaN(n)) return raw
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
+  return String(n)
 }
 
 /** Animated number that rolls up/down when value changes. */
@@ -64,6 +85,13 @@ export function AIUsageStatus() {
         monthly: String(data.monthly || '--'),
         tier: data.tier as string | undefined,
         updated: (data.updated_at || data.updated) as string | undefined,
+        claudeCost: data.claude_cost as string | undefined,
+        claudeTokens: data.claude_tokens as string | undefined,
+        codexCost: data.codex_cost as string | undefined,
+        codexTokens: data.codex_tokens as string | undefined,
+        monthlyTotal: data.monthly_total as string | undefined,
+        monthlyBudget: data.monthly_budget as string | undefined,
+        claudeMonthly: data.claude_monthly as string | undefined,
       })
     } catch {
       setUsage(null)
@@ -115,15 +143,67 @@ export function AIUsageStatus() {
               <span style={{ color: 'var(--text-dim)' }}>Weekly</span>
               <AnimatedValue value={usage?.weekly || '--'} style={{ fontWeight: 600, fontFamily: 'monospace', color: 'var(--text)' }} />
             </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
               <span style={{ color: 'var(--text-dim)' }}>Monthly</span>
-              <AnimatedValue value={usage?.monthly || '--'} style={{ fontWeight: 600, fontFamily: 'monospace', color: 'var(--text)' }} />
+              <span style={{ fontFamily: 'monospace' }}>
+                <AnimatedValue value={usage?.monthly || '--'} style={{ fontWeight: 600, color: 'var(--text)' }} />
+                {usage?.monthlyBudget && (
+                  <span style={{ color: 'var(--text-faint)' }}> / {usage.monthlyBudget}</span>
+                )}
+              </span>
             </div>
           </div>
           {usage?.tier && (
             <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', fontSize: 10 }}>
               <span style={{ color: 'var(--text-dim)' }}>Tier</span>
               <span style={{ fontWeight: 600, color: 'var(--accent)' }}>{usage.tier}</span>
+            </div>
+          )}
+          {usage?.claudeMonthly && usage?.monthlyTotal && (
+            <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11 }}>
+              <div style={{ color: 'var(--text-faint)', fontSize: 9, textTransform: 'uppercase', letterSpacing: 0.4 }}>Monthly breakdown</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--text-dim)' }}>Claude Code</span>
+                <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--text)' }}>${usage.claudeMonthly}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--text-dim)' }}>Other (gateway)</span>
+                <span style={{ fontFamily: 'monospace', color: 'var(--text-faint)' }}>
+                  ${(() => {
+                    const total = parseFloat((usage.monthlyTotal || '0').replace(/,/g, ''))
+                    const claude = parseFloat((usage.claudeMonthly || '0').replace(/,/g, ''))
+                    const diff = total - claude
+                    return isNaN(diff) ? '--' : diff.toLocaleString('en-US', { maximumFractionDigits: 2 })
+                  })()}
+                </span>
+              </div>
+            </div>
+          )}
+          {(usage?.claudeCost || usage?.codexCost) && (
+            <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11 }}>
+              <div style={{ color: 'var(--text-faint)', fontSize: 9, textTransform: 'uppercase', letterSpacing: 0.4 }}>Spend (recent)</div>
+              {usage?.claudeCost && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--text-dim)' }}>Claude Code</span>
+                  <span style={{ fontFamily: 'monospace', color: 'var(--text)' }}>
+                    <span style={{ fontWeight: 600 }}>${usage.claudeCost}</span>
+                    {fmtTokens(usage.claudeTokens) && (
+                      <span style={{ color: 'var(--text-faint)', marginLeft: 6 }}>{fmtTokens(usage.claudeTokens)} tok</span>
+                    )}
+                  </span>
+                </div>
+              )}
+              {usage?.codexCost && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--text-dim)' }}>Codex</span>
+                  <span style={{ fontFamily: 'monospace', color: 'var(--text)' }}>
+                    <span style={{ fontWeight: 600 }}>${usage.codexCost}</span>
+                    {fmtTokens(usage.codexTokens) && (
+                      <span style={{ color: 'var(--text-faint)', marginLeft: 6 }}>{fmtTokens(usage.codexTokens)} tok</span>
+                    )}
+                  </span>
+                </div>
+              )}
             </div>
           )}
           {usage?.updated && (

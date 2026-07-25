@@ -1,6 +1,9 @@
 import { useCallback, useState } from 'react'
 import { api, type Ticket } from '../api'
-import { timeAgo } from '../utils'
+import { timeAgo, formatLocalShort } from '../utils'
+import { colorForSeverity } from '../utils/ticketColors'
+import { classifyHistoryEntry, historyKindColor } from '../utils/taskHelpers'
+import { PRNode } from './PRNode'
 
 /**
  * TicketCard -- right pane of the Tickets page.
@@ -27,6 +30,8 @@ export function TicketCard({
   const components = ticket.components ?? []
   const fixVersions = ticket.fix_versions ?? []
   const linkedTasks = ticket.linked_tasks ?? []
+  const history = ticket.history ?? []
+  const prs = ticket.prs ?? []
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8,
@@ -44,9 +49,48 @@ export function TicketCard({
         </span>
       </div>
 
+      {/* Status badges: pinned (manually tracked, never auto-pruned)
+          and the left-the-queue marker so a resolved/reassigned ticket
+          announces itself instead of silently lingering. */}
+      {(ticket.pinned || ticket.left_jql_at) && (
+        <div data-testid="ticket-badges"
+             style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+          {ticket.pinned && (
+            <span data-testid="ticket-badge-pinned" style={{
+              fontSize: 10, padding: '1px 7px', borderRadius: 3, fontWeight: 700,
+              background: 'rgba(99,102,241,0.18)', color: 'var(--accent)',
+            }}>PINNED</span>
+          )}
+          {ticket.left_jql_at && (
+            <span data-testid="ticket-badge-leftjql" style={{
+              fontSize: 10, padding: '1px 7px', borderRadius: 3, fontWeight: 700,
+              ...(((ticket.status_category || '').toLowerCase() === 'done')
+                ? { background: 'rgba(34,197,94,0.18)', color: 'var(--green)' }
+                : { background: 'rgba(168,162,158,0.22)', color: 'var(--text-dim)' }),
+            }}>
+              {(ticket.status_category || '').toLowerCase() === 'done'
+                ? 'RESOLVED' : 'REASSIGNED'}
+              {' '}<span style={{ fontWeight: 400 }}>
+                {timeAgo(ticket.left_jql_at)}
+              </span>
+            </span>
+          )}
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: 12, marginTop: 8, fontSize: 11,
                     flexWrap: 'wrap' }}>
         <KV k="Status" v={ticket.status} />
+        {ticket.severity && (
+          <div data-testid="ticket-kv-severity">
+            <span style={{ color: 'var(--text-dim)' }}>Severity: </span>
+            <span style={{
+              fontWeight: 700, padding: '0 5px', borderRadius: 3,
+              background: colorForSeverity(ticket.severity).bg,
+              color: colorForSeverity(ticket.severity).fg,
+            }}>{ticket.severity}</span>
+          </div>
+        )}
         <KV k="Priority" v={ticket.priority} />
         <KV k="Type" v={ticket.issue_type} />
         <KV k="Project" v={ticket.project_key} />
@@ -112,6 +156,62 @@ export function TicketCard({
                       }}>
                 {lt.project} / {lt.task_id}
               </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* History -- a ticket is a task row, so it carries the same
+          task-keyed history timeline as a project task. Mirrors the
+          TaskCard History section. */}
+      {history.length > 0 && (
+        <div data-testid="ticket-history" style={{ marginTop: 12 }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: 'var(--accent)',
+            textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4,
+          }}>History</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 10 }}>
+            {history.slice(0, 8).map((e, i) => {
+              const kind = classifyHistoryEntry(e.text)
+              const dotColor = historyKindColor(kind)
+              return (
+                <span key={`${e.ts}-${i}`}
+                      data-history-kind={kind}
+                      style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {dotColor && (
+                    <span aria-hidden="true" title={kind.replace('_', ' ')}
+                          style={{ width: 6, height: 6, borderRadius: '50%',
+                                   background: dotColor, flexShrink: 0 }} />
+                  )}
+                  <span style={{ color: 'var(--text-faint)', whiteSpace: 'nowrap',
+                                 fontFamily: 'monospace' }} title={e.ts}>
+                    {formatLocalShort(e.ts)}
+                  </span>
+                  <span style={{ color: kind === 'manual' ? 'var(--text-dim)' : 'var(--text)' }}>
+                    {e.text}
+                  </span>
+                </span>
+              )
+            })}
+            {history.length > 8 && (
+              <span style={{ color: 'var(--text-faint)', fontSize: 9 }}>
+                + {history.length - 8} older
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Related PRs -- same task-keyed prs table as project tasks. */}
+      {prs.length > 0 && (
+        <div data-testid="ticket-prs" style={{ marginTop: 12 }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, color: 'var(--accent)',
+            textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4,
+          }}>Related PRs</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {prs.map((pr) => (
+              <PRNode key={pr.number} pr={pr} showMeta />
             ))}
           </div>
         </div>

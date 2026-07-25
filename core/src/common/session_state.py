@@ -191,7 +191,11 @@ def recover_crashed_sessions() -> dict:
 
     candidates: list[tuple[str, str, str]] = []  # (name, kind, uuid)
 
-    # Project-task sessions: rows in `sessions` table with agent_session_id.
+    # User sessions: rows in `sessions` table with agent_session_id.
+    # Regular project tasks and ticket sessions both live here; infer
+    # the kind from tmux_name so ticket-* rows resume through the
+    # ticket-aware metadata path instead of being treated as project
+    # tasks.
     try:
         for s in app_state._db.list_sessions():
             uuid = (s.get("agent_session_id") or "").strip()
@@ -203,7 +207,7 @@ def recover_crashed_sessions() -> dict:
                     continue
             except Exception:
                 continue
-            candidates.append((name, "task", uuid))
+            candidates.append((name, _infer_kind(name), uuid))
     except Exception as e:
         print(f"[session_state] recover task scan failed: {e}", flush=True)
 
@@ -251,8 +255,8 @@ def recover_crashed_sessions() -> dict:
     from . import sessions as _sessions
     for name, kind, _uuid in candidates:
         try:
-            res = _sessions.resume_session(name) if kind == "task" \
-                  else _resume_review(name)
+            res = _resume_review(name) if kind == "review" \
+                  else _sessions.resume_session(name)
             if res and res.get("running") is not False:
                 out["resumed"].append(name)
                 # state stays 'crashed' until the SessionStart hook
@@ -285,12 +289,18 @@ def _resume_review(name: str) -> dict | None:
             return None
         from adapters.tmux import launch_session_argv
         from . import agent as _agent
-        # Same shape `reviews._launch_new_review_session` uses
-        # for fresh launches, but routed through the agent's resume
-        # subcommand (`claude resume UUID` / `<agent> resume UUID`).
-        argv = _agent.resume_argv(uuid)
+        from . import sessions as _sessions
+        # Resume with the agent that launched this review session (empty
+        # agent_impl -> default agent), not the global active agent. `resume_argv`
+        # routes by id shape (local `--resume` UUID vs cloud `resume`
+        # id). Local resume is cwd-sensitive, so launch from the dir the
+        # session was created in (recovered from the transcript), falling
+        # back to `~` for cloud ids / missing transcripts.
+        sess_agent = _agent.get_agent_by_id(r.get("agent_impl", "") or "")
+        argv = sess_agent.resume_argv(uuid)
+        cwd = _sessions._local_transcript_cwd(uuid) or "~"
         try:
-            launch_session_argv(name, "~", argv)
+            launch_session_argv(name, cwd, argv)
             return {"session": name, "action": "resumed", "running": True}
         except Exception:
             return None

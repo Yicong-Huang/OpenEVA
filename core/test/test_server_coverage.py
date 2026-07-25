@@ -572,6 +572,16 @@ class TestBuildBackground:
 class TestSessionManagement:
     """Cover open_session endpoint with the new --append-system-prompt flow."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_claude_new_session(self, patched_server):
+        """Pin the new-session agent to a Claude-family binary so these
+        mechanics tests keep asserting the `--append-system-prompt`
+        shape, independent of whatever new-session default an install
+        covered in test_agent.py)."""
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
+
     @staticmethod
     def _bg_arg(mock_tmux):
         argv = mock_tmux["launch_argv"].call_args.args[2]

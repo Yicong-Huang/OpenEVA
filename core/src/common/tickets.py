@@ -35,6 +35,161 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
+# Safety cap on per-tick re-fetches of tickets that dropped out of the
+# JQL. A JIRA hiccup that briefly returns fewer rows would otherwise
+# fan out into one `fetch_issue` per cached ticket. We log when the cap
+# bites so a degraded sync is visible rather than silent.
+MAX_DISAPPEARED_REFETCH = 50
+
+# Scope rule: only JIRA project prefixes in the configured allow-list
+# may enter the ticket system. Everything else stays reachable from
+# project-task links but never lands in the Tickets page queue. The
+# allow-list is a per-user setting (empty = no restriction) so no
+# org-specific prefix is baked into the source. See
+# `settings.get_ticket_allowed_prefixes`.
+def is_allowed_key(key: str) -> bool:
+    """True when `key`'s project prefix is in the configured allow-list.
+
+    An empty allow-list means "no scope restriction" -- every prefix is
+    allowed, so a fresh install with no configuration tracks all synced
+    tickets rather than none."""
+    allowed = _settings.get_ticket_allowed_prefixes()
+    if not allowed:
+        return True
+    return _project_prefix(key or "") in allowed
+
+# Settings-key prefix for the per-instance Severity custom-field id,
+# plus an in-process cache so we hit JIRA's field catalogue at most
+# once per instance per process.
+_SEVERITY_FIELD_SETTING = "jira.severity_field"
+_SEVERITY_FIELD_CACHE: dict[str, str] = {}
+
+
+def _coerce_field_value(raw: Any) -> str:
+    """Flatten a JIRA custom-field value to a display string. Select
+    lists arrive as `{"value": ...}` / `{"name": ...}`, multi-selects
+    as a list of those, simpler fields as a bare string."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        return str(raw.get("value") or raw.get("name") or "").strip()
+    if isinstance(raw, list):
+        parts = [_coerce_field_value(x) for x in raw]
+        return ", ".join(p for p in parts if p)
+    return str(raw).strip()
+
+
+def _severity_field_id(instance: dict, *, http_get=None) -> str:
+    """Resolve this instance's Severity `customfield_XXXXX` id,
+    auto-detecting it from JIRA's field catalogue and caching the
+    result (in-process + settings). Returns "" when the instance has
+    no Severity-like field.
+
+    Detection is two-stage because a big JIRA install (e.g. an
+    enterprise JIRA) has MANY fields whose name contains "severity" -- several named
+    literally "Severity" (mostly empty) plus the one actually in use
+    ("Support Severity Level", holding "SEV1 High" etc.). So we:
+      1. gather every field whose name contains "severity",
+      2. if more than one, probe a sample of the instance's own JQL and
+         pick the candidate populated on the most issues.
+    A single candidate is used directly; zero -> "".
+
+    A persisted "" means "looked up, none found" so we don't re-query
+    every tick. To force re-detection (admin added the field, or to
+    override the auto-pick) set/clear the `jira.severity_field.<name>`
+    setting."""
+    name = instance["name"]
+    if name in _SEVERITY_FIELD_CACHE:
+        return _SEVERITY_FIELD_CACHE[name]
+    skey = f"{_SEVERITY_FIELD_SETTING}.{name}"
+    cached = _settings.get_value(skey, None)
+    if cached is not None:
+        _SEVERITY_FIELD_CACHE[name] = cached
+        return cached
+    field_id = ""
+    try:
+        fields = _jira.fetch_fields(
+            base_url=instance["base_url"],
+            auth_type=instance["auth_type"],
+            email=instance["email"],
+            api_token=instance["api_token"],
+            http_get=http_get,
+        )
+        candidates = [
+            str(f.get("id", "")) for f in fields
+            if "severity" in str(f.get("name", "")).lower()
+            and str(f.get("id", ""))
+        ]
+        if len(candidates) == 1:
+            field_id = candidates[0]
+        elif len(candidates) > 1:
+            field_id = _pick_populated_field(
+                instance, candidates, http_get=http_get)
+    except Exception as e:
+        # Don't persist on error -- a transient catalogue failure
+        # shouldn't permanently mark the instance as "no severity".
+        print(f"[tickets-sync] severity field lookup for {name} "
+              f"failed: {e}", flush=True)
+        return ""
+    _settings.set_value(skey, field_id)
+    _SEVERITY_FIELD_CACHE[name] = field_id
+    return field_id
+
+
+# A populated value that READS like a severity label -- "Sev1",
+# "SEV0 Critical", "Blocker", "Major". Used to disambiguate when an
+# install has several "severity"-named fields: a human-readable label
+# field beats a numeric/score field (e.g. an enterprise JIRA's "Support
+# Severity Level" = "SEV1 High" over a derived "Severity" = "1.0").
+_SEVERITY_LABEL_RE = re.compile(
+    r"sev|critical|blocker|major|minor|moderate|trivial|"
+    r"\b(high|medium|low)\b",
+    re.IGNORECASE,
+)
+
+
+def _pick_populated_field(instance: dict, candidates: list[str],
+                          *, http_get=None) -> str:
+    """Among several Severity-named field ids, pick the most useful one
+    by probing a sample of the instance's own tickets. Ranking, per
+    candidate, over the sample:
+      1. how many values READ like a severity label (regex) -- this is
+         what separates "SEV1 High" from a numeric "1.0" score field;
+      2. tie-break on how many values are populated at all.
+    Falls back to the first candidate when the probe fails or nothing
+    is populated (better a maybe-empty field than none)."""
+    try:
+        issues = _jira.search_issues(
+            base_url=instance["base_url"],
+            auth_type=instance["auth_type"],
+            email=instance["email"],
+            api_token=instance["api_token"],
+            jql=instance["jql"],
+            max_results=25,
+            extra_fields=candidates,
+            http_get=http_get,
+        )
+    except Exception:
+        return candidates[0]
+    label_hits = {c: 0 for c in candidates}
+    populated = {c: 0 for c in candidates}
+    for issue in issues:
+        f = issue.get("fields") or {}
+        for c in candidates:
+            val = _coerce_field_value(f.get(c))
+            if not val:
+                continue
+            populated[c] += 1
+            if _SEVERITY_LABEL_RE.search(val):
+                label_hits[c] += 1
+    best = max(candidates, key=lambda c: (label_hits[c], populated[c]))
+    if label_hits[best] or populated[best]:
+        return best
+    return candidates[0]
+
+
 # ---- Instance config ----
 
 def _normalise_instance(raw: Any) -> dict | None:
@@ -178,7 +333,8 @@ def _render_adf(node: Any) -> str:
 
 # ---- Sync ----
 
-def _normalise_issue(issue: dict, instance: dict) -> dict:
+def _normalise_issue(issue: dict, instance: dict,
+                     *, severity_field_id: str = "") -> dict:
     """Project a raw JIRA REST issue dict onto our cache columns.
 
     Defensive: every nested .get("foo", {}).get("bar") so an
@@ -237,9 +393,16 @@ def _normalise_issue(issue: dict, instance: dict) -> dict:
     # `undefined`; this is what JIRA itself uses to colour the badge.
     # Normalised so the UI can render a consistent chip across servers.
     status_category = (status.get("statusCategory") or {}).get("key", "") or ""
+    # Severity is an instance-specific custom field (enterprise JIRA's
+    # real triage dimension -- `priority` there is uniformly "Major").
+    # `severity_field_id` is resolved + cached by `_severity_field_id`;
+    # empty means the instance has no Severity field, so we store "".
+    severity = _coerce_field_value(
+        fields.get(severity_field_id)) if severity_field_id else ""
     return {
         "instance_name": instance["name"],
         "key": issue.get("key", ""),
+        "severity": severity,
         "summary": fields.get("summary", "") or "",
         "description": description,
         "status": status.get("name", "") or "",
@@ -268,7 +431,7 @@ def _normalise_issue(issue: dict, instance: dict) -> dict:
 _TICKET_TRACKED_FIELDS = (
     "status", "priority", "issue_type", "assignee_email",
     "reporter_email", "summary", "updated_at", "resolution",
-    "status_category", "parent_key",
+    "status_category", "parent_key", "severity",
 )
 
 
@@ -333,29 +496,47 @@ def sync_one(instance: dict, *, http_get=None) -> dict:
     fields to the freshly-fetched payload, upsert, then emit
     `ticket.created` (when the row is new) or `ticket.updated` (when
     any tracked field changed). Returns
-    `{name, count, pruned, created, updated, jql}`.
+    `{name, count, created, updated, left, jql}`.
     """
     started_at = _now_iso()
+    severity_field_id = _severity_field_id(instance, http_get=http_get)
+    extra_fields = [severity_field_id] if severity_field_id else None
+    # Snapshot the cached keys BEFORE the fetch so we can tell which
+    # tickets dropped out of the JQL this tick (resolved / reassigned).
+    before_keys = app_state._db.ticket_keys_for_instance(instance["name"])
     issues = _jira.search_issues(
         base_url=instance["base_url"],
         auth_type=instance["auth_type"],
         email=instance["email"],
         api_token=instance["api_token"],
         jql=instance["jql"],
+        extra_fields=extra_fields,
         http_get=http_get,
     )
     count = 0
     created = 0
     updated = 0
+    returned_keys: set[str] = set()
     for issue in issues:
-        record = _normalise_issue(issue, instance)
-        if not record["key"]:
+        record = _normalise_issue(
+            issue, instance, severity_field_id=severity_field_id)
+        if not record["key"] or not is_allowed_key(record["key"]):
             continue
         record["synced_at"] = started_at
+        # Present in the JQL again -> clear any "left the queue" badge.
+        record["left_jql_at"] = ""
         prev = app_state._db.get_ticket(
             record["key"], instance_name=instance["name"],
         )
-        app_state._db.upsert_ticket(**record)
+        try:
+            app_state._db.upsert_ticket(**record)
+        except Exception as e:
+            # One corrupted row (e.g. a task_id collision) must not
+            # kill the whole instance sync -- skip it, keep going.
+            print(f"[tickets-sync] upsert {record['key']} failed: {e}",
+                  flush=True)
+            continue
+        returned_keys.add(record["key"])
         count += 1
         if prev is None:
             created += 1
@@ -365,22 +546,108 @@ def sync_one(instance: dict, *, http_get=None) -> dict:
             if changes:
                 updated += 1
                 _emit_ticket_event("updated", record, changes)
-    pruned = app_state._db.delete_tickets_synced_before(
-        started_at, instance_name=instance["name"],
+    # Tickets cached last tick but no longer returned by the JQL: they
+    # were resolved, reassigned away, or otherwise left "my queue".
+    # Re-fetch each to capture its TRUE current state, keep it forever,
+    # and badge it via `left_jql_at` -- so the user actually sees the
+    # transition (the #2 "didn't update" complaint).
+    # Pinned tickets are refreshed but never badged.
+    left = _sync_disappeared(
+        instance, before_keys - returned_keys, started_at,
+        severity_field_id=severity_field_id,
+        extra_fields=extra_fields, http_get=http_get,
     )
     return {
         "name": instance["name"],
         "count": count,
         "created": created,
         "updated": updated,
-        "pruned": pruned,
+        "left": left,
         "jql": instance["jql"],
     }
 
 
+def _sync_disappeared(instance: dict, disappeared: set, started_at: str,
+                      *, severity_field_id: str = "",
+                      extra_fields=None, http_get=None) -> int:
+    """Refresh + badge tickets that dropped out of the instance JQL.
+
+    Only NEWLY-disappeared rows (no `left_jql_at` badge yet) and
+    pinned rows are re-fetched; rows badged on a previous tick are
+    skipped so per-tick JIRA traffic stays flat as the permanently-
+    retained history grows.
+
+    Returns the number of rows whose tracked fields changed (so the
+    caller can report how many transitioned). A 404 on re-fetch means
+    the issue was deleted/hidden in JIRA -> detach immediately. A
+    transient instance error leaves the cached row untouched for the
+    next tick. Capped at MAX_DISAPPEARED_REFETCH per tick to avoid a
+    fan-out when a JIRA hiccup briefly shrinks the result set."""
+    # Filter BEFORE capping: already-badged rows are skipped (their
+    # state stays whatever the last fetch saw), so they must not eat
+    # the refetch budget -- otherwise the same badged keys fill the
+    # cap every tick and unbadged rows behind them rot forever.
+    refetch: list[tuple[str, dict]] = []
+    for key in sorted(disappeared):
+        if not is_allowed_key(key):
+            # Legacy out-of-scope rows (SPARK-, SC- project links)
+            # must not trigger JIRA re-fetches.
+            continue
+        prev = app_state._db.get_ticket(key, instance_name=instance["name"])
+        if prev is None:
+            continue
+        if not prev.get("pinned") and prev.get("left_jql_at"):
+            # Already badged on a previous tick. With permanent
+            # retention these rows accumulate forever; re-fetching
+            # each of them every tick would make sync traffic grow
+            # with history size.
+            continue
+        refetch.append((key, prev))
+    if len(refetch) > MAX_DISAPPEARED_REFETCH:
+        print(f"[tickets-sync] {instance['name']}: {len(refetch)} tickets "
+              f"left the JQL this tick; re-fetching only the first "
+              f"{MAX_DISAPPEARED_REFETCH} (the rest retry next tick)",
+              flush=True)
+        refetch = refetch[:MAX_DISAPPEARED_REFETCH]
+    left = 0
+    for key, prev in refetch:
+        try:
+            issue = _jira.fetch_issue(
+                base_url=instance["base_url"],
+                auth_type=instance["auth_type"],
+                email=instance["email"],
+                api_token=instance["api_token"],
+                key=key, extra_fields=extra_fields, http_get=http_get,
+            )
+        except RuntimeError:
+            # Transient instance error -- keep the cached row, retry next.
+            continue
+        if not issue:
+            # 404 -> deleted/invisible in JIRA. Detach the cache now.
+            app_state._db.delete_ticket(key, instance_name=instance["name"])
+            continue
+        record = _normalise_issue(
+            issue, instance, severity_field_id=severity_field_id)
+        record["synced_at"] = started_at
+        if not prev.get("pinned"):
+            # Stamp when it first left the JQL; sticky until it returns.
+            record["left_jql_at"] = prev.get("left_jql_at") or started_at
+        try:
+            app_state._db.upsert_ticket(**record)
+        except Exception as e:
+            print(f"[tickets-sync] upsert {key} (left-jql refresh) "
+                  f"failed: {e}", flush=True)
+            continue
+        changes = _ticket_diff(prev, record)
+        if changes:
+            left += 1
+            _emit_ticket_event("updated", record, changes)
+    return left
+
+
 def sync_all(*, http_get=None) -> dict:
     """Sync every configured instance. Returns
-    `{instances: [{name, count, pruned, ...}], total_count, errors: [...]}`.
+    `{instances: [{name, count, ...}], total_count, errors: [...]}`.
 
     Per-instance errors are captured (not raised) so a single broken
     JIRA doesn't kill the whole sync.
@@ -408,16 +675,15 @@ def sync_all(*, http_get=None) -> dict:
 # and existing callers use it. Routes route the same shape.
 def sync(*, http_get=None) -> dict:
     """Legacy single-JIRA wrapper around `sync_all`. Returns the
-    old-shape `{count, pruned, jql}` for the first instance so old
+    old-shape `{count, jql}` for the first instance so old
     callers still work; new callers should prefer `sync_all`."""
     out = sync_all(http_get=http_get)
     if not out["instances"]:
-        return {"count": 0, "pruned": 0, "jql": "",
-                "errors": out["errors"]}
+        return {"count": 0, "jql": "", "errors": out["errors"]}
     first = out["instances"][0]
     return {
         "count": out["total_count"],
-        "pruned": sum(s["pruned"] for s in out["instances"]),
+        "left": sum(s.get("left", 0) for s in out["instances"]),
         "jql": first["jql"],
         "instances": out["instances"],
         "errors": out["errors"],
@@ -427,8 +693,8 @@ def sync(*, http_get=None) -> dict:
 # ---- List + view enrichment ----
 
 def _project_prefix(key: str) -> str:
-    """Return the JIRA project prefix from a key. `EX-123` -> `EX`,
-    `EX-1234` -> `ES`. Empty when the key has no dash, which the UI
+    """Return the JIRA project prefix from a key. `ABC-123` -> `ABC`,
+    `PROJ-1234` -> `PROJ`. Empty when the key has no dash, which the UI
     can render as a generic 'misc' chip."""
     if not key or "-" not in key:
         return ""
@@ -499,6 +765,7 @@ def list_tickets(limit: int = 100) -> list[dict]:
     if not list_instances():
         return []
     rows = app_state._db.list_tickets(limit=limit)
+    rows = [r for r in rows if is_allowed_key(r.get("key", ""))]
     enriched = [enrich_for_view(r) for r in rows]
     hidden = _settings.get_hidden_projects()
     if not hidden:
@@ -512,6 +779,28 @@ def list_tickets(limit: int = 100) -> list[dict]:
     return out
 
 
+def _attach_history_and_prs(view: dict) -> dict:
+    """Attach the ticket task's `history` and `prs` to a detail view.
+
+    A ticket IS a task row (task_id == the JIRA key, project == the
+    prefix), so its history and PRs live in the same task-keyed tables
+    as any other task. The detail panel surfaces them so a ticket can
+    log progress and carry related PRs just like a project task.
+
+    Only used on the single-ticket detail path (`get_one`), not the
+    list, to avoid an N+1 across the whole Tickets queue. Best-effort:
+    a lookup failure leaves the fields empty rather than failing the
+    detail fetch."""
+    key = view.get("key", "")
+    try:
+        task = app_state._db.get_task("", key)
+    except Exception:
+        task = None
+    view["history"] = (task or {}).get("history", []) or []
+    view["prs"] = (task or {}).get("prs", []) or []
+    return view
+
+
 def get_one(key: str, *, instance_name: str = "") -> dict | None:
     """Fetch one ticket by `(instance_name, key)` and return its
     view-enriched form. Returns None when the key isn't cached.
@@ -522,12 +811,12 @@ def get_one(key: str, *, instance_name: str = "") -> dict | None:
     instance owns a key."""
     if instance_name:
         row = app_state._db.get_ticket(key, instance_name=instance_name)
-        return enrich_for_view(row) if row else None
+        return _attach_history_and_prs(enrich_for_view(row)) if row else None
     # Walk every configured instance.
     for inst in list_instances():
         row = app_state._db.get_ticket(key, instance_name=inst["name"])
         if row:
-            return enrich_for_view(row)
+            return _attach_history_and_prs(enrich_for_view(row))
     return None
 
 
@@ -859,7 +1148,7 @@ def _derive_owner_team(
       2. Most-common component across similar tickets.
       3. The Bazel target's first segment (e.g. `//widget/...` ->
          "widget"). Useful when JIRA components are empty (common
-         on auto-filed ES tickets).
+         on auto-filed tickets).
       4. Empty string -- no signal.
     """
     if current_components:
@@ -950,7 +1239,7 @@ def triage(key: str, *, instance_name: str = "") -> dict | None:
     # Phase-3: search the SAME JIRA instance for recently-filed tickets
     # whose summary references the same Bazel target. Surfaces "the
     # same test was flaky last week, assigned to alice" context that
-    # often leapfrogs the auto-tagged-but-empty assignee on ES tickets.
+    # often leapfrogs the auto-tagged-but-empty assignee on such tickets.
     similar_tickets: list[dict] = []
     bazel_targets = _BAZEL_TARGET_RE.findall(summary_text + " " + description_text)
     instance_for_search = None
@@ -1049,18 +1338,24 @@ def track(key: str, *, instance_name: str = "",
     """
     if not key:
         raise ValueError("ticket key is required")
+    if not is_allowed_key(key):
+        allowed = _settings.get_ticket_allowed_prefixes()
+        raise ValueError(
+            f"ticket {key!r} is outside the ticket system's scope -- "
+            f"only {'/'.join(allowed)} tickets can be tracked"
+        )
 
     # 1. Cache hit.
     if instance_name:
         row = app_state._db.get_ticket(key, instance_name=instance_name)
         if row:
-            return enrich_for_view(row)
+            return _attach_history_and_prs(enrich_for_view(row))
     else:
         # Walk every configured instance to find a cached match.
         for inst in list_instances():
             row = app_state._db.get_ticket(key, instance_name=inst["name"])
             if row:
-                return enrich_for_view(row)
+                return _attach_history_and_prs(enrich_for_view(row))
 
     # 2. JIRA probe.
     candidates = list_instances()
@@ -1071,13 +1366,15 @@ def track(key: str, *, instance_name: str = "",
         return None
 
     for inst in candidates:
+        severity_field_id = _severity_field_id(inst, http_get=http_get)
+        extra_fields = [severity_field_id] if severity_field_id else None
         try:
             issue = _jira.fetch_issue(
                 base_url=inst["base_url"],
                 auth_type=inst["auth_type"],
                 email=inst["email"],
                 api_token=inst["api_token"],
-                key=key, http_get=http_get,
+                key=key, extra_fields=extra_fields, http_get=http_get,
             )
         except RuntimeError:
             # Auth or network error on this instance -> try the next
@@ -1085,14 +1382,22 @@ def track(key: str, *, instance_name: str = "",
             continue
         if not issue:
             continue
-        record = _normalise_issue(issue, inst)
+        record = _normalise_issue(
+            issue, inst, severity_field_id=severity_field_id)
         record["synced_at"] = _now_iso()
         app_state._db.upsert_ticket(**record)
+        # Pin manually-tracked tickets so the scheduled JQL sync never
+        # auto-detaches them -- a ticket the user explicitly added may
+        # not match the instance JQL (e.g. assigned to someone else),
+        # and silently pruning it is exactly the "ticket disappeared"
+        # bug we're fixing.
+        app_state._db.set_ticket_pinned(
+            key, instance_name=inst["name"], pinned=True)
         # Newly-cached row gets a created event so any open
         # TicketsPage repaints.
         _emit_ticket_event("created", record, [])
         row = app_state._db.get_ticket(key, instance_name=inst["name"])
-        return enrich_for_view(row) if row else None
+        return _attach_history_and_prs(enrich_for_view(row)) if row else None
 
     return None
 
@@ -1145,11 +1450,40 @@ def open_session_for_ticket(key: str, *, instance_name: str = "",
         _exists = lambda _name: False  # tests assume always-new
 
     is_new = not _exists(session)
+    from . import agent as _agent
+    new_agent = _agent.get_agent_for_new_session()
+    # Codex has no launch-time system-prompt channel, so launch bare and
+    # fold bg_system into the first pasted prompt instead.
+    fold_bg_into_prompt = is_new and not new_agent.system_prompt_via_launch
     if is_new:
-        from . import agent as _agent
-        argv = _agent.launch_argv(session, system_prompt=bg_system)
+        launch_system = bg_system if new_agent.system_prompt_via_launch else None
+        argv = new_agent.launch_argv(session, system_prompt=launch_system)
         _launch(session, "~", argv)
-    if custom_prompt:
+    if not app_state._db.get_session(session):
+        # Record the launching agent so resume uses the same one.
+        app_state._db.create_session(session, "", session,
+                                     agent_impl=new_agent.id)
+    from . import session_state
+    session_state.set_state(
+        session,
+        state="starting" if is_new else "idle",
+        detail="ticket session opened" if is_new else "ticket session attached",
+        kind="ticket",
+        target_id=key,
+        target_instance=instance_name,
+    )
+    _emit_ticket_event("session.opened", {
+        "key": key,
+        "instance_name": instance_name,
+        "session_name": session,
+    }, [])
+    # For Codex (no launch-time system prompt), the ticket context must
+    # ride along with the first delivered message. Fold bg_system in even
+    # when there's no custom_prompt so a bare "open" still seeds context.
+    delivered = custom_prompt or ""
+    if fold_bg_into_prompt and bg_system:
+        delivered = f"{bg_system}\n\n{delivered}" if delivered else bg_system
+    if delivered:
         # Run async-style: wait until the agent shows its prompt, then
         # paste. Best-effort -- a paste failure shouldn't fail the
         # session-open call (the user can still type the prompt).
@@ -1157,11 +1491,11 @@ def open_session_for_ticket(key: str, *, instance_name: str = "",
             if paste is None:
                 from adapters import tmux as _tmux
                 if _tmux.wait_until_ready(session, timeout_secs=20):
-                    _tmux.paste_text(session, custom_prompt)
+                    _tmux.paste_text(session, delivered)
                 else:
-                    _tmux.paste_text(session, custom_prompt)
+                    _tmux.paste_text(session, delivered)
             else:
-                paste(session, custom_prompt)
+                paste(session, delivered)
         except Exception as e:
             print(f"[tickets] paste prompt for {key} failed: {e}",
                   flush=True)
@@ -1170,7 +1504,7 @@ def open_session_for_ticket(key: str, *, instance_name: str = "",
         "new": is_new,
         "ticket_key": key,
         "instance_name": instance_name,
-        "prompt_sent": bool(custom_prompt),
+        "prompt_sent": bool(delivered),
     }
 
 

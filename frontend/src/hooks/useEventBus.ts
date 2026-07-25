@@ -103,6 +103,17 @@ function subscribeConnect(listener: ConnectListener) {
  * - "github.*" -> all github events
  * - "*" -> all events
  */
+/**
+ * Broadcast a client-side event to all matching subscribers, without a
+ * server round-trip. Same fan-out as SSE-received events (exact +
+ * "prefix.*" wildcard + "*"), so a component can nudge pages that
+ * already subscribe to a pattern (e.g. a page's `github.*` refetch)
+ * after a local state change like marking a PR seen.
+ */
+export function emitLocalEvent(eventType: string, event: Record<string, unknown> = {}) {
+  dispatch(eventType, event)
+}
+
 /** Reset global state. For testing only. */
 export function _resetEventBus() {
   if (source) { source.close(); source = null }

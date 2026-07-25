@@ -54,6 +54,10 @@ def test_get_actions_pr_context(client):
 
 def test_sessions_open_creates_new_session(client):
     from server import _db
+    from common import agent as _agent
+    # Pin new-session agent to a Claude-family binary so this mechanics
+    # test keeps asserting the `--append-system-prompt` shape.
+    _db.set_setting(_agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
     _db.create_task("test-proj", "my-task", description="Test task")
 
     launch_argv = MagicMock()
@@ -244,6 +248,8 @@ def test_rename_task_target_exists_endpoint(client):
 def test_open_session_with_pr_context(client):
     """Open session with pr_number and pr_repo, verify PR Detail in injected bg."""
     from server import _db
+    from common import agent as _agent
+    _db.set_setting(_agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
     _db.create_task("test-proj", "pr-ctx-task", description="PR context task")
     _db.add_pr(
         project="test-proj",

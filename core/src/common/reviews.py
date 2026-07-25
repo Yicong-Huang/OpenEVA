@@ -166,10 +166,29 @@ def _launch_new_review_session(
     """
     bg_system = build_review_system_prompt(pr_row)
     from . import agent as _agent
+    new_agent = _agent.get_agent_for_new_session()
+    # Claude family gets the PR context as a launch-time system prompt;
+    # Codex has no such channel, so launch bare -- `open_review_session`
+    # folds bg_system into the first delivered prompt instead.
+    launch_system = bg_system if new_agent.system_prompt_via_launch else None
     launch_session_argv(
         session_name, "~",
-        _agent.launch_argv(session_name, system_prompt=bg_system),
+        new_agent.launch_argv(session_name, system_prompt=launch_system),
     )
+    # Record the launching agent on the review's session row so resume
+    # (`_resume_review`) uses the same agent. Only stamped here, on a
+    # fresh launch -- resume/re-click must not overwrite it. Goes
+    # through upsert_review_pr's session-write path (keyed by review
+    # task_id); session_name is already persisted by the caller.
+    try:
+        app_state._db.upsert_review_pr(
+            url=pr_row["url"], repo=pr_row["repo"], number=pr_row["number"],
+            session_name=session_name, agent_impl=new_agent.id,
+        )
+    except Exception:
+        # A metadata write failure must not break the launch -- the
+        # session is already up. Resume falls back to the default agent.
+        pass
     try:
         app_state._db.append_review_history(
             review_url, f"session started: {action_id}", source="system",
@@ -208,6 +227,15 @@ def open_review_session(review_url: str, action_id: str = "review-pr",
 
     if is_new:
         _launch_new_review_session(session_name, review_url, action_id, pr_row)
+        # Agents without a launch-time system-prompt channel (Codex)
+        # get the PR context folded into this first delivered prompt,
+        # since `_launch_new_review_session` couldn't put it in the argv.
+        from . import agent as _agent
+        new_agent = _agent.get_agent_for_new_session()
+        if not new_agent.system_prompt_via_launch:
+            bg_system = build_review_system_prompt(pr_row)
+            if bg_system:
+                prompt = f"{bg_system}\n\n{prompt}" if prompt else bg_system
 
     # Emit on re-click too: the frontend needs a refresh signal
     # regardless of whether we spun up tmux. Without this the second

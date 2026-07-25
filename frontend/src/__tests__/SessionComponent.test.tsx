@@ -89,6 +89,39 @@ describe('SessionCard', () => {
     expect(screen.getByText('Kill')).toBeInTheDocument()
   })
 
+  it('shows Restart (not Resume) for a live session', () => {
+    renderCard(<SessionCard sessionName="live-a" initialStatus="idle" onKill={() => {}} />)
+    expect(screen.getByText('Restart')).toBeInTheDocument()
+    expect(screen.queryByText('Resume')).not.toBeInTheDocument()
+  })
+
+  it('shows Resume (not Restart) for a stopped session', () => {
+    renderCard(<SessionCard sessionName="dead-a" initialStatus="stopped" onKill={() => {}} />)
+    expect(screen.getByText('Resume')).toBeInTheDocument()
+    expect(screen.queryByText('Restart')).not.toBeInTheDocument()
+  })
+
+  it('calls restart endpoint when Restart clicked and confirmed', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderCard(<SessionCard sessionName="live-b" initialStatus="idle" onKill={() => {}} />)
+    await userEvent.click(screen.getByText('Restart'))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('Restart session "live-b"?'))
+    const hitRestart = mockFetch.mock.calls.some(
+      (c: unknown[]) => String(c[0]).includes('/api/sessions/live-b/restart'),
+    )
+    expect(hitRestart).toBe(true)
+  })
+
+  it('does NOT call restart endpoint when confirm cancelled', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    renderCard(<SessionCard sessionName="live-c" initialStatus="idle" onKill={() => {}} />)
+    await userEvent.click(screen.getByText('Restart'))
+    const hitRestart = mockFetch.mock.calls.some(
+      (c: unknown[]) => String(c[0]).includes('/api/sessions/live-c/restart'),
+    )
+    expect(hitRestart).toBe(false)
+  })
+
   it('toggles terminal container on double click (expand then collapse)', async () => {
     renderCard(<SessionCard sessionName="task-toggle" initialStatus="idle" onKill={() => {}} />)
     const container = screen.getByTestId('terminal-container')

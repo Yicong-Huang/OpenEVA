@@ -72,6 +72,10 @@ const KEYS = {
   intervalSlackMonitor: 'service.intervals.slack_monitor_seconds',
   intervalUsageRefresh: 'service.intervals.usage_refresh_seconds',
   intervalCertCheck: 'service.intervals.cert_check_seconds',
+  // Task PR background sync cadences. Dirty pass consumes notification
+  // flags; full pass is a backstop refresh of all open task PRs.
+  intervalPrSyncDirty: 'service.intervals.pr_sync_dirty_seconds',
+  intervalPrSyncFull: 'service.intervals.pr_sync_full_seconds',
 } as const
 
 type SettingsBag = Record<string, unknown>
@@ -405,6 +409,12 @@ const INTERVAL_ROWS: IntervalRow[] = [
   { key: KEYS.jiraSyncInterval, label: 'JIRA sync',
     defaultSeconds: 300, minSeconds: 30,
     description: 'How often to refresh the JIRA tickets cache (powers the Tickets page).' },
+  { key: KEYS.intervalPrSyncDirty, label: 'Task PR sync (dirty)',
+    defaultSeconds: 60, minSeconds: 30,
+    description: 'How often to refresh task PRs the notification poller flagged as changed. Cheap GraphQL batch; no-op when nothing is dirty.' },
+  { key: KEYS.intervalPrSyncFull, label: 'Task PR sync (full)',
+    defaultSeconds: 600, minSeconds: 120,
+    description: 'Backstop pass that refreshes all open task PRs so a dropped notification does not leave a PR stale.' },
 ]
 
 function IntervalsTab({ bag, save, saving }: TabProps) {

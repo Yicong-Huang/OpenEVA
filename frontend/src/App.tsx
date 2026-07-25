@@ -228,6 +228,8 @@ function AppInner() {
         onNavigate={handleNavigate}
         onSelectTask={setTaskId}
         onSelectPR={setSelectedPR}
+        onSelectReview={setSelectedReviewUrl}
+        onSelectTicket={setRequestedTicket}
       />
       <SetupBanner />
       <div className="app-body">

@@ -1,7 +1,51 @@
 """Session management core logic. Direct tmux + config_db access."""
 
+import glob
+import json
+import os
+
 import app_state
 from adapters.tmux import session_exists, launch_session_argv, graceful_kill_session
+
+# Root where Claude Code stores per-cwd transcripts
+# (`<root>/<encoded-cwd>/<uuid>.jsonl`). Module-level so tests can
+# repoint it at a temp dir. `os.path.expanduser` is deferred to call
+# time so a test monkeypatching this constant takes effect.
+CLAUDE_PROJECTS_DIR = "~/.claude/projects"
+
+
+def _local_transcript_cwd(session_uuid: str) -> str | None:
+    """Return the original working directory of a local Claude session.
+
+    `claude --resume UUID` is cwd-sensitive: it only finds the
+    transcript when launched from the same directory the session was
+    created in (Claude keys transcripts by an encoding of that cwd).
+    We recover that directory from the transcript itself -- the first
+    record carries a `cwd` field -- so resume can launch from the right
+    place instead of a hardcoded `~`.
+
+    Returns None when no transcript exists for the uuid (e.g. a cloud
+    session id, or a transcript that was deleted), letting the caller
+    fall back to its default working dir."""
+    if not session_uuid:
+        return None
+    root = os.path.expanduser(CLAUDE_PROJECTS_DIR)
+    matches = glob.glob(os.path.join(root, "*", f"{session_uuid}.jsonl"))
+    if not matches:
+        return None
+    try:
+        with open(matches[0], encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                cwd = rec.get("cwd")
+                if cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
 
 
 def _enrich(s: dict) -> dict:
@@ -35,6 +79,9 @@ def list_all_sessions():
     all_sessions = app_state._db.list_sessions()
     result = {}
     for s in all_sessions:
+        tmux_name = s.get("tmux_name") or s.get("task_id") or ""
+        if tmux_name.startswith(("ticket-", "review-", "cron-")):
+            continue
         pid = s["project"]
         if pid in hidden:
             continue
@@ -87,14 +134,25 @@ def open_session(task_id, project_id, action_id="open", custom_prompt=None,
     is_new = session is None
     needs_launch = is_new or not session_exists(session_name)
 
+    from . import agent as _agent
+    new_agent = _agent.get_agent_for_new_session()
+    # Agents without a launch-time system-prompt channel (e.g. Codex)
+    # can't carry `bg_system` in the launch argv. For them we launch
+    # bare and fold the background into the FIRST delivered prompt
+    # instead (see the return value below). `needs_launch` marks that
+    # first turn -- a re-click on an already-running session skips this.
+    fold_bg_into_prompt = needs_launch and not new_agent.system_prompt_via_launch
     if needs_launch:
         working_dir = proj.get("working_dir", "~")
-        from . import agent as _agent
-        argv = _agent.launch_argv(session_name, system_prompt=bg_system)
+        launch_system = bg_system if new_agent.system_prompt_via_launch else None
+        argv = new_agent.launch_argv(session_name, system_prompt=launch_system)
         launch_session_argv(session_name, working_dir, argv)
 
     if is_new:
-        app_state._db.create_session(task_id, project_id)
+        # Record which agent launched the session so resume uses the
+        # same one (codex ids and Claude UUIDs aren't interchangeable).
+        app_state._db.create_session(task_id, project_id,
+                                     agent_impl=new_agent.id)
         # Seed the session-state cache so the new row appears in the
         # global snapshot before the agent's SessionStart hook (2-5s lag)
         # gets a chance to fire. Emits `session.state` on the bus,
@@ -113,11 +171,24 @@ def open_session(task_id, project_id, action_id="open", custom_prompt=None,
             "severity": "info",
             "session": session_name,
         }, persist=False)
+    elif needs_launch:
+        # Row exists but the pane was gone, so we just launched a fresh
+        # process (not a resume) with `new_agent` -- keep agent_impl in
+        # sync with what's actually running.
+        app_state._db.update_session(task_id, agent_impl=new_agent.id)
+
+    # For agents that can't take a launch-time system prompt, prepend the
+    # background to the first delivered prompt so the session still gets
+    # its context (Codex reads the whole first message as turn one).
+    delivered_prompt = action_prompt
+    if fold_bg_into_prompt and bg_system:
+        delivered_prompt = (f"{bg_system}\n\n{action_prompt}"
+                            if action_prompt else bg_system)
 
     return {
         "session": session_name,
         "new": is_new,
-        "prompt": action_prompt,
+        "prompt": delivered_prompt,
     }
 
 
@@ -208,21 +279,31 @@ def resume_session(session_name):
     working_dir = (proj.get("working_dir", "~") if proj else "~") or "~"
 
     from . import agent as _agent
+    # Resume with the agent that launched this session, not the global
+    # active agent -- codex session ids and Claude transcript UUIDs are
+    # not interchangeable. Empty `agent_impl` (legacy row) resolves to
+    # the default agent inside `get_agent_by_id`.
+    sess_agent = _agent.get_agent_by_id(session.get("agent_impl", "") or "")
     uuid = (session.get("agent_session_id") or "").strip()
     if uuid:
-        # Use the agent's own `resume` subcommand (NOT `--resume`,
-        # which transparent-passes through to claude). An exact UUID
-        # match resumes non-interactively -- required because the
-        # tmux session we spawn is detached and can't drive an
-        # interactive picker.
-        argv = _agent.resume_argv(uuid)
+        # `resume_argv` routes by id shape: a transcript UUID resumes
+        # the LOCAL conversation via `--resume` (cloud-independent),
+        # while a numeric cloud id goes through the cloud `resume`
+        # subcommand. Local resume is cwd-sensitive, so launch from the
+        # directory the session was actually created in (recovered from
+        # the transcript) rather than the project/`~` default. Cloud
+        # ids have no local transcript and keep the project working dir.
+        transcript_cwd = _local_transcript_cwd(uuid)
+        if transcript_cwd:
+            working_dir = transcript_cwd
+        argv = sess_agent.resume_argv(uuid)
         action = "resumed"
     else:
         # No UUID on record (legacy row written before the column
         # existed). Best effort: launch a fresh agent under the same
         # tmux name so the card comes back alive; conversation history
         # is lost in this branch.
-        argv = _agent.launch_argv(session_name)
+        argv = sess_agent.launch_argv(session_name)
         action = "relaunched"
     launch_session_argv(session_name, working_dir, argv)
 
@@ -271,6 +352,43 @@ def resume_session(session_name):
         "session": project_id,
     }, persist=False)
     return {"session": session_name, "action": action, "running": True, "agent_session_id": uuid}
+
+
+def restart_session(session_name):
+    """Restart a live session: kill its tmux but KEEP the DB row (and
+    thus the `agent_session_id`), then resume so the agent reconnects
+    to the same conversation.
+
+    Use case: the agent binary or its config was updated and the
+    running session needs to be relaunched to pick up the change --
+    without losing the conversation. This is the live-session analog
+    of `resume_session` (which only relaunches an already-dead tmux).
+
+    Distinct from `kill_session`, which deletes the DB row and forgets
+    the agent session id. Here we graceful-kill tmux, wait for it to
+    actually disappear, then hand off to `resume_session` (which only
+    launches when tmux is absent and reuses the stored UUID)."""
+    session = app_state._db.get_session(session_name)
+    if not session:
+        raise ValueError(f"Session not found: {session_name}")
+
+    if session_exists(session_name):
+        # Graceful kill (Ctrl+C + grace + tmux kill). Crucially we do
+        # NOT call kill_session() here -- that would delete the DB row
+        # and drop the UUID we need for resume.
+        graceful_kill_session(session_name)
+        # graceful_kill_session is synchronous through tmux kill-session,
+        # but poll to be certain tmux is gone before resume re-binds the
+        # name (resume no-ops if it still sees the session alive).
+        import time as _time
+        for _ in range(20):
+            if not session_exists(session_name):
+                break
+            _time.sleep(0.25)
+
+    result = resume_session(session_name)
+    result["restarted"] = True
+    return result
 
 
 def kill_session(session_name):
@@ -438,7 +556,8 @@ def open_project_session(project_id: str) -> dict:
         bg = build_project_background_system(proj, tasks)
         working_dir = proj.get("working_dir", "~")
         from . import agent as _agent
-        argv = _agent.launch_argv(tmux_name, system_prompt=bg)
+        argv = _agent.get_agent_for_new_session().launch_argv(
+            tmux_name, system_prompt=bg)
         launch_session_argv(tmux_name, working_dir, argv)
         app_state._db.create_project_session(project_id, tmux_name)
         if is_new:
@@ -464,6 +583,34 @@ def get_project_session(project_id: str) -> dict | None:
     if not record:
         return None
     return {**record, "running": session_exists(record["tmux_name"])}
+
+
+def list_project_manager_sessions(*, live_only: bool = True) -> list[dict]:
+    """Return project-manager session rows enriched for UI lists.
+
+    Project managers live in their own `project_sessions` table rather
+    than the task `sessions` table, so `/api/all-sessions` intentionally
+    does not include them. This helper gives Live Tasks one compact
+    source for manager rows while respecting hidden projects.
+    """
+    from . import settings as _settings
+    hidden = _settings.get_hidden_projects()
+    out: list[dict] = []
+    for row in app_state._db.list_project_sessions():
+        pid = row.get("project_id", "")
+        if pid in hidden:
+            continue
+        tmux_name = row.get("tmux_name", "")
+        running = session_exists(tmux_name)
+        if live_only and not running:
+            continue
+        proj = app_state._db.get_project(pid) or {}
+        out.append({
+            **row,
+            "project_name": proj.get("name", pid),
+            "running": running,
+        })
+    return out
 
 
 def kill_project_session(project_id: str) -> dict:

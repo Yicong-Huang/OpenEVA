@@ -596,6 +596,33 @@ class TestPollerAccessorsDelegate:
         assert slack_monitor.get_interval_seconds() == 10
 
 
+class TestPrSyncIntervalKeys:
+    """The task-PR background sync jobs (server.py) read these keys via
+    the shared `get_interval_seconds` accessor, mirroring review_sync.
+    Lock the key names + default/clamp contract so a rename doesn't
+    silently reschedule at the wrong cadence."""
+
+    def test_dirty_default_60s(self, patched_server):
+        assert core_settings.get_interval_seconds(
+            core_settings.KEY_INTERVAL_PR_SYNC_DIRTY, 60, min_s=30) == 60
+
+    def test_full_default_600s(self, patched_server):
+        assert core_settings.get_interval_seconds(
+            core_settings.KEY_INTERVAL_PR_SYNC_FULL, 600, min_s=120) == 600
+
+    def test_dirty_override_honored(self, patched_server):
+        patched_server._db.set_setting(
+            core_settings.KEY_INTERVAL_PR_SYNC_DIRTY, 90)
+        assert core_settings.get_interval_seconds(
+            core_settings.KEY_INTERVAL_PR_SYNC_DIRTY, 60, min_s=30) == 90
+
+    def test_full_below_floor_clamps(self, patched_server):
+        patched_server._db.set_setting(
+            core_settings.KEY_INTERVAL_PR_SYNC_FULL, 1)
+        assert core_settings.get_interval_seconds(
+            core_settings.KEY_INTERVAL_PR_SYNC_FULL, 600, min_s=120) == 120
+
+
 class TestJiraSyncUsesSharedAccessor:
     """`services.jira_sync.get_interval_seconds` is now a one-liner
     delegate to `common.settings.get_interval_seconds`. Lock that the

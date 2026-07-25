@@ -4,12 +4,67 @@ Network is never hit -- `adapters.jira._http_get` is replaced with an
 in-memory fake that returns canned issue payloads.
 """
 
+import re
+import urllib.error
+
 import common
 import pytest
 
 from adapters import jira as jira_adapter
 from common import tickets as core_tickets
 from common import settings as core_settings
+
+
+@pytest.fixture(autouse=True)
+def _clear_severity_cache():
+    """The Severity custom-field id is cached in a module-level dict
+    keyed by instance name (a per-process perf optimisation). Tests
+    reuse the process, so clear it between tests to keep
+    severity-detection assertions order-independent."""
+    core_tickets._SEVERITY_FIELD_CACHE.clear()
+    yield
+    core_tickets._SEVERITY_FIELD_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _widen_ticket_prefixes(monkeypatch):
+    """The scope rule admits only keys whose prefix is in the configured
+    allow-list, with an empty list meaning "no restriction". Legacy tests
+    in this file use PROJ-/ABC-/... fake keys, so force the allow-list
+    empty here to admit every prefix. Strictness itself is covered by
+    TestTicketPrefixAllowList, whose class fixture re-narrows it."""
+    monkeypatch.setattr(
+        core_tickets._settings, "get_ticket_allowed_prefixes",
+        lambda: (),
+    )
+
+
+def _router(*, search, issues=None, fields=None):
+    """Build a URL-aware fake `http_get` for the multi-call sync path.
+
+    Routes by URL:
+      - `/field`         -> the field catalogue (a list), default [].
+      - `/issue/<KEY>`   -> a single raw issue dict from `issues`, or a
+                            404 HTTPError when the key isn't in the map
+                            (mirrors a ticket deleted/hidden in JIRA).
+      - everything else  -> `{"issues": [...]}` from `search` (a list or
+                            a zero-arg callable returning a list).
+    """
+    issues = issues or {}
+
+    def fn(url, headers, timeout=15):
+        if "/field" in url:
+            return fields if fields is not None else []
+        m = re.search(r"/issue/([^/?]+)", url)
+        if m:
+            key = m.group(1)
+            if key in issues:
+                return issues[key]
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        rows = search() if callable(search) else search
+        return {"issues": list(rows)}
+
+    return fn
 
 
 # ---- Fake JIRA payloads (small but representative) ----
@@ -576,6 +631,131 @@ class TestNormaliseIssue:
         assert out["assignee_email"] == ""
         assert out["status"] == ""
 
+    def test_severity_blank_without_field_id(self):
+        # No severity_field_id -> severity stays "" even if a custom
+        # field is present on the issue.
+        issue = _fake_issue("S-1")
+        issue["fields"]["customfield_10042"] = {"value": "Sev. 1"}
+        out = core_tickets._normalise_issue(issue, self._INST)
+        assert out["severity"] == ""
+
+    def test_severity_extracted_from_custom_field(self):
+        # Select-list custom fields arrive as {"value": ...}.
+        issue = _fake_issue("S-2")
+        issue["fields"]["customfield_10042"] = {"value": "Sev. 2"}
+        out = core_tickets._normalise_issue(
+            issue, self._INST, severity_field_id="customfield_10042")
+        assert out["severity"] == "Sev. 2"
+
+
+class TestCoerceFieldValue:
+    def test_none_and_str(self):
+        assert core_tickets._coerce_field_value(None) == ""
+        assert core_tickets._coerce_field_value("  Sev. 1 ") == "Sev. 1"
+
+    def test_dict_value_then_name(self):
+        assert core_tickets._coerce_field_value({"value": "X"}) == "X"
+        assert core_tickets._coerce_field_value({"name": "Y"}) == "Y"
+
+    def test_list_joins_non_empty(self):
+        raw = [{"value": "A"}, {"value": ""}, {"value": "B"}]
+        assert core_tickets._coerce_field_value(raw) == "A, B"
+
+
+class TestSeverityDetection:
+    def test_detects_and_persists_field_id_and_extracts(self, patched_server):
+        _configure_jira(patched_server._db, name="sev-inst")
+        catalogue = [
+            {"id": "summary", "name": "Summary"},
+            {"id": "customfield_10042", "name": "Severity"},
+        ]
+        issue = _fake_issue("SEV-1")
+        issue["fields"]["customfield_10042"] = {"value": "Sev. 2"}
+        core_tickets.sync(http_get=_router(search=[issue], fields=catalogue))
+        cached = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert cached["SEV-1"]["severity"] == "Sev. 2"
+        # The resolved id is persisted so later ticks skip the catalogue.
+        assert core_settings.get_value(
+            "jira.severity_field.sev-inst") == "customfield_10042"
+
+    def test_no_severity_field_persists_empty_sentinel(self, patched_server):
+        _configure_jira(patched_server._db, name="nosev")
+        catalogue = [{"id": "summary", "name": "Summary"}]
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("N-1")], fields=catalogue))
+        # "" persisted so we don't re-query the catalogue every tick.
+        assert core_settings.get_value("jira.severity_field.nosev") == ""
+
+    def test_picks_label_field_over_numeric_among_candidates(self, patched_server):
+        # A big JIRA has several "severity"-named fields, some populated
+        # with useless numeric scores ("1.0") and one with the real
+        # human label ("SEV1 High"). Even though BOTH are populated, the
+        # label field must win (an enterprise JIRA's real-world case).
+        _configure_jira(patched_server._db, name="multi")
+        catalogue = [
+            {"id": "customfield_1", "name": "Severity"},  # numeric decoy
+            {"id": "customfield_2", "name": "Support Severity Level"},
+            {"id": "summary", "name": "Summary"},
+        ]
+        issue = _fake_issue("M-1")
+        issue["fields"]["customfield_1"] = 1.0          # numeric score
+        issue["fields"]["customfield_2"] = {"value": "SEV1 High"}  # label
+        core_tickets.sync(http_get=_router(search=[issue], fields=catalogue))
+        cached = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert cached["M-1"]["severity"] == "SEV1 High"
+        assert core_settings.get_value(
+            "jira.severity_field.multi") == "customfield_2"
+
+
+class TestPermanentRetention:
+    def test_left_jql_rows_survive_indefinitely(self, patched_server):
+        # A ticket that left the JQL long ago (way past the old 7-day
+        # grace) must STAY cached -- triaged/resolved history is kept
+        # forever now.
+        db = patched_server._db
+        _configure_jira(db)
+        ancient = "2020-01-01T00:00:00.000000"
+        db.upsert_ticket(key="EX-100", summary="old triaged",
+                         synced_at=ancient, left_jql_at=ancient)
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("EX-101")],
+            issues={"EX-100": _fake_issue(
+                "EX-100", assignee="someone@else.com")},
+        ))
+        keys = [t["key"] for t in core_tickets.list_tickets()]
+        assert "EX-100" in keys
+
+    def test_sync_summary_has_no_pruned_field(self, patched_server):
+        _configure_jira(patched_server._db)
+        out = core_tickets.sync(http_get=_router(
+            search=[_fake_issue("EX-1")]))
+        assert "pruned" not in out
+
+
+class TestTrackPinning:
+    def test_track_pins_manually_added_ticket(self, patched_server):
+        _configure_jira(patched_server._db)
+        issue = _fake_issue("TRK-1", assignee="someone@else.com")
+        out = core_tickets.track(
+            "TRK-1", http_get=_router(search=[], issues={"TRK-1": issue}))
+        assert out is not None
+        row = {t["key"]: t
+               for t in patched_server._db.list_tickets()}["TRK-1"]
+        assert row["pinned"] is True
+
+    def test_pinned_ticket_survives_jql_sync_without_badge(self, patched_server):
+        _configure_jira(patched_server._db)
+        issue = _fake_issue("PIN-9", assignee="other@example.com")
+        core_tickets.track(
+            "PIN-9", http_get=_router(search=[], issues={"PIN-9": issue}))
+        # A scheduled sync whose JQL returns only my own ticket -- PIN-9
+        # leaves the result set but must stay (pinned) and stay un-badged.
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("MINE-1")], issues={"PIN-9": issue}))
+        by_key = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert "PIN-9" in by_key
+        assert by_key["PIN-9"]["left_jql_at"] == ""
+
 
 class TestSync:
     def test_sync_inserts_issues_into_cache(self, patched_server):
@@ -592,34 +772,51 @@ class TestSync:
         keys = sorted(t["key"] for t in cached)
         assert keys == ["PROJ-1", "PROJ-2"]
 
-    def test_sync_prunes_tickets_no_longer_in_jql(self, patched_server):
+    def test_sync_keeps_and_badges_ticket_that_left_jql(self, patched_server):
+        # A ticket that drops out of the JQL (reassigned / resolved) is
+        # re-fetched, KEPT, and badged via left_jql_at -- never silently
+        # pruned. This is the fix for "ticket disappeared / didn't update".
         _configure_jira(patched_server._db)
-        # Round 1: two tickets returned.
-        def round1(url, headers, timeout=15):
-            return {"issues": [_fake_issue("A-1"), _fake_issue("A-2")]}
-        core_tickets.sync(http_get=round1)
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("A-1"), _fake_issue("A-2")]))
         assert len(core_tickets.list_tickets()) == 2
-        # Round 2: only A-1 returned -- A-2 should be pruned.
-        def round2(url, headers, timeout=15):
-            return {"issues": [_fake_issue("A-1")]}
-        out = core_tickets.sync(http_get=round2)
+        # Round 2: A-2 left my queue (now assigned to someone else).
+        a2_reassigned = _fake_issue("A-2", assignee="someone@else.com")
+        out = core_tickets.sync(http_get=_router(
+            search=[_fake_issue("A-1")], issues={"A-2": a2_reassigned}))
         assert out["count"] == 1
-        assert out["pruned"] >= 1
+        assert out["left"] >= 1
+        by_key = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert "A-2" in by_key
+        assert by_key["A-2"]["left_jql_at"]  # badge stamped
+        assert by_key["A-2"]["assignee_email"] == "someone@else.com"
+        # A-1 is still active -> no badge.
+        assert by_key["A-1"]["left_jql_at"] == ""
+
+    def test_sync_detaches_ticket_deleted_in_jira(self, patched_server):
+        # When a disappeared ticket also 404s on re-fetch (deleted or no
+        # longer visible in JIRA) we detach it immediately -- there's
+        # nothing to keep.
+        _configure_jira(patched_server._db)
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("A-1"), _fake_issue("A-2")]))
+        # A-2 gone from JQL, and the issue map has no A-2 -> 404 on refetch.
+        core_tickets.sync(http_get=_router(search=[_fake_issue("A-1")]))
         keys = [t["key"] for t in core_tickets.list_tickets()]
         assert "A-1" in keys
         assert "A-2" not in keys
 
-    def test_sync_does_not_prune_other_users_tickets(self, patched_server):
-        # A coworker's cached ticket must survive my sync.
+    def test_sync_does_not_drop_other_users_tickets(self, patched_server):
+        # A coworker's cached ticket must survive my sync (kept + badged).
         patched_server._db.upsert_ticket(
             key="OTHER-1", summary="not mine",
-            assignee_email="coworker@example.com", synced_at="2026-01-01T00:00:00",
+            assignee_email="coworker@example.com",
+            synced_at="2026-01-01T00:00:00",
         )
         _configure_jira(patched_server._db, email="dev@example.com")
-        def fake_get(url, headers, timeout=15):
-            return {"issues": [_fake_issue("MINE-1")]}
-        core_tickets.sync(http_get=fake_get)
-        # Coworker's ticket still in the cache (different assignee_email).
+        other_now = _fake_issue("OTHER-1", assignee="coworker@example.com")
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("MINE-1")], issues={"OTHER-1": other_now}))
         keys = [t["key"] for t in patched_server._db.list_tickets()]
         assert "OTHER-1" in keys
 
@@ -638,6 +835,34 @@ class TestSync:
         out = core_tickets.sync(http_get=fake_get)
         # OK-1 indexed, malformed silently skipped.
         assert out["count"] == 1
+
+
+class TestTicketDetailHistoryAndPRs:
+    """A ticket IS a task row, so its detail view (get_one) carries the
+    same task-keyed history + PRs as any project task."""
+
+    def test_get_one_attaches_history_and_prs(self, patched_server):
+        _configure_jira(patched_server._db)
+        patched_server._db.upsert_ticket(
+            instance_name="primary", key="EX-4242", summary="ticket w/ work",
+        )
+        # ticket task_id == key, project == prefix (EX) after upsert.
+        patched_server._db.append_task_history("EX", "EX-4242", "started digging")
+        patched_server._db.add_pr("EX", "EX-4242", 777, url="https://gh/pr/777")
+
+        detail = core_tickets.get_one("EX-4242", instance_name="primary")
+        assert detail is not None
+        assert any("started digging" in h["text"] for h in detail["history"])
+        assert any(p["number"] == 777 for p in detail["prs"])
+
+    def test_get_one_empty_history_and_prs_when_none(self, patched_server):
+        _configure_jira(patched_server._db)
+        patched_server._db.upsert_ticket(
+            instance_name="primary", key="EX-4243", summary="fresh",
+        )
+        detail = core_tickets.get_one("EX-4243", instance_name="primary")
+        assert detail["history"] == []
+        assert detail["prs"] == []
 
 
 class TestListTickets:
@@ -888,7 +1113,7 @@ class TestTriage:
             issue_type="Bug",
             assignee_email="alice@example.com",
             reporter_email="bob@example.com",
-            project_key="ES",
+            project_key="EX",
             components='["SQL Core"]',
             labels='["flaky", "needs-triage"]',
         )
@@ -911,7 +1136,7 @@ class TestTriage:
         assert out["owner"]["reporter"] == "bob@example.com"
         assert "SQL Core" in out["owner"]["components"]
         assert "flaky" in out["owner"]["labels"]
-        assert out["owner"]["project_key"] == "ES"
+        assert out["owner"]["project_key"] == "EX"
         # Files referenced: extracted from description.
         files = out["files_referenced"]
         assert "src/Foo.py" in files
@@ -1420,7 +1645,7 @@ class TestSyncLegacyWrapper:
     `sync_all` directly."""
 
     def test_sync_empty_when_no_instances_configured(self, patched_server):
-        # Returns the legacy {count, pruned, jql} shape with errors
+        # Returns the legacy {count, jql} shape with errors
         # captured -- no exception even when there's nothing to sync.
         import pytest
         # `sync_all` raises when no instances; legacy wrapper bubbles.
@@ -1952,7 +2177,10 @@ class TestPhase4Track:
                 fp=None,  # type: ignore[arg-type]
             )
         monkeypatch.setattr(_jira_adapter, "_http_get", fake_get)
-        r = client.post("/api/tickets/MISSING/track", json={})
+        # EX- prefix keeps the key inside the scope allow-list; the
+        # 404 here must come from JIRA not knowing the key, not from
+        # the prefix rule (which would be a 422).
+        r = client.post("/api/tickets/EX-999999/track", json={})
         assert r.status_code == 404
 
     def test_route_returns_enriched_payload_for_freshly_tracked(
@@ -2296,6 +2524,13 @@ class TestOpenSessionForTicket:
         assert core_tickets.session_name_for_ticket("ABC-1") == "ticket-ABC-1"
 
     def test_open_session_invokes_launcher_with_agent_argv(self, patched_server):
+        # Pin the new-session agent to a Claude-family binary so this
+        # mechanics test keeps asserting the `-n` /
+        # `--append-system-prompt` shape (a Codex-family agent is the
+        # default; its distinct argv is covered in test_agent.py).
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         # Seed a ticket so the cache lookup succeeds.
         patched_server._db.upsert_ticket(
             key="OPS-99", summary="Audit logging",
@@ -2317,13 +2552,33 @@ class TestOpenSessionForTicket:
                        "ticket_key": "OPS-99", "instance_name": "",
                        "prompt_sent": False}
         assert captured["name"] == "ticket-OPS-99"
-        assert captured["argv"][0] in ("agent", "claude")  # active agent
+        assert "agent" in captured["argv"] or "claude" in captured["argv"]
         assert "-n" in captured["argv"]
         # The system prompt carries the ticket summary.
         sys_prompt_idx = captured["argv"].index("--append-system-prompt") + 1
         sys_prompt = captured["argv"][sys_prompt_idx]
         assert "OPS-99" in sys_prompt
         assert "Audit logging" in sys_prompt
+
+    def test_open_session_persists_recoverable_session_row(self, patched_server):
+        patched_server._db.upsert_ticket(
+            key="OPS-99", summary="Audit logging",
+            description="add audit logs to admin endpoints",
+            status="Open", url="https://j.example/browse/OPS-99",
+        )
+
+        def fake_launch(*_a, **_kw):
+            pass
+
+        core_tickets.open_session_for_ticket(
+            "OPS-99", launcher=fake_launch,
+        )
+
+        row = patched_server._db.get_session("ticket-OPS-99")
+        assert row is not None
+        assert row["task_id"] == "ticket-OPS-99"
+        assert row["tmux_name"] == "ticket-OPS-99"
+        assert row["project"] == ""
 
     def test_open_session_404_for_missing_ticket(self, client):
         # No ticket in cache.
@@ -2335,6 +2590,12 @@ class TestOpenSessionForTicket:
         """Phase-5 action buttons supply a `custom_prompt` that the
         executor pastes into the session post-launch. Tests inject a
         fake `paste` so they don't shell out to tmux."""
+        # Pin to a Claude-family agent so the pasted text is the raw
+        # custom_prompt. Codex folds bg_system into the first paste
+        # (covered separately); that's a different assertion.
+        from common import agent as _agent
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         patched_server._db.upsert_ticket(
             key="ACT-1", summary="some flaky test",
         )
@@ -2587,7 +2848,7 @@ class TestSyncLegacyAllFail:
     """`sync()` is the back-compat wrapper around `sync_all`. When
     every configured instance fails, `sync_all` returns successfully
     with an empty `instances` list and the per-instance errors. The
-    legacy wrapper must surface as `{count: 0, pruned: 0, ...}` rather
+    legacy wrapper must surface as `{count: 0, ...}` rather
     than crash on `out['instances'][0]`."""
 
     def test_returns_legacy_shape_when_every_instance_fails(
@@ -2605,7 +2866,6 @@ class TestSyncLegacyAllFail:
         monkeypatch.setattr(core_tickets, "sync_one", boom)
         out = core_tickets.sync()
         assert out["count"] == 0
-        assert out["pruned"] == 0
         assert out["jql"] == ""
         assert out["errors"] and out["errors"][0]["name"] == "broken"
 
@@ -2637,10 +2897,11 @@ class TestTrackFiltersInstanceName:
             "BETA-1", instance_name="beta", http_get=fake_get,
         )
         assert out is not None
-        # Exactly one probe -- and it MUST be against beta's base_url.
-        assert len(seen_urls) == 1
-        assert "b.example" in seen_urls[0]
-        assert "a.example" not in seen_urls[0]
+        # Every probe (severity field catalogue + the issue fetch) MUST
+        # target beta's base_url -- alpha is never touched.
+        assert seen_urls  # at least one call was made
+        assert all("b.example" in u for u in seen_urls)
+        assert all("a.example" not in u for u in seen_urls)
 
 
 class TestResolveInstanceForTicket:
@@ -2707,7 +2968,12 @@ class TestPasteFallbacks:
         # eventually appears. Without this fallback the user's prompt
         # would be silently dropped on slow systems.
         from adapters import tmux as _tmux
+        from common import agent as _agent
         self._setup_ticket(patched_server)
+        # Pin Claude-family so the paste is the raw prompt (Codex would
+        # fold ticket context into it -- separate concern).
+        patched_server._db.set_setting(
+            _agent.KEY_NEW_SESSION_AGENT_IMPL, "claude")
         pastes = []
         monkeypatch.setattr(_tmux, "session_exists", lambda n: False)
         monkeypatch.setattr(_tmux, "launch_session_argv",
@@ -2742,3 +3008,272 @@ class TestPasteFallbacks:
         assert out["session"] == "ticket-PST-1"
         captured = capsys.readouterr().out
         assert "paste prompt for PST-1 failed" in captured
+
+
+class TestTicketPrefixAllowList:
+    @pytest.fixture(autouse=True)
+    def _strict(self, monkeypatch, _widen_ticket_prefixes):
+        # Re-narrow to a concrete allow-list. Depending on
+        # `_widen_ticket_prefixes` forces this to run AFTER the
+        # module-level widener, so the narrow value wins.
+        monkeypatch.setattr(
+            core_tickets._settings, "get_ticket_allowed_prefixes",
+            lambda: ("EX", "INTKEY"))
+
+    def test_sync_skips_non_allowed_keys(self, patched_server):
+        _configure_jira(patched_server._db)
+        out = core_tickets.sync(http_get=_router(search=[
+            _fake_issue("EX-1"), _fake_issue("INTKEY-2"),
+            _fake_issue("SPARK-3"), _fake_issue("MYPROJ-4"),
+        ]))
+        assert out["count"] == 2
+        keys = sorted(t["key"] for t in core_tickets.list_tickets())
+        assert keys == ["EX-1", "INTKEY-2"]
+
+    def test_track_rejects_non_allowed_prefix(self, patched_server):
+        _configure_jira(patched_server._db)
+        with pytest.raises(ValueError, match="EX/INTKEY"):
+            core_tickets.track("SPARK-123")
+
+    def test_track_accepts_allowed_prefix(self, patched_server):
+        _configure_jira(patched_server._db)
+        issue = _fake_issue("EX-77")
+        out = core_tickets.track(
+            "EX-77", http_get=_router(search=[], issues={"EX-77": issue}))
+        assert out is not None and out["key"] == "EX-77"
+
+    def test_list_hides_legacy_non_allowed_rows(self, patched_server):
+        # Rows that entered the cache before the scope rule (SPARK-,
+        # other project links) must not surface in the queue.
+        db = patched_server._db
+        _configure_jira(db)
+        db.upsert_ticket(key="SPARK-9", summary="legacy",
+                         synced_at=core_tickets._now_iso())
+        db.upsert_ticket(key="EX-9", summary="ok",
+                         synced_at=core_tickets._now_iso())
+        keys = [t["key"] for t in core_tickets.list_tickets()]
+        assert "SPARK-9" not in keys
+        assert "EX-9" in keys
+
+
+class TestDisappearedRefetchConvergence:
+    def test_already_badged_rows_are_not_refetched(self, patched_server):
+        _configure_jira(patched_server._db)
+        # Tick 1: EX-1 + EX-2 both in my JQL.
+        core_tickets.sync(http_get=_router(
+            search=[_fake_issue("EX-1"), _fake_issue("EX-2")]))
+        # Tick 2: EX-2 left the JQL -> one re-fetch + badge.
+        reassigned = _fake_issue("EX-2", assignee="someone@else.com")
+        calls = {"es2_fetches": 0}
+        inner = _router(search=[_fake_issue("EX-1")],
+                        issues={"EX-2": reassigned})
+
+        def counting_get(url, headers, timeout=15):
+            if "/issue/EX-2" in url:
+                calls["es2_fetches"] += 1
+            return inner(url, headers, timeout)
+
+        core_tickets.sync(http_get=counting_get)
+        assert calls["es2_fetches"] == 1
+        by_key = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert by_key["EX-2"]["left_jql_at"] != ""
+        # Tick 3: same JQL result -- EX-2 is already badged, so it
+        # must NOT be fetched again.
+        core_tickets.sync(http_get=counting_get)
+        assert calls["es2_fetches"] == 1
+
+    def test_pinned_rows_keep_refreshing(self, patched_server):
+        # Pinned (manually tracked) rows never get badged, and must
+        # keep being refreshed every tick so their status stays live.
+        _configure_jira(patched_server._db)
+        issue = _fake_issue("EX-5", assignee="other@example.com")
+        core_tickets.track(
+            "EX-5", http_get=_router(search=[], issues={"EX-5": issue}))
+        calls = {"es5_fetches": 0}
+        inner = _router(search=[_fake_issue("EX-1")],
+                        issues={"EX-5": issue})
+
+        def counting_get(url, headers, timeout=15):
+            if "/issue/EX-5" in url:
+                calls["es5_fetches"] += 1
+            return inner(url, headers, timeout)
+
+        core_tickets.sync(http_get=counting_get)
+        core_tickets.sync(http_get=counting_get)
+        assert calls["es5_fetches"] == 2
+
+
+class TestSearchIssuesPagination:
+    def test_get_path_follows_start_at_until_total(self):
+        # 230 issues, 100 per page: the GET path must walk startAt
+        # 0 -> 100 -> 200 instead of silently truncating at page 1.
+        all_issues = [_fake_issue(f"EX-{i}") for i in range(230)]
+
+        def fake_get(url, headers, timeout=15):
+            import urllib.parse as up
+            qs = up.parse_qs(up.urlparse(url).query)
+            start = int(qs.get("startAt", ["0"])[0])
+            return {
+                "issues": all_issues[start:start + 100],
+                "total": len(all_issues),
+                "startAt": start,
+            }
+
+        out = jira_adapter.search_issues(
+            base_url="https://j.example",
+            email="d@e.com", api_token="T",
+            jql="*", http_get=fake_get,
+        )
+        assert len(out) == 230
+        assert out[0]["key"] == "EX-0"
+        assert out[-1]["key"] == "EX-229"
+
+    def test_get_path_stops_without_total_field(self):
+        # Fakes (and some servers) omit `total` -- one page, no loop.
+        calls = []
+
+        def fake_get(url, headers, timeout=15):
+            calls.append(url)
+            return {"issues": [_fake_issue("EX-1")]}
+
+        out = jira_adapter.search_issues(
+            base_url="https://j.example",
+            email="d@e.com", api_token="T",
+            jql="*", http_get=fake_get,
+        )
+        assert len(out) == 1
+        assert len(calls) == 1
+
+    def test_post_fallback_follows_next_page_token(self):
+        import urllib.error
+
+        def fake_get(url, headers, timeout=15):
+            raise urllib.error.HTTPError(url, 410, "Gone", {}, None)
+
+        post_payloads = []
+
+        def fake_post(url, headers, payload, timeout=15):
+            post_payloads.append(payload)
+            if "nextPageToken" not in payload:
+                return {"issues": [_fake_issue("EX-1")],
+                        "nextPageToken": "tok-2", "isLast": False}
+            return {"issues": [_fake_issue("EX-2")], "isLast": True}
+
+        out = jira_adapter.search_issues(
+            base_url="https://j.example",
+            email="d@e.com", api_token="T",
+            jql="*", http_get=fake_get, http_post=fake_post,
+        )
+        assert [i["key"] for i in out] == ["EX-1", "EX-2"]
+        assert len(post_payloads) == 2
+        assert post_payloads[1]["nextPageToken"] == "tok-2"
+
+
+class TestUpsertTicketCollision:
+    """The old grace-prune detached ticket rows by clearing ticket_*
+    but KEPT the task row (task_id = the JIRA key). When that ticket
+    later re-enters the JQL, the insert path used to collide on
+    task_id (UNIQUE) and kill the whole instance sync."""
+
+    def _shell(self, db, task_id):
+        db._conn.execute(
+            "INSERT INTO tasks (task_id, project, type, status, priority) "
+            "VALUES (?, '', 'bug', 'not_started', 5)", (task_id,))
+        db._conn.commit()
+
+    def test_reattaches_detached_bare_row(self, patched_server):
+        db = patched_server._db
+        self._shell(db, "EX-500")
+        out = db.upsert_ticket(key="EX-500", summary="back again",
+                               instance_name="example")
+        assert out["summary"] == "back again"
+        rows = db._conn.execute_fetchall(
+            "SELECT task_id FROM tasks WHERE task_id LIKE 'EX-500%'")
+        assert [r["task_id"] for r in rows] == ["EX-500"]
+
+    def test_reattaches_detached_jira_suffix_row(self, patched_server):
+        # Bare id belongs to a live ticket row pointing elsewhere;
+        # the -jira shell is detached -> reattach to the shell.
+        db = patched_server._db
+        db._conn.execute(
+            "INSERT INTO tasks (task_id, project, type, status, priority,"
+            " ticket_id) VALUES ('EX-501', '', 'bug', 'not_started', 5,"
+            " 'OTHER-1')")
+        db._conn.commit()
+        self._shell(db, "EX-501-jira")
+        out = db.upsert_ticket(key="EX-501", summary="reborn",
+                               instance_name="example")
+        assert out["summary"] == "reborn"
+        row = db._conn.execute_fetchone(
+            "SELECT task_id FROM tasks WHERE ticket_id='EX-501'")
+        assert row["task_id"] == "EX-501-jira"
+
+    def test_falls_back_to_numbered_suffix_when_both_taken(self, patched_server):
+        # Both candidate ids taken by rows tracking OTHER tickets ->
+        # insert under EX-502-jira2 instead of raising UNIQUE.
+        db = patched_server._db
+        for tid, other in (("EX-502", "OTHER-2"), ("EX-502-jira", "OTHER-3")):
+            db._conn.execute(
+                "INSERT INTO tasks (task_id, project, type, status,"
+                " priority, ticket_id) VALUES (?, '', 'bug',"
+                " 'not_started', 5, ?)", (tid, other))
+        db._conn.commit()
+        out = db.upsert_ticket(key="EX-502", summary="third id",
+                               instance_name="example")
+        assert out["summary"] == "third id"
+        row = db._conn.execute_fetchone(
+            "SELECT task_id FROM tasks WHERE ticket_id='EX-502'")
+        assert row["task_id"] == "EX-502-jira2"
+
+
+class TestSyncPerIssueIsolation:
+    def test_one_bad_upsert_does_not_kill_instance_sync(
+        self, patched_server, monkeypatch,
+    ):
+        # A single corrupted row (e.g. the task_id UNIQUE collision)
+        # must skip that ticket and keep syncing the rest -- the
+        # previous behavior failed the WHOLE instance, so the cache
+        # rotted while the Sync button appeared to work.
+        _configure_jira(patched_server._db)
+        orig = patched_server._db.upsert_ticket
+
+        def flaky(**kw):
+            if kw.get("key") == "EX-2":
+                raise RuntimeError("UNIQUE constraint failed: tasks.task_id")
+            return orig(**kw)
+
+        monkeypatch.setattr(patched_server._db, "upsert_ticket", flaky)
+        out = core_tickets.sync(http_get=_router(search=[
+            _fake_issue("EX-1"), _fake_issue("EX-2"), _fake_issue("EX-3"),
+        ]))
+        keys = sorted(t["key"] for t in core_tickets.list_tickets())
+        assert keys == ["EX-1", "EX-3"]
+        assert out["count"] == 2
+        assert out.get("errors") == []
+
+
+class TestDisappearedRefetchCapAfterFilter:
+    def test_cap_does_not_starve_unbadged_rows(self, patched_server,
+                                               monkeypatch):
+        # With the refetch cap at 1: two tickets leave the JQL, tick 2
+        # refetches+badges the first. On tick 3 the cap slot must go
+        # to the still-unbadged second ticket -- the old code applied
+        # the cap BEFORE the badged-skip filter, so the same badged
+        # keys ate the whole budget every tick and the rest of the
+        # cache rotted forever.
+        monkeypatch.setattr(core_tickets, "MAX_DISAPPEARED_REFETCH", 1)
+        _configure_jira(patched_server._db)
+        core_tickets.sync(http_get=_router(search=[
+            _fake_issue("EX-1"), _fake_issue("EX-2"), _fake_issue("EX-3"),
+        ]))
+        gone = {
+            "EX-2": _fake_issue("EX-2", assignee="a@else.com"),
+            "EX-3": _fake_issue("EX-3", assignee="b@else.com"),
+        }
+        router = _router(search=[_fake_issue("EX-1")], issues=gone)
+        core_tickets.sync(http_get=router)  # tick 2: refetch EX-2 only
+        core_tickets.sync(http_get=router)  # tick 3: must reach EX-3
+        by_key = {t["key"]: t for t in core_tickets.list_tickets()}
+        assert by_key["EX-2"]["left_jql_at"] != ""
+        assert by_key["EX-3"]["left_jql_at"] != ""
+        assert by_key["EX-3"]["assignee_email"] == "b@else.com"

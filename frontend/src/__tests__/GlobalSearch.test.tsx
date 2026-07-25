@@ -24,6 +24,8 @@ describe('GlobalSearch', () => {
     onNavigate: vi.fn(),
     onSelectTask: vi.fn(),
     onSelectPR: vi.fn(),
+    onSelectReview: vi.fn(),
+    onSelectTicket: vi.fn(),
   })
 
   it('renders the input', () => {
@@ -81,6 +83,39 @@ describe('GlobalSearch', () => {
     expect(props.onSelectPR).toHaveBeenCalledWith({
       repo: 'o/r', number: 100, taskId: 'task-a', projectId: 'p1',
     })
+  })
+
+  it('clicking a ticket result navigates to tickets and selects ticket', async () => {
+    mockSearch.mockResolvedValue({
+      results: [
+        { type: 'ticket', title: 'EX-123', subtitle: 'x', badge: 'Open', project_id: 'EX', task_id: 'EX-123', ticket_key: 'EX-123', ticket_instance: 'primary' },
+      ],
+    })
+    const props = setupProps()
+    render(<GlobalSearch {...props} />)
+    fireEvent.change(screen.getByTestId('global-search-input'), { target: { value: 'type:ticket EX-123' } })
+    await waitFor(() => screen.getByTestId('global-search-result-0'))
+    fireEvent.click(screen.getByTestId('global-search-result-0'))
+    expect(props.onNavigate).toHaveBeenCalledWith(null, 'tickets')
+    expect(props.onSelectTicket).toHaveBeenCalledWith({
+      key: 'EX-123', instance: 'primary',
+    })
+  })
+
+  it('clicking a review result navigates to all-reviews and selects review', async () => {
+    const reviewUrl = 'https://github.com/o/r/pull/300'
+    mockSearch.mockResolvedValue({
+      results: [
+        { type: 'review', title: '#300', subtitle: 'x', badge: 'queued', project_id: '', review_url: reviewUrl, pr_number: 300, pr_repo: 'o/r' },
+      ],
+    })
+    const props = setupProps()
+    render(<GlobalSearch {...props} />)
+    fireEvent.change(screen.getByTestId('global-search-input'), { target: { value: 'type:review 300' } })
+    await waitFor(() => screen.getByTestId('global-search-result-0'))
+    fireEvent.click(screen.getByTestId('global-search-result-0'))
+    expect(props.onNavigate).toHaveBeenCalledWith(null, 'all-reviews')
+    expect(props.onSelectReview).toHaveBeenCalledWith(reviewUrl)
   })
 
   it('clicking a session result navigates to Live Tasks view with the task selected', async () => {
