@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openeva.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/OpenEVA/.venv/bin/python</string>
+    <string>/path/to/OpenEVA/core/src/server.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/path/to/OpenEVA</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/path/to/OpenEVA/core/src</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>EVA_PORT</key>
+    <string>8021</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/OpenEVA/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/OpenEVA/server-error.log</string>
+</dict>
+</plist>

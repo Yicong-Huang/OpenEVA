@@ -70,3 +70,7 @@ tasks.bak/
 
 # Local isaac CLI state (per-user)
 .isaac/
+
+# Local launchd copy of ops/macos/com.openeva.server.plist.example,
+# filled in with per-user absolute paths (launchd cannot expand $HOME).
+ops/macos/com.openeva.server.plist
