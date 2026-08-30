@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import type { Ticket, PR } from '../api'
+import type { Ticket } from '../api'
+import type { PR } from '../types'
 
 // Mock session-status hook (no live session) so the card renders
 // without the SSE provider. Return null = no session.

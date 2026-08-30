@@ -54,7 +54,8 @@ function makeTask(tid: string, project: string) {
   return {
     task_id: tid, project, description: tid + ' desc', type: 'feature',
     status: 'in_progress', group_name: '', notes: '', priority: 1,
-    ticket_id: null, ticket_url: null, dependencies: [], follow_ups: [],
+    ticket_id: null as string | null, ticket_url: null as string | null,
+    dependencies: [], follow_ups: [],
     prs: [], created_at: '', updated_at: '',
     session: { name: tid, running: true, status: 'idle' },
   }

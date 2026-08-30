@@ -81,7 +81,13 @@ const KEYS = {
 } as const
 
 type SettingsBag = Record<string, unknown>
-type RootTab = 'setup' | 'repos' | 'appearance' | 'layout' | 'plugins' | 'intervals'
+export type RootTab =
+  'setup' | 'repos' | 'appearance' | 'layout' | 'plugins' | 'intervals'
+
+/** Runtime companion to `RootTab`, for validating tab names that
+ *  arrive as plain strings (e.g. off an `eva-open-settings` event). */
+export const ROOT_TABS: readonly RootTab[] =
+  ['setup', 'repos', 'appearance', 'layout', 'plugins', 'intervals']
 
 interface PluginDef {
   id: string
@@ -238,7 +244,7 @@ export function SettingsModal({
               <ReposTab bag={bag} save={save} saving={saving} />
             )}
             {bag && tab === 'appearance' && (
-              <AppearanceTab bag={bag} save={save} saving={saving} />
+              <AppearanceTab />
             )}
             {bag && tab === 'layout' && (
               <LayoutTab bag={bag} save={save} saving={saving} />
@@ -991,11 +997,11 @@ function ResolvedReposSection({
   )
 }
 
-function AppearanceTab({ bag, save, saving }: {
-  bag: SettingsBag
-  save: (key: string, value: unknown) => Promise<void>
-  saving: Record<string, 'pending' | 'ok' | 'error'>
-}) {
+// Takes no props: every value it edits lives in `useTheme()` (localStorage
+// backed), not in the server-side settings bag. It used to be handed
+// bag/save/saving like its sibling tabs and destructured all three
+// without reading any of them.
+function AppearanceTab() {
   const {
     theme, toggle, setTheme,
     fontScale, setFontScale,

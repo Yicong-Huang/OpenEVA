@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import type { Ticket, PR } from '../api'
+import type { Ticket } from '../api'
+import type { PR } from '../types'
 import { TicketCard } from '../components/TicketCard'
 
 const TICKET = (overrides: Partial<Ticket> = {}): Ticket => ({

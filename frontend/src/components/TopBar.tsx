@@ -4,7 +4,7 @@ import { SessionIndicator } from './status/SessionIndicator'
 import { AIUsageStatus } from './status/AIUsageStatus'
 import { EventStatus } from './status/EventStatus'
 import { GlobalSearch } from './GlobalSearch'
-import { SettingsModal } from './SettingsModal'
+import { SettingsModal, ROOT_TABS, type RootTab } from './SettingsModal'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { useTheme } from '../hooks/useTheme'
 
@@ -22,7 +22,10 @@ interface TopBarProps {
 
 function MenuDropdown() {
   const [open, setOpen] = useState(false)
-  const [showSettings, setShowSettings] = useState<false | 'setup' | 'repos' | 'themes' | 'plugins' | 'intervals'>(false)
+  // Mirrors SettingsModal's own `RootTab` instead of restating it. The
+  // hand-maintained copy had drifted: it still listed 'themes', renamed
+  // to 'appearance' when the tab was reworked, and never gained 'layout'.
+  const [showSettings, setShowSettings] = useState<false | RootTab>(false)
   const ref = useRef<HTMLDivElement>(null)
   useClickOutside(ref, () => setOpen(false))
   const { theme, toggle: toggleTheme } = useTheme()
@@ -32,7 +35,12 @@ function MenuDropdown() {
   useEffect(() => {
     const onOpen = (e: Event) => {
       const detail = (e as CustomEvent).detail || {}
-      const tab = detail.tab && typeof detail.tab === 'string' ? detail.tab : 'setup'
+      // `detail` is untyped event data, so validate before trusting it:
+      // an unknown name would render an empty modal body.
+      const requested = typeof detail.tab === 'string' ? detail.tab : ''
+      const tab = (ROOT_TABS as readonly string[]).includes(requested)
+        ? requested as RootTab
+        : 'setup'
       setShowSettings(tab)
     }
     window.addEventListener('eva-open-settings', onOpen)

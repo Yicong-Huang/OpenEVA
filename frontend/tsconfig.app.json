@@ -36,10 +36,18 @@
       // "Cannot find module 'react' or its corresponding type
       // declarations." Mirrors `resolve.alias` in vite.config.ts so
       // tsc and the Vite bundler agree.
-      "react": ["./node_modules/react"],
-      "react-dom": ["./node_modules/react-dom"],
-      "react/jsx-runtime": ["./node_modules/react/jsx-runtime"],
-      "react/jsx-dev-runtime": ["./node_modules/react/jsx-dev-runtime"]
+      // Each entry lists @types FIRST. A `paths` mapping short-circuits
+      // module resolution to the literal target, so pointing straight at
+      // the runtime package resolved `react` to `node_modules/react/
+      // index.js` and the companion `@types/react` lookup never ran --
+      // every React import came back `any`, which cascaded into
+      // thousands of TS7026 "no interface JSX.IntrinsicElements"
+      // errors across the app. tsc walks the candidate list in order
+      // and stops at the first that yields declarations.
+      "react": ["./node_modules/@types/react", "./node_modules/react"],
+      "react-dom": ["./node_modules/@types/react-dom", "./node_modules/react-dom"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime", "./node_modules/react/jsx-runtime"],
+      "react/jsx-dev-runtime": ["./node_modules/@types/react/jsx-dev-runtime", "./node_modules/react/jsx-dev-runtime"]
     }
   },
   "include": [
