@@ -37,6 +37,19 @@ function discoverExtensions(): Ext[] {
 }
 const extensions = discoverExtensions()
 
+// A test file under `<extension>/test/` lives outside `frontend/`, so Node
+// resolves its bare imports by walking the EXTENSION's parent chain -- which
+// never reaches `frontend/node_modules`. `@testing-library/react` and friends
+// are simply not found from there. Pin each one to the copy installed here,
+// the same way vite.config.ts pins `react` for plugin sources: tests inside
+// `frontend/` already resolve to these exact files, so this is a no-op for
+// them and the difference between "works" and "cannot import" for the rest.
+const installed = (pkg: string) => path.join(__dirname, 'node_modules', pkg)
+const SHARED_DEPS = [
+  'react', 'react-dom', 'react/jsx-runtime', 'react/jsx-dev-runtime',
+  '@testing-library/react', '@testing-library/dom', '@testing-library/jest-dom',
+]
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -44,6 +57,7 @@ export default defineConfig({
       '@core/plugins': corePlugins,
       '@app': frontendSrc,
       ...Object.fromEntries(extensions.map(e => [`@${e.id}`, e.src])),
+      ...Object.fromEntries(SHARED_DEPS.map(pkg => [pkg, installed(pkg)])),
     },
   },
   // Vitest's underlying Vite dev server enforces `fs.allow`. The
