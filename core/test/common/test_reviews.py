@@ -173,6 +173,75 @@ class TestOpenReviewSession:
 
     @patch("common.reviews.launch_session_argv")
     @patch("common.reviews.session_exists", return_value=False)
+    def test_seeds_session_state_cache_on_launch(
+        self, _mock_exists, _mock_launch, patched_server
+    ):
+        """Regression: a launched review session was never written to
+        the session-state cache, so it was absent from the snapshot the
+        frontend mirrors. `useSessionState` returned nothing, SessionCard
+        fell back to its `initialStatus`, and the card sat on "starting"
+        forever while tmux and the agent were both healthy. Task and
+        ticket sessions have always seeded it; reviews were the outlier.
+        """
+        url = self._seed(patched_server)
+        from common import session_state
+        from common.reviews import open_review_session
+
+        session_state.remove("review-example-repo-42")
+        open_review_session(url, action_id="review-pr")
+
+        row = session_state.get("review-example-repo-42")
+        assert row, "a launched review session must appear in the state cache"
+        assert row["state"] == "starting"
+        assert row["kind"] == "review"
+        assert row["target_id"] == url
+
+    @patch("common.reviews.launch_session_argv")
+    @patch("common.reviews.session_exists", return_value=True)
+    def test_reclick_repairs_a_stale_stopped_row(
+        self, _mock_exists, _mock_launch, patched_server
+    ):
+        """The cache can be stale in the other direction: a kill leaves
+        `stopped` behind and a relaunch seconds later never corrects it,
+        so the card reports a dead session that is actually running.
+        Re-click repairs that row."""
+        url = self._seed(patched_server)
+        patched_server._db.upsert_review_pr(
+            url=url, repo="example/repo", number=42,
+            session_name="review-example-repo-42",
+        )
+        from common import session_state
+        from common.reviews import open_review_session
+
+        session_state.set_state("review-example-repo-42", state="stopped",
+                                detail="killed via DELETE", kind="review")
+        open_review_session(url, action_id="review-pr")
+
+        assert session_state.get("review-example-repo-42")["state"] == "idle"
+
+    @patch("common.reviews.launch_session_argv")
+    @patch("common.reviews.session_exists", return_value=True)
+    def test_reclick_does_not_downgrade_a_busy_session(
+        self, _mock_exists, _mock_launch, patched_server
+    ):
+        """A live row is left alone: stamping `idle` over a `busy` agent
+        would make the card lie until the next hook fires."""
+        url = self._seed(patched_server)
+        patched_server._db.upsert_review_pr(
+            url=url, repo="example/repo", number=42,
+            session_name="review-example-repo-42",
+        )
+        from common import session_state
+        from common.reviews import open_review_session
+
+        session_state.set_state("review-example-repo-42", state="busy",
+                                detail="running", kind="review")
+        open_review_session(url, action_id="review-pr")
+
+        assert session_state.get("review-example-repo-42")["state"] == "busy"
+
+    @patch("common.reviews.launch_session_argv")
+    @patch("common.reviews.session_exists", return_value=False)
     def test_preserves_started_at_on_second_launch(
         self, _mock_exists, _mock_launch, patched_server
     ):

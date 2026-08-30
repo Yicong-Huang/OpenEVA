@@ -237,6 +237,33 @@ def open_review_session(review_url: str, action_id: str = "review-pr",
             if bg_system:
                 prompt = f"{bg_system}\n\n{prompt}" if prompt else bg_system
 
+    # Seed the session-state cache, exactly as task sessions
+    # (`sessions.open_session`) and ticket sessions
+    # (`tickets._open_ticket_session`) do. Without it a freshly
+    # launched review session never appears in the global snapshot
+    # the frontend mirrors: `useSessionState` returns nothing,
+    # `SessionCard` falls back to its `initialStatus`, and the card
+    # sits on "starting" forever even though tmux and the agent are
+    # both healthy. The agent's SessionStart hook is not a substitute
+    # -- it lags 2-5s and, for review sessions, may not report at all.
+    #
+    # Re-click seeds too, and for the same reason the event below is
+    # emitted on re-click: the cached row can be stale in the other
+    # direction, left at `stopped` by a kill that a relaunch two
+    # seconds later never corrected. But an existing row that already
+    # describes a live session is left alone -- overwriting a `busy`
+    # agent with `idle` would make the card lie until the next hook.
+    from . import session_state
+    _cached = session_state.get(session_name)
+    if is_new or not _cached or _cached.get("state") in ("", "stopped", None):
+        session_state.set_state(
+            session_name,
+            state="starting" if is_new else "idle",
+            detail="review session opened" if is_new else "review session attached",
+            kind="review",
+            target_id=review_url,
+        )
+
     # Emit on re-click too: the frontend needs a refresh signal
     # regardless of whether we spun up tmux. Without this the second
     # click on "Review PR" (session already live) would POST but never
