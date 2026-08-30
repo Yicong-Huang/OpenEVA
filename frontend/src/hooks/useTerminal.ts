@@ -138,6 +138,38 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
       fit.fit()
       termRef.current = term
       fitRef.current = fit
+      const apiBase = `/api/terminal/${encodeURIComponent(sessionName)}`
+      const postInput = (data: string) => {
+        fetch(`${apiBase}/input`, { method: 'POST', body: data })
+      }
+
+      // xterm uses a hidden textarea to receive soft-keyboard input. iOS
+      // Safari sometimes reports Return only as a beforeinput line-break and
+      // never emits xterm's normal onData("\r"). Translate that event here.
+      // The timestamp guard below prevents a double Enter on browsers that do
+      // emit both events.
+      const helperTextarea = container.querySelector<HTMLTextAreaElement>(
+        '.xterm-helper-textarea',
+      )
+      let lastSoftInput = { data: '', at: 0 }
+      const softInputHandler = (event: Event) => {
+        const inputEvent = event as InputEvent
+        const isEnter = inputEvent.inputType === 'insertLineBreak'
+          || inputEvent.inputType === 'insertParagraph'
+        const isSpace = inputEvent.inputType === 'insertText'
+          && (inputEvent.data === ' ' || inputEvent.data === '\u00a0')
+        if (!isEnter && !isSpace) return
+        event.preventDefault()
+        const data = isEnter ? '\r' : ' '
+        lastSoftInput = { data, at: Date.now() }
+        postInput(data)
+      }
+      if (helperTextarea) {
+        helperTextarea.setAttribute('enterkeyhint', 'send')
+        helperTextarea.setAttribute('autocapitalize', 'none')
+        helperTextarea.setAttribute('autocomplete', 'off')
+        helperTextarea.addEventListener('beforeinput', softInputHandler)
+      }
 
       // Bubble-phase only: capture-phase stopPropagation kills the
       // event before it reaches xterm's own viewport listener
@@ -218,9 +250,60 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
       }
       container.addEventListener('wheel', wheelHandler, { passive: false })
 
-      onStatusChange?.('')
-      const apiBase = `/api/terminal/${encodeURIComponent(sessionName)}`
+      // Touch-to-history for phones/tablets. xterm's native touch handling can
+      // only traverse browser-side scrollback; interactive agent TUIs keep
+      // most history in their own viewport/tmux. Consume vertical swipes and
+      // use xterm scrollback first, then fall through to the same backend
+      // scroll endpoint as a desktop wheel at either boundary.
+      let lastTouchY: number | null = null
+      let touchRemainder = 0
+      const touchStartHandler = (event: TouchEvent) => {
+        if (event.touches.length !== 1) return
+        lastTouchY = event.touches[0].clientY
+        touchRemainder = 0
+      }
+      const touchMoveHandler = (event: TouchEvent) => {
+        if (event.touches.length !== 1 || lastTouchY === null) return
+        const currentY = event.touches[0].clientY
+        const delta = currentY - lastTouchY
+        lastTouchY = currentY
+        if (Math.abs(delta) < 2) return
+        event.preventDefault()
+        event.stopPropagation()
+        touchRemainder += Math.abs(delta)
+        const lines = Math.min(30, Math.floor(touchRemainder / 5))
+        if (lines < 1) return
+        touchRemainder -= lines * 5
 
+        // Match the expected mobile gesture: swipe upward to reveal older
+        // history; swipe downward to return toward the live tail.
+        const dir: 'up' | 'down' = delta < 0 ? 'up' : 'down'
+        try {
+          const buf = term.buffer.active
+          const canScrollXterm = dir === 'up'
+            ? buf.viewportY > 0
+            : buf.viewportY < buf.baseY
+          if (canScrollXterm) {
+            term.scrollLines(dir === 'up' ? -lines : lines)
+            return
+          }
+        } catch { /* backend fallback below */ }
+        if (dir !== pendingDir) { pendingDir = dir; pendingLines = 0 }
+        pendingLines += lines
+        flushScroll()
+      }
+      const touchEndHandler = () => {
+        lastTouchY = null
+        touchRemainder = 0
+      }
+      // Capture phase is intentional: xterm installs handlers on descendant
+      // nodes and may stop the event before it bubbles back to the container.
+      container.addEventListener('touchstart', touchStartHandler, { passive: true, capture: true })
+      container.addEventListener('touchmove', touchMoveHandler, { passive: false, capture: true })
+      container.addEventListener('touchend', touchEndHandler, { passive: true, capture: true })
+      container.addEventListener('touchcancel', touchEndHandler, { passive: true, capture: true })
+
+      onStatusChange?.('')
       // Send the current viewport size to the server so the tmux session
       // renders at the right dimensions before any input arrives.
       const pushResize = () => {
@@ -259,7 +342,8 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
         // working in the browser. Wheel scrolling is handled out-of-band
         // by `wheelHandler` -> POST /scroll instead.
         if (isMouseSequence(data)) return
-        fetch(`${apiBase}/input`, { method: 'POST', body: data })
+        if (data === lastSoftInput.data && Date.now() - lastSoftInput.at < 100) return
+        postInput(data)
       })
 
       const observer = new ResizeObserver(() => {
@@ -278,6 +362,11 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
         observer.disconnect()
         unsubscribe()
         container.removeEventListener('wheel', wheelHandler)
+        container.removeEventListener('touchstart', touchStartHandler, true)
+        container.removeEventListener('touchmove', touchMoveHandler, true)
+        container.removeEventListener('touchend', touchEndHandler, true)
+        container.removeEventListener('touchcancel', touchEndHandler, true)
+        helperTextarea?.removeEventListener('beforeinput', softInputHandler)
         term.dispose()
         termRef.current = null
         fitRef.current = null
@@ -294,5 +383,13 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
     fetch(`/api/terminal/${encodeURIComponent(sessionName)}/input`, { method: 'POST', body: text })
   }, [sessionName])
 
-  return { sendInput, termRef, fitRef }
+  const scrollHistory = useCallback((direction: 'up' | 'down', lines = 30) => {
+    fetch(`/api/terminal/${encodeURIComponent(sessionName)}/scroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir: direction, lines }),
+    })
+  }, [sessionName])
+
+  return { sendInput, scrollHistory, termRef, fitRef }
 }

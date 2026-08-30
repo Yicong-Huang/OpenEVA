@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { SessionDot } from './SessionDot'
 import { useTerminal } from '../hooks/useTerminal'
+import { MobileTerminalToolbar } from './MobileTerminalToolbar'
 import { useEventBus } from '../hooks/useEventBus'
 import { useAgentSessionStatus } from '../hooks/useAgentSessionStatus'
 import { useAlert } from './Alert'
@@ -90,11 +91,13 @@ export function ProjectSessionCard({ projectId, projectName }: Props) {
       .catch(() => setInfo(null))
   }, [tmuxName, projectId]))
 
-  useTerminal({
+  const terminal = useTerminal({
     sessionName: tmuxName || '',
     containerRef: terminalRef,
     active: !!tmuxName && expanded && !!info?.running,
   })
+  const sendTerminalInput = terminal?.sendInput ?? (() => {})
+  const scrollTerminalHistory = terminal?.scrollHistory
 
   // When info?.running is false, force the dot grey via 'stopped'
   // regardless of any stale snapshot state -- the source-of-truth is
@@ -260,6 +263,13 @@ export function ProjectSessionCard({ projectId, projectName }: Props) {
           </button>
         ))}
       </div>
+
+      {expanded && info.running && (
+        <MobileTerminalToolbar
+          sendInput={sendTerminalInput}
+          scrollHistory={scrollTerminalHistory}
+        />
+      )}
 
       {/* Floating terminal -- anchored to the bottom of the card header
           but positioned absolute so expanding it doesn't push the view

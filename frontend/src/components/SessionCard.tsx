@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { SessionDot } from './SessionDot'
 import { useTerminal } from '../hooks/useTerminal'
+import { MobileTerminalToolbar } from './MobileTerminalToolbar'
 import { useAgentSessionStatus } from '../hooks/useAgentSessionStatus'
 import { useAlert } from './Alert'
 import { api } from '../api'
@@ -67,12 +68,14 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
   const status = sseStatus || initialStatus || 'stopped'
   const terminalRef = useRef<HTMLDivElement>(null)
 
-  useTerminal({
+  const terminal = useTerminal({
     sessionName,
     containerRef: terminalRef,
     active: expanded,
     onStatusChange: setTermStatus,
   })
+  const sendTerminalInput = terminal?.sendInput ?? (() => {})
+  const scrollTerminalHistory = terminal?.scrollHistory
 
   // Session status is the default. Only show terminal status when stream is broken.
   const termError = termStatus === 'stream lost' ? termStatus : null
@@ -220,6 +223,13 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
           </button>
         </span>
       </div>
+
+      {expanded && (
+        <MobileTerminalToolbar
+          sendInput={sendTerminalInput}
+          scrollHistory={scrollTerminalHistory}
+        />
+      )}
 
       {/* Terminal container: fixed pixel height keeps xterm renderer stable.
           540px paired with fontSize 10 + lineHeight 1.0 in useTerminal:
