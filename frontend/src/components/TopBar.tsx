@@ -9,6 +9,7 @@ import { useClickOutside } from '../hooks/useClickOutside'
 import { useTheme } from '../hooks/useTheme'
 
 interface TopBarProps {
+  onMobileMenu?: () => void
   unreadEventCount?: number
   onEventsOpened?: () => void
   onEventNavigate?: (event: import('../types').EvaEvent) => void
@@ -92,6 +93,7 @@ const Separator = () => (
 )
 
 export function TopBar({
+  onMobileMenu,
   unreadEventCount,
   onEventsOpened,
   onEventNavigate,
@@ -103,12 +105,22 @@ export function TopBar({
 }: TopBarProps) {
   return (
     <div className="top-bar" data-testid="top-bar">
+      <button
+        className="mobile-nav-btn"
+        onClick={onMobileMenu}
+        aria-label="Open navigation"
+        title="Navigation"
+      >
+        <span />
+        <span />
+        <span />
+      </button>
       <span className="top-bar-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <img src="/favicon.svg" width={18} height={18} alt="" style={{ borderRadius: 3 }} />
         OpenEVA
       </span>
       {onNavigate && (
-        <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+        <div className="top-bar-search" style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
           <GlobalSearch
             onNavigate={onNavigate}
             onSelectTask={onSelectTask}

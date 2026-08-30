@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { api, type JiraInstance } from '../api'
 import {
   useTheme,
@@ -168,7 +169,7 @@ export function SettingsModal({
     }, 50)
   }, [])
 
-  return (
+  return createPortal(
     <div
       data-testid="settings-backdrop"
       onClick={onClose}
@@ -252,7 +253,8 @@ export function SettingsModal({
         </div>
         </SearchFilterContext.Provider>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

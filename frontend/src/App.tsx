@@ -39,6 +39,7 @@ function AppInner() {
     key: string; instance?: string
   } | null>(null)
   const [unreadEventCount, setUnreadEventCount] = useState(0)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const { showToast } = useToast()
 
   // GitHub events: toast + badge
@@ -222,6 +223,7 @@ function AppInner() {
   return (
     <>
       <TopBar
+        onMobileMenu={() => setMobileNavOpen(true)}
         unreadEventCount={unreadEventCount}
         onEventsOpened={() => setUnreadEventCount(0)}
         onEventNavigate={handleEventNavigate}
@@ -233,8 +235,21 @@ function AppInner() {
       />
       <SetupBanner />
       <div className="app-body">
-        <SideBar activeProject={projectId} activeView={view} onNavigate={handleNavigate} />
-        <div id="main-panel" style={{ flex: 1, overflow: 'auto', padding: 16 }}>
+        <button
+          className={`mobile-nav-backdrop${mobileNavOpen ? ' open' : ''}`}
+          aria-label="Close navigation"
+          onClick={() => setMobileNavOpen(false)}
+        />
+        <SideBar
+          activeProject={projectId}
+          activeView={view}
+          mobileOpen={mobileNavOpen}
+          onNavigate={(pid, nextView) => {
+            handleNavigate(pid, nextView)
+            setMobileNavOpen(false)
+          }}
+        />
+        <main id="main-panel" className="main-panel">
           {getPage(view)?.render({
             projectId, setProjectId,
             taskId, setTaskId,
@@ -245,7 +260,7 @@ function AppInner() {
             requestedTicket,
             handleNavigate, handleSelectLiveTask,
           })}
-        </div>
+        </main>
       </div>
     </>
   )

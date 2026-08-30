@@ -119,9 +119,10 @@ interface SideBarProps {
   activeView: string
   onNavigate: (projectId: string | null, view: string) => void
   projects?: Array<{ id: string; name: string; progress: number }>
+  mobileOpen?: boolean
 }
 
-export function SideBar({ activeProject, activeView, onNavigate }: SideBarProps) {
+export function SideBar({ activeProject, activeView, onNavigate, mobileOpen = false }: SideBarProps) {
   const [collapsed, setCollapsed] = useState(loadCollapsed)
 
   const toggleCollapsed = useCallback(() => {
@@ -132,10 +133,10 @@ export function SideBar({ activeProject, activeView, onNavigate }: SideBarProps)
     })
   }, [])
 
-  if (collapsed) {
+  if (collapsed && !mobileOpen) {
     return (
       <div
-        className="sidebar"
+        className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
         data-testid="sidebar"
         style={{
           width: 52, minWidth: 52,
@@ -188,7 +189,7 @@ export function SideBar({ activeProject, activeView, onNavigate }: SideBarProps)
   }
 
   return (
-    <div className="sidebar" data-testid="sidebar" style={{ display: 'flex', flexDirection: 'column', height: '100%', transition: 'width 0.2s' }}>
+    <div className={`sidebar${mobileOpen ? ' mobile-open' : ''}`} data-testid="sidebar" style={{ display: 'flex', flexDirection: 'column', height: '100%', transition: 'width 0.2s' }}>
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {/* Section header: matches the Plugins panel style (small, dim,
             uppercase) so both panels read as peers. Background falls

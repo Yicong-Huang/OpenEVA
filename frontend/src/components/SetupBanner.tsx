@@ -34,14 +34,7 @@ export function SetupBanner() {
   return (
     <div
       data-testid="setup-banner"
-      style={{
-        display: 'flex', alignItems: 'center', gap: 10,
-        padding: '6px 14px',
-        background: 'var(--orange, #d6a300)',
-        color: '#000',
-        fontSize: 12,
-        borderBottom: '1px solid var(--border)',
-      }}
+      className="setup-banner"
     >
       <span style={{ fontWeight: 700 }}>Setup incomplete:</span>
       <span style={{ flex: 1 }}>
@@ -57,10 +50,7 @@ export function SetupBanner() {
       <button
         onClick={() => setDismissed(true)}
         title="Dismiss for this session"
-        style={{
-          background: 'transparent', border: 'none', cursor: 'pointer',
-          color: '#000', fontSize: 14, padding: '0 4px',
-        }}
+        className="setup-banner-dismiss"
       >x</button>
     </div>
   )
