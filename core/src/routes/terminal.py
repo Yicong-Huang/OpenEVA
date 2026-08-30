@@ -46,6 +46,22 @@ async def terminal_input(session_name: str, request: Request):
     return {"ok": True}
 
 
+@app_state.app.post("/api/terminal/{session_name}/message")
+async def terminal_message(session_name: str, request: Request):
+    """Submit one complete user message without requiring an in-memory PTY."""
+    if not session_exists(session_name):
+        raise HTTPException(status_code=404, detail="tmux session not found")
+    try:
+        message = (await request.body()).decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="message must be UTF-8") from exc
+    if not message:
+        raise HTTPException(status_code=400, detail="message is empty")
+    from adapters.tmux import paste_text
+    paste_text(session_name, message)
+    return {"ok": True}
+
+
 @app_state.app.post("/api/terminal/{session_name}/resize")
 async def terminal_resize(session_name: str, rows: int = 24, cols: int = 80):
     """Resize terminal."""
@@ -54,6 +70,16 @@ async def terminal_resize(session_name: str, rows: int = 24, cols: int = 80):
         raise HTTPException(status_code=404, detail="No active terminal session")
     ps.resize(rows, cols)
     return {"ok": True}
+
+
+@app_state.app.get("/api/terminal/{session_name}/snapshot")
+async def terminal_snapshot(session_name: str, lines: int = 500):
+    """Return a stable, ANSI-free tmux snapshot for lightweight native UIs."""
+    if not session_exists(session_name):
+        raise HTTPException(status_code=404, detail="tmux session not found")
+    from adapters.tmux import capture_output
+    lines = max(20, min(lines, 2000))
+    return {"session": session_name, "output": capture_output(session_name, lines)}
 
 
 class ScrollBody(BaseModel):
