@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# This project is managed with yarn. An `npm install` here rewrites
+# yarn.lock to npmjs URLs and drops the cross-platform optional binaries
+# (rolldown/rollup bindings), which breaks installs on other platforms.
+package-lock.json
