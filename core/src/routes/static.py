@@ -63,4 +63,16 @@ def serve_react(path: str = ""):
             status_code=503,
             detail="Frontend not built. Run `cd frontend && npm run build`.",
         )
-    return FileResponse(str(_FRONTEND_DIR / "index.html"))
+    # The HTML shell points at content-hashed Vite assets. It must never be
+    # cached by a browser or reverse proxy: keeping an old shell means clients
+    # continue requesting an old JS/CSS pair even after a fresh deployment.
+    # This is especially visible on iOS Safari behind Cloudflare Access, where
+    # a stale desktop shell can survive normal reloads for a long time.
+    return FileResponse(
+        str(_FRONTEND_DIR / "index.html"),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
