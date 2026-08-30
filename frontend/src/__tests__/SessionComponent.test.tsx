@@ -22,6 +22,29 @@ vi.mock('../hooks/useEventBus', () => ({
 // firing agent.* events through the (mocked) event bus, bypassing
 // any HTTP. Without stubbing fetch the provider would throw on the
 // initial /api/sessions/snapshot GET.
+//
+// The stub must answer each endpoint with its real shape, not one
+// blanket payload. `/api/project-managers` returns `{sessions: []}`
+// -- an array -- while the snapshot returns `{sessions: {}}`, a map
+// keyed by session name. Replying `{sessions: {}}` to both made
+// `projectManagers.filter` a TypeError, which took down the whole
+// SessionStatusProvider (it has no error boundary) a tick after the
+// first await -- so every test that awaited a click saw an unmounted
+// tree rather than the assertion it was written for.
+const EMPTY_PAYLOADS: Record<string, unknown> = {
+  '/api/project-managers': { sessions: [] },
+  '/api/cron-jobs': { jobs: [] },
+  '/api/review-requests': { prs: [] },
+  '/api/tickets': { tickets: [], configured: false },
+  '/api/all-sessions': {},
+}
+function emptyPayloadFor(url: string): unknown {
+  const match = Object.keys(EMPTY_PAYLOADS).find(path => url.includes(path))
+  // Anything else (the snapshot GET, terminal POSTs) keeps the
+  // session-map shape the provider expects.
+  return match ? EMPTY_PAYLOADS[match] : { sessions: {} }
+}
+
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
 
@@ -35,10 +58,13 @@ function renderCard(ui: React.ReactElement) {
 beforeEach(() => {
   eventBusHandlers.length = 0
   mockFetch.mockReset()
-  mockFetch.mockResolvedValue({
-    ok: true, status: 200,
-    json: () => Promise.resolve({ sessions: {} }),
-    text: () => Promise.resolve('{"sessions":{}}'),
+  mockFetch.mockImplementation((input: unknown) => {
+    const payload = emptyPayloadFor(String(input))
+    return Promise.resolve({
+      ok: true, status: 200,
+      json: () => Promise.resolve(payload),
+      text: () => Promise.resolve(JSON.stringify(payload)),
+    })
   })
 })
 
