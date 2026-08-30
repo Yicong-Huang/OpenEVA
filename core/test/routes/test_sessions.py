@@ -320,25 +320,47 @@ class TestLaunchSession:
         data = resp.json()
         assert data["session"] == "new-sess"
         assert data["running"] is True
-        mock_tmux["launch"].assert_called_once()
+        mock_tmux["launch_argv"].assert_called_once()
+        from common import agent as _agent
+        expected = _agent.get_agent_for_new_session().launch_argv(
+            "new-sess", prompt="Do something",
+        )
+        assert mock_tmux["launch_argv"].call_args[0][2] == expected
 
     def test_launch_with_agent_args(self, client, mock_tmux):
-        """When `agent_args` is non-empty, the route runs the active
-        agent's binary plus those argv tokens verbatim. The binary
-        name itself is whatever the registered agent ships (OSS
-        default `claude`)."""
+        """When `agent_args` is non-empty, the route runs the new-session
+        agent's binary plus those argv tokens. They are split with shlex
+        and passed as argv rather than interpolated into a shell string,
+        so a quoted token survives intact. The binary name itself is
+        whatever the registered agent ships (OSS default `claude`)."""
         resp = client.post("/api/sessions/launch", json={
             "session_name": "args-sess",
             "working_dir": "~",
             "agent_args": "-n args-sess --model opus",
         })
         assert resp.status_code == 200
-        mock_tmux["launch"].assert_called_once()
-        call_args = mock_tmux["launch"].call_args
-        command = call_args[0][2]  # third positional arg
+        mock_tmux["launch_argv"].assert_called_once()
+        argv = mock_tmux["launch_argv"].call_args[0][2]
         from common import agent as _agent
-        binary = _agent.get_active_agent().binary
-        assert command == f"{binary} -n args-sess --model opus"
+        binary = _agent.get_agent_for_new_session().binary
+        assert argv[-5:] == [binary, "-n", "args-sess", "--model", "opus"]
+
+    def test_launch_agent_args_appends_prompt_as_one_argv_token(
+        self, client, mock_tmux,
+    ):
+        """Regression: the route used to build `f"{binary} {agent_args}"`
+        and let tmux re-split it through a shell, so a prompt containing
+        spaces or quotes was torn into separate words. It is now appended
+        as a single argv element."""
+        resp = client.post("/api/sessions/launch", json={
+            "session_name": "quoted-sess",
+            "working_dir": "~",
+            "agent_args": "--model opus",
+            "prompt": 'fix the "off by one" bug',
+        })
+        assert resp.status_code == 200
+        argv = mock_tmux["launch_argv"].call_args[0][2]
+        assert argv[-1] == 'fix the "off by one" bug'
 
     def test_launch_no_project_id(self, client, mock_tmux):
         resp = client.post("/api/sessions/launch", json={

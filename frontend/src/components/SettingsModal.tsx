@@ -20,6 +20,7 @@ import { refreshPluginsEnabled } from '../hooks/usePluginsEnabled'
  * a new field here and the matching backend constant + seed entry.
  */
 const KEYS = {
+  newSessionAgent: 'service.agent.new_session_impl',
   forkableCookie: 'plugin.forkable.cookie',
   ubereatsDid: 'plugin.ubereats.did',
   ubereatsJwt: 'plugin.ubereats.jwt',
@@ -533,6 +534,9 @@ function SetupTab() {
   const [data, setData] = useState<{ all_ok: boolean; checks: SetupCheck[] } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [agents, setAgents] = useState<Array<{ id: string; name: string; binary: string; available: boolean }>>([])
+  const [selectedAgent, setSelectedAgent] = useState('')
+  const [savingAgent, setSavingAgent] = useState(false)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -547,9 +551,44 @@ function SetupTab() {
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
+  useEffect(() => {
+    api.listAgents().then((result) => {
+      setAgents(result.agents)
+      setSelectedAgent(result.selected)
+    }).catch(() => {})
+  }, [])
 
   return (
     <>
+      <Section title="Coding agent">
+        <Note>
+          Choose the CLI used for new sessions. Existing sessions remain bound
+          to the agent that created them, so changing this does not break resume.
+        </Note>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <select
+            value={selectedAgent}
+            onChange={(event) => setSelectedAgent(event.target.value)}
+            data-testid="settings-agent-select"
+            style={{ flex: 1, padding: '6px 8px', color: 'var(--text)', background: 'var(--panel-bg)', border: '1px solid var(--border)', borderRadius: 4 }}
+          >
+            {agents.map((agent) => (
+              <option key={agent.id} value={agent.id} disabled={!agent.available}>
+                {agent.name}{agent.available ? '' : ` (${agent.binary} not installed)`}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn-action"
+            disabled={!selectedAgent || savingAgent}
+            onClick={async () => {
+              setSavingAgent(true)
+              try { await api.setSetting(KEYS.newSessionAgent, selectedAgent) }
+              finally { setSavingAgent(false) }
+            }}
+          >{savingAgent ? 'Saving…' : 'Use for new sessions'}</button>
+        </div>
+      </Section>
       <Section title="Setup status">
         <Note>
           Eva shells out to the `gh` CLI for every GitHub call, so it

@@ -229,15 +229,17 @@ class SessionLaunch(BaseModel):
 def launch_session_route(body: SessionLaunch):
     """Launch a raw tmux + agent session."""
     from common import agent as _agent
-    active = _agent.get_active_agent()
-    binary = active.binary
+    import shlex
+    active = _agent.get_agent_for_new_session()
     if body.agent_args:
-        command = f"{binary} {body.agent_args}"
+        argv = active._env_prefix() + [active.binary] + shlex.split(body.agent_args)
+        if body.prompt:
+            argv.append(body.prompt)
     else:
-        command = f'{binary} -n "{body.session_name}"'
+        argv = active.launch_argv(body.session_name, prompt=body.prompt or None)
     already_exists = session_exists(body.session_name)
     print(f"[launch] session={body.session_name} exists={already_exists} action={body.action} dir={body.working_dir}", flush=True)
-    launch_session(body.session_name, body.working_dir, command)
+    launch_session_argv(body.session_name, body.working_dir, argv)
     return {
         "session": body.session_name,
         "running": True,

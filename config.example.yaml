@@ -57,3 +57,7 @@ slack_monitor:
   channels:
     # - id: C0XXXXXXXX
     #   name: alerts
+# New interactive sessions can use either bundled CLI agent. Existing
+# sessions remain bound to the agent that originally launched them.
+# This value can also be changed in Settings -> Setup.
+# service.agent.new_session_impl: codex

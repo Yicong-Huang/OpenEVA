@@ -168,6 +168,10 @@ export const api = {
   // Settings: generic JSON key/value store backing the SettingsModal.
   // Values can be any JSON (string, number, list, dict).
   listSettings: () => fetchApi<{ settings: Record<string, unknown> }>('/api/settings'),
+  listAgents: () => fetchApi<{
+    selected: string
+    agents: Array<{ id: string; name: string; binary: string; available: boolean }>
+  }>('/api/agents'),
   setSetting: (key: string, value: unknown) =>
     fetchApi<{ key: string; value: unknown }>(`/api/settings/${encodeURIComponent(key)}`, {
       method: 'PUT',

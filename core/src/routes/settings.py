@@ -12,10 +12,33 @@ from fastapi import HTTPException
 
 import app_state
 from common import settings as core_settings
+from common import agent as core_agent
+import shutil
 
 
 class SettingValue(BaseModel):
     value: Any
+
+
+@app_state.app.get("/api/agents")
+def list_agents():
+    """List registered CLI agents and the choice used for new sessions."""
+    selected = core_settings.get_value(
+        core_agent.KEY_NEW_SESSION_AGENT_IMPL,
+        default=core_agent.get_active_agent().id,
+    )
+    return {
+        "selected": selected,
+        "agents": [
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "binary": agent.binary,
+                "available": shutil.which(agent.binary) is not None,
+            }
+            for agent in core_agent.all_agents()
+        ],
+    }
 
 
 @app_state.app.get("/api/settings")
