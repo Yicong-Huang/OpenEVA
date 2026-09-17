@@ -1,3 +1,4 @@
+import { type MouseEvent as ReactMouseEvent } from 'react'
 import type { Task } from '../types'
 import { TaskNode } from './GraphView'
 import { type TaskNodeData, latestPrCiStatus } from './graphShared'
@@ -19,6 +20,9 @@ interface TaskNodeChipProps {
   selected?: boolean
   dimmed?: boolean
   onClick?: () => void
+  /** Right-click handler -- lets the host page open a task context menu
+   *  (set status / delete), same as the GraphView canvas. */
+  onContextMenu?: (e: ReactMouseEvent) => void
 }
 
 
@@ -50,6 +54,7 @@ export function TaskNodeChip({
   selected,
   dimmed,
   onClick,
+  onContextMenu,
 }: TaskNodeChipProps) {
   // Effective status: stored, except `blocked` is computed -- mirrors
   // the GraphView's `getLayoutedElements` logic.
@@ -97,6 +102,7 @@ export function TaskNodeChip({
       data-testid={`task-node-chip-${taskId}`}
       data-status={status}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       style={{
         // Wrapper isn't styled -- TaskNode renders its own card.
         // We just intercept the click and exposed testid/data-status

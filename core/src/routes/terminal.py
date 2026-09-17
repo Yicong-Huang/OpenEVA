@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 import pty_manager as _pty
 import app_state
-from adapters.tmux import session_exists
+from adapters.tmux import session_exists, pane_on_alt_screen
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +152,10 @@ _TRAILING_SPACES_RE = re.compile(rb"[ \t]+$")
 # accumulated before (especially after EventSource reconnect).
 _REPLAY_RESET = b"\x1b[H\x1b[2J\x1b[3J"
 
+# Select the alternate screen before replaying a snapshot captured there so
+# subsequent cursor-relative updates continue in the same buffer.
+_ENTER_ALT_SCREEN = b"\x1b[?1049h"
+
 
 def _tmux_capture(session_name: str) -> bytes:
     """Return the last `_REPLAY_LINES` of the tmux pane as raw bytes.
@@ -164,7 +168,8 @@ def _tmux_capture(session_name: str) -> bytes:
     trailing whitespace that tmux still emits to pad each line.
 
     Prepends a clear-screen-and-home reset so replay paints onto a fresh
-    xterm buffer (fixes cursor drift after EventSource reconnect).
+    xterm buffer. If the pane uses the alternate screen, the replay selects
+    that screen first so later updates address the same buffer.
 
     Joins lines with \\r\\n so xterm places them on separate rows rather
     than treating the buffer as one long wrapped line.
@@ -187,9 +192,17 @@ def _tmux_capture(session_name: str) -> bytes:
             for line in raw.splitlines()
         ]
         body = b"\r\n".join(lines) + b"\r\n"
-        return _REPLAY_RESET + body
     except Exception:
         return b""
+    # Probe separately: the capture already succeeded, so a failing probe
+    # must degrade to a plain reset rather than discard the snapshot.
+    prefix = _REPLAY_RESET
+    try:
+        if pane_on_alt_screen(session_name):
+            prefix = _ENTER_ALT_SCREEN + prefix
+    except Exception:
+        pass
+    return prefix + body
 
 
 def _push_frame(q: asyncio.Queue, frame: dict):

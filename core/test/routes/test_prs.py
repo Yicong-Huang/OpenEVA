@@ -21,7 +21,7 @@ class TestFetchPrDetail:
         self.server = patched_server
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     @patch("routes.prs.app_state.gh_run_async")
     def test_success_updates_db(self, mock_async, patched_server):
@@ -816,7 +816,7 @@ class TestHelperWrappers:
 
 class TestFetchPrDetailForkCiEdgeCases:
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     @patch("routes.prs.app_state.gh_run_async")
     def test_fork_ci_malformed_json_lines(self, mock_async, patched_server):

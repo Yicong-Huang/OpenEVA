@@ -175,7 +175,9 @@ export function SessionStatusProvider({ children }: { children: ReactNode }) {
   const cronJobs = cronData?.jobs ?? []
   const reviews = reviewData?.prs ?? []
   const tickets = ticketData?.tickets ?? []
-  const projectManagers = managerData?.sessions ?? []
+  const projectManagers = Array.isArray(managerData?.sessions)
+    ? managerData.sessions
+    : []
 
   const isLiveByName = useCallback((name: string) => {
     const s = sessions[name]

@@ -779,6 +779,58 @@ def test_cmd_rename_task_target_exists(temp_db):
 
 
 # ============================================================
+# move-task
+# ============================================================
+
+
+def test_cmd_move_task(temp_db, capsys):
+    """move-task re-files a task under the destination project."""
+    cli_mod._ensure_core()
+    args = _make_args(project="proj-a", task_id="task-3", to_project="proj-b")
+    cli_mod.cmd_move_task(args)
+    out = capsys.readouterr().out
+    assert "Moved task 'task-3' from 'proj-a' to 'proj-b'" in out
+    assert temp_db.get_task("proj-b", "task-3")["project"] == "proj-b"
+
+
+def test_cmd_move_task_json(temp_db, capsys):
+    """move-task --json emits the moved task."""
+    cli_mod._ensure_core()
+    args = _make_args(project="proj-a", task_id="task-3", to_project="proj-b", json=True)
+    cli_mod.cmd_move_task(args)
+    data = json.loads(capsys.readouterr().out)
+    assert data["task_id"] == "task-3"
+    assert data["project"] == "proj-b"
+
+
+def test_cmd_move_task_source_not_found(temp_db):
+    """move-task on a nonexistent task exits with error."""
+    cli_mod._ensure_core()
+    args = _make_args(project="proj-a", task_id="no-such", to_project="proj-b")
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.cmd_move_task(args)
+    assert exc_info.value.code == 1
+
+
+def test_cmd_move_task_dest_missing(temp_db):
+    """move-task to a nonexistent destination project exits with error."""
+    cli_mod._ensure_core()
+    args = _make_args(project="proj-a", task_id="task-1", to_project="no-such-proj")
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.cmd_move_task(args)
+    assert exc_info.value.code == 1
+
+
+def test_cmd_move_task_same_project(temp_db):
+    """move-task to the task's current project exits with error."""
+    cli_mod._ensure_core()
+    args = _make_args(project="proj-a", task_id="task-1", to_project="proj-a")
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.cmd_move_task(args)
+    assert exc_info.value.code == 1
+
+
+# ============================================================
 # close-task
 # ============================================================
 
@@ -1737,7 +1789,7 @@ def test_cmd_sync_prs_full_flag_forwarded(temp_db, capsys):
 # ============================================================
 
 
-def test_cmd_open_session_success_new(temp_db, capsys):
+def test_cmd_open_session_success_new(temp_db, capsys, mock_tmux):
     from common import sessions as sess
     fake = {"session": "task-1", "new": True, "prompt": "hello"}
     with patch.object(sess, "open_session", return_value=fake):
@@ -1748,7 +1800,7 @@ def test_cmd_open_session_success_new(temp_db, capsys):
     out = capsys.readouterr().out
     assert "Opened new session" in out
     assert "task-1" in out
-    assert "Prompt ready" in out  # prompt size echoed
+    assert "Prompt sent" in out  # prompt size echoed
 
 
 def test_cmd_open_session_resumed(temp_db, capsys):
@@ -1792,7 +1844,7 @@ def test_cmd_open_session_pr_context_passes_pr_args(temp_db, capsys):
     assert kwargs["action_id"] == "fix-ci"
 
 
-def test_cmd_open_review_session_success(temp_db, capsys):
+def test_cmd_open_review_session_success(temp_db, capsys, mock_tmux):
     """open-review-session is the CLI mirror of clicking a Review Card
     button in the web UI."""
     from common import reviews as rev

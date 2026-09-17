@@ -1,6 +1,7 @@
 import { useCallback } from 'react'
 import { api } from '../api'
 import { useAlert } from '../components/Alert'
+import { useSessionStatus } from './SessionStatusProvider'
 
 /**
  * Single source of truth for "open a session and deliver its system
@@ -39,6 +40,10 @@ export interface LaunchOptions {
   // for endpoint.type='review'.
   prNumber?: number
   prRepo?: string
+  // Pre-chosen agent id. When set, the launcher skips the "which agent?"
+  // prompt and launches this agent directly. Leave unset to let the
+  // launcher prompt (multiple enabled) or auto-resolve (one enabled).
+  agentId?: string
 }
 
 export interface LaunchResult {
@@ -47,12 +52,73 @@ export interface LaunchResult {
   new: boolean
 }
 
+// Sentinel distinguishing "user dismissed the agent picker" (abort the
+// launch) from "no pick needed / resolve on the backend" (null id).
+const CANCELLED = Symbol('agent-pick-cancelled')
+
+/**
+ * Decide which agent launches the session.
+ *   - 0/1 enabled agents -> return null (backend resolves; no prompt).
+ *   - 2+ enabled -> open a `choose` bubble; return the picked id, or
+ *     CANCELLED if the user dismissed it (Escape / backdrop / Cancel).
+ * A network failure fetching the list degrades to null (no prompt) so a
+ * transient error never blocks launching with the default agent.
+ */
+async function pickAgentIfNeeded(
+  choose: (opts: {
+    title: string
+    message?: string
+    choices: Array<{ key: string; label: string; variant?: 'default' | 'primary' | 'danger' }>
+  }) => Promise<string | null>,
+): Promise<string | null | typeof CANCELLED> {
+  let agents: Array<{ id: string; name: string }>
+  let enabled: string[]
+  try {
+    const res = await api.listAgents()
+    agents = res.agents
+    enabled = res.enabled
+  } catch {
+    return null
+  }
+  if (enabled.length <= 1) return null
+  const byId = new Map(agents.map((a) => [a.id, a.name]))
+  const picked = await choose({
+    title: 'Launch with which agent?',
+    message: 'You have multiple agents enabled. Pick which one runs this session.',
+    choices: enabled.map((id, i) => ({
+      key: id,
+      label: byId.get(id) ?? id,
+      variant: i === 0 ? 'primary' : 'default',
+    })),
+  })
+  return picked === null ? CANCELLED : picked
+}
+
 export function useSessionLauncher(endpoint: SessionEndpoint) {
-  const { alert } = useAlert()
+  const { alert, choose } = useAlert()
+  const { sessions, reviews } = useSessionStatus()
 
   const launch = useCallback(
     async (opts: LaunchOptions): Promise<LaunchResult | null> => {
       try {
+        // Agent selection: when the user has enabled more than one
+        // agent, prompt them to pick which one launches this session.
+        // Exactly one enabled -> launch it silently (agentId stays
+        // undefined and the backend resolves it). A caller-supplied
+        // `opts.agentId` skips the prompt. Dismissing the picker aborts.
+        //
+        // BUT: if a session is already open for this surface, the agent
+        // was chosen when it launched -- re-clicking an action button
+        // just delivers a new prompt into the SAME running session (the
+        // backend skips relaunch, so any agent_id is ignored). Prompting
+        // "which agent?" there is pointless and annoying, so we reuse the
+        // existing session and skip the picker entirely.
+        let agentId = opts.agentId
+        if (!agentId && !isSessionLive(endpoint, sessions, reviews)) {
+          const picked = await pickAgentIfNeeded(choose)
+          if (picked === CANCELLED) return null
+          agentId = picked ?? undefined
+        }
         // Unified endpoint: /api/sessions/open routes by `kind` so
         // task / review sessions share the same network path. Adding
         // a new context (e.g. PR-only sessions) is one new branch on
@@ -67,12 +133,14 @@ export function useSessionLauncher(endpoint: SessionEndpoint) {
                 pr_number: opts.prNumber,
                 pr_repo: opts.prRepo,
                 custom_prompt: opts.customPrompt,
+                agent_id: agentId,
               }
             : {
                 kind: 'review' as const,
                 review_url: endpoint.reviewUrl,
                 action_id: opts.actionId,
                 custom_prompt: opts.customPrompt,
+                agent_id: agentId,
               }
         const result = (await api.openSession(body)) as LaunchResult
         if (result.prompt) {
@@ -88,10 +156,44 @@ export function useSessionLauncher(endpoint: SessionEndpoint) {
         return null
       }
     },
-    [endpoint, alert],
+    [endpoint, alert, choose, sessions, reviews],
   )
 
   return { launch }
+}
+
+// Minimal shapes we read off the session-status service. Kept local so
+// the launcher doesn't couple to the full SessionState / review-row
+// types -- all we need is a tmux name -> state lookup and, for reviews,
+// the url -> session_name mapping.
+type SessionRowLike = { state?: string }
+type ReviewRowLike = { url?: string; session_name?: string | null }
+
+/**
+ * True iff a live agent session already backs this launch surface.
+ * "Live" == present in the snapshot and not stopped/unknown (same rule
+ * the SessionStatusProvider uses for its `isLiveByName`). When live, the
+ * caller reuses that session instead of re-prompting for an agent.
+ *
+ *   - task:   the tmux session name IS the task id.
+ *   - review: the tmux name is derived server-side, so we resolve it
+ *             from the cached review row (url -> session_name). No row
+ *             yet (never launched) -> not live -> picker runs as normal.
+ */
+function isSessionLive(
+  endpoint: SessionEndpoint,
+  sessions: Record<string, SessionRowLike>,
+  reviews: ReviewRowLike[],
+): boolean {
+  let name: string | null | undefined
+  if (endpoint.type === 'task') {
+    name = endpoint.taskId
+  } else {
+    name = reviews.find((r) => r.url === endpoint.reviewUrl)?.session_name
+  }
+  if (!name) return false
+  const state = sessions[name]?.state
+  return !!state && state !== 'stopped' && state !== 'unknown'
 }
 
 /**

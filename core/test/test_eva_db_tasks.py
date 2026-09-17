@@ -457,6 +457,51 @@ def test_rename_task_reverse_deps(db):
 
 
 # ------------------------------------------------------------------
+# move_task
+# ------------------------------------------------------------------
+
+def test_move_task(db):
+    """move_task rewrites the task's owning project and carries deps + PRs."""
+    db.create_task("proj-a", "task-mv")
+    db.create_task("proj-a", "dep-task")
+    db.add_dependency("proj-a", "task-mv", "dep-task")
+    db.add_pr("proj-a", "task-mv", 42,
+              url="https://github.com/example/repo/pull/42", status="open", title="PR")
+
+    result = db.move_task("task-mv", "proj-b")
+    assert result is True
+
+    moved = db.get_task("proj-b", "task-mv")
+    assert moved["project"] == "proj-b"
+    # Deps and PRs (keyed by task_id) follow the task.
+    assert "dep-task" in moved["dependencies"]
+    assert len(moved["prs"]) == 1 and moved["prs"][0]["number"] == 42
+    # It no longer appears under the source project's task list.
+    assert "task-mv" not in {t["task_id"] for t in db.list_tasks("proj-a")}
+    assert "task-mv" in {t["task_id"] for t in db.list_tasks("proj-b")}
+
+
+def test_move_task_not_found(db):
+    """move_task returns False when the task does not exist."""
+    assert db.move_task("nonexistent", "proj-b") is False
+
+
+def test_move_task_rewrites_history_and_session(db):
+    """move_task re-files the task's history and session rows too."""
+    db.create_task("proj-a", "task-hs")
+    db.append_task_history("proj-a", "task-hs", "created")
+    db.create_session("task-hs", "proj-a")
+
+    assert db.move_task("task-hs", "proj-b") is True
+
+    hist_row = db._conn.execute(
+        "SELECT project FROM task_history WHERE task_id=?", ("task-hs",)
+    ).fetchone()
+    assert hist_row["project"] == "proj-b"
+    assert db.get_session("task-hs")["project"] == "proj-b"
+
+
+# ------------------------------------------------------------------
 # Edge cases: task CRUD
 # ------------------------------------------------------------------
 

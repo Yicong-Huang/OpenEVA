@@ -21,7 +21,6 @@ import { refreshPluginsEnabled } from '../hooks/usePluginsEnabled'
  * a new field here and the matching backend constant + seed entry.
  */
 const KEYS = {
-  newSessionAgent: 'service.agent.new_session_impl',
   forkableCookie: 'plugin.forkable.cookie',
   ubereatsDid: 'plugin.ubereats.did',
   ubereatsJwt: 'plugin.ubereats.jwt',
@@ -538,13 +537,100 @@ type SetupCheck = {
   hint: string
 }
 
+function AgentsSection() {
+  const [agents, setAgents] = useState<Array<{
+    id: string
+    name: string
+    binary?: string
+    available?: boolean
+  }>>([])
+  const [enabled, setEnabled] = useState<string[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    api.listAgents()
+      .then((r) => { setAgents(r.agents); setEnabled(r.enabled) })
+      .catch(() => setError('Failed to load agents'))
+  }, [])
+
+  const toggle = useCallback(async (id: string, checked: boolean) => {
+    const next = checked
+      ? Array.from(new Set([...enabled, id]))
+      : enabled.filter((x) => x !== id)
+    if (next.length === 0) {
+      // At least one must stay enabled (backend rejects empty).
+      setError('At least one agent must stay enabled.')
+      return
+    }
+    // Preserve registry order so the list is stable across toggles.
+    const ordered = agents.map((a) => a.id).filter((x) => next.includes(x))
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await api.setEnabledAgents(ordered)
+      setEnabled(r.enabled)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }, [agents, enabled])
+
+  return (
+    <Section title="Agents">
+      <Note>
+        Which agent(s) can launch sessions. Enable more than one and
+        Eva asks which to use each time you open a session; enable just
+        one and it launches silently. Already-running sessions keep the
+        agent they started with.
+      </Note>
+      {error && <div style={{ color: 'var(--red)', fontSize: 11 }}>{error}</div>}
+      {agents.length === 0 && !error && (
+        <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>No agents registered.</div>
+      )}
+      {agents.map((a) => {
+        const on = enabled.includes(a.id)
+        const isLast = on && enabled.length === 1
+        return (
+          <label
+            key={a.id}
+            data-testid={`agent-toggle-${a.id}`}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              fontSize: 11, opacity: busy ? 0.6 : 1,
+              cursor: isLast ? 'not-allowed' : 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={on}
+              disabled={busy || isLast || a.available === false}
+              onChange={(e) => toggle(a.id, e.target.checked)}
+            />
+            <span style={{ fontWeight: 600 }}>{a.name}</span>
+            <span style={{ color: 'var(--text-dim)' }}>{a.id}</span>
+            {a.available === false && (
+              <span style={{ color: 'var(--text-dim)' }}>
+                {a.binary ? `${a.binary} not installed` : 'not installed'}
+              </span>
+            )}
+          </label>
+        )
+      })}
+      {enabled.length > 1 && (
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
+          {enabled.length} agents enabled -- you'll be asked which to use when opening a session.
+        </div>
+      )}
+    </Section>
+  )
+}
+
 function SetupTab() {
   const [data, setData] = useState<{ all_ok: boolean; checks: SetupCheck[] } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [agents, setAgents] = useState<Array<{ id: string; name: string; binary: string; available: boolean }>>([])
-  const [selectedAgent, setSelectedAgent] = useState('')
-  const [savingAgent, setSavingAgent] = useState(false)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -559,44 +645,9 @@ function SetupTab() {
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
-  useEffect(() => {
-    api.listAgents().then((result) => {
-      setAgents(result.agents)
-      setSelectedAgent(result.selected)
-    }).catch(() => {})
-  }, [])
-
   return (
     <>
-      <Section title="Coding agent">
-        <Note>
-          Choose the CLI used for new sessions. Existing sessions remain bound
-          to the agent that created them, so changing this does not break resume.
-        </Note>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <select
-            value={selectedAgent}
-            onChange={(event) => setSelectedAgent(event.target.value)}
-            data-testid="settings-agent-select"
-            style={{ flex: 1, padding: '6px 8px', color: 'var(--text)', background: 'var(--panel-bg)', border: '1px solid var(--border)', borderRadius: 4 }}
-          >
-            {agents.map((agent) => (
-              <option key={agent.id} value={agent.id} disabled={!agent.available}>
-                {agent.name}{agent.available ? '' : ` (${agent.binary} not installed)`}
-              </option>
-            ))}
-          </select>
-          <button
-            className="btn-action"
-            disabled={!selectedAgent || savingAgent}
-            onClick={async () => {
-              setSavingAgent(true)
-              try { await api.setSetting(KEYS.newSessionAgent, selectedAgent) }
-              finally { setSavingAgent(false) }
-            }}
-          >{savingAgent ? 'Saving…' : 'Use for new sessions'}</button>
-        </div>
-      </Section>
+      <AgentsSection />
       <Section title="Setup status">
         <Note>
           Eva shells out to the `gh` CLI for every GitHub call, so it

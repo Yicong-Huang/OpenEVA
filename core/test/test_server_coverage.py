@@ -465,6 +465,18 @@ class TestBuildBackground:
         base.update(overrides)
         return base
 
+    def test_background_system_ground_truth_guardrail(self):
+        """build_background_system emits the [Ground truth] guardrail so a
+        session trusts live tool output over stale line numbers / SHAs in
+        the description, instead of confabulating "polluted" tools."""
+        from common.sessions import build_background_system
+        task = self._make_task()
+        result = build_background_system(task, "Test Project", {})
+        assert "[Ground truth]" in result
+        assert "polluted" in result
+        # Guardrail must come before the closing [Language] line.
+        assert result.index("[Ground truth]") < result.index("[Language]")
+
     def test_basic_output(self):
         """build_background produces [Background] and [Action] sections."""
         task = self._make_task()

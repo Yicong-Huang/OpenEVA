@@ -446,6 +446,13 @@ class EvaDB:
                 project_id TEXT PRIMARY KEY,
                 tmux_name TEXT NOT NULL,
                 status TEXT DEFAULT 'idle',
+                -- Claude Code's session UUID (captured from the SessionStart
+                -- hook) and the agent impl that launched it. Mirror the
+                -- `sessions` table so a PM session survives tmux death: the
+                -- startup recovery pass can `claude --resume <uuid>` it back
+                -- with the same agent instead of losing it forever.
+                agent_session_id TEXT DEFAULT '',
+                agent_impl TEXT DEFAULT '',
                 created_at TEXT,
                 updated_at TEXT
             );
@@ -515,6 +522,12 @@ class EvaDB:
         # so resume uses the same one. Pre-existing rows get '' (treated
         # as the default agent on resume).
         self._migrate_add_columns("sessions", {
+            "agent_impl": "TEXT DEFAULT ''",
+        })
+        # PM sessions gained resume support after the table existed, so
+        # pre-existing DBs need these ALTERed in (same fields as `sessions`).
+        self._migrate_add_columns("project_sessions", {
+            "agent_session_id": "TEXT DEFAULT ''",
             "agent_impl": "TEXT DEFAULT ''",
         })
 
@@ -2036,6 +2049,37 @@ class EvaDB:
             self._conn.execute("PRAGMA foreign_keys=ON")
         return True
 
+    def move_task(self, task_id: str, new_project: str) -> bool:
+        """Move a task to a different project atomically. Rewrites every
+        table that stores the task's owning project: the task row itself,
+        its `task_history` timeline, and its `sessions` row (so the
+        All Live Tasks / sessions-by-project views re-file it under the
+        destination). Dependencies and PRs are keyed by task_id alone
+        (globally unique) so they follow the task without rewriting.
+
+        Returns False if the task doesn't exist. The caller is expected
+        to validate that `new_project` exists (kept out of here so the
+        DB method stays a pure write, mirroring `rename_task`)."""
+        with self._conn:
+            if not self._conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone():
+                return False
+            now = _now_iso()
+            self._conn.execute(
+                "UPDATE tasks SET project=?, updated_at=? WHERE task_id=?",
+                (new_project, now, task_id),
+            )
+            self._conn.execute(
+                "UPDATE task_history SET project=? WHERE task_id=?",
+                (new_project, task_id),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET project=?, updated_at=? WHERE task_id=?",
+                (new_project, now, task_id),
+            )
+        return True
+
     # ------------------------------------------------------------------
     # Action definitions
     # ------------------------------------------------------------------
@@ -2152,14 +2196,20 @@ class EvaDB:
     # Project session methods
     # ------------------------------------------------------------------
 
-    def create_project_session(self, project_id: str, tmux_name: str) -> dict:
-        """Insert (or replace) a project-level session row."""
+    def create_project_session(self, project_id: str, tmux_name: str,
+                               agent_impl: str = "") -> dict:
+        """Insert (or replace) a project-level session row.
+
+        `agent_impl` records which agent launched the session so resume
+        routes off the same one (Claude UUIDs and codex ids aren't
+        interchangeable). Empty = legacy row, treated as the default agent.
+        """
         now = _now_iso()
         self._conn.execute(
             """INSERT OR REPLACE INTO project_sessions
-               (project_id, tmux_name, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (project_id, tmux_name, "idle", now, now),
+               (project_id, tmux_name, status, agent_impl, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (project_id, tmux_name, "idle", agent_impl or "", now, now),
         )
         self._conn.commit()
         return self.get_project_session(project_id)
@@ -2171,7 +2221,7 @@ class EvaDB:
         return _row_to_dict(row) if row else None
 
     def update_project_session(self, project_id: str, **fields) -> dict | None:
-        allowed = {"status", "tmux_name"}
+        allowed = {"status", "tmux_name", "agent_session_id", "agent_impl"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return self.get_project_session(project_id)

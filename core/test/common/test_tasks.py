@@ -15,6 +15,7 @@ from common.tasks import (
     close_task,
     delete_task,
     rename_task,
+    move_task,
     add_dependency,
     check_status,
     get_task,
@@ -239,6 +240,36 @@ class TestRenameTask:
         assert result is not None
         assert result["task_id"] == "task-a-renamed"
         assert get_task("test-proj", "task-a") is None
+
+
+class TestMoveTask:
+    def test_move_source_not_found_returns_none(self, patched_server):
+        assert move_task("test-proj", "does-not-exist", "empty-proj") is None
+
+    def test_move_dest_project_missing_raises(self, patched_server):
+        with pytest.raises(KeyError):
+            move_task("test-proj", "task-a", "no-such-project")
+
+    def test_move_same_project_raises(self, patched_server):
+        with pytest.raises(ValueError, match="already in project"):
+            move_task("test-proj", "task-a", "test-proj")
+
+    def test_move_success(self, patched_server):
+        import app_state
+        result = move_task("test-proj", "task-a", "empty-proj")
+        assert result is not None
+        assert result["project"] == "empty-proj"
+        # The task is re-filed: gone from source, present in destination.
+        assert "task-a" not in {
+            t["task_id"] for t in app_state._db.list_tasks("test-proj")}
+        assert "task-a" in {
+            t["task_id"] for t in app_state._db.list_tasks("empty-proj")}
+
+    def test_move_appends_history(self, patched_server):
+        import app_state
+        move_task("test-proj", "task-a", "empty-proj")
+        history = app_state._db.list_task_history("empty-proj", "task-a")
+        assert any("moved: test-proj -> empty-proj" in e["text"] for e in history)
 
 
 class TestAddDependency:
@@ -494,7 +525,7 @@ class TestAutoHistory:
         texts = self._history_texts(patched_server, "task-d")
         assert any("-> in_review" in t for t in texts)
 
-    def test_pr_merge_transition_records_line(self, patched_server):
+    def test_pr_merge_transition_records_line(self, patched_server, mock_tmux):
         """_update_pr_from_gh detecting open -> merged writes `PR #N merged`."""
         from common.prs import _update_pr_from_gh, add_pr
         add_pr("test-proj", "task-d",
@@ -520,7 +551,8 @@ class TestAutoHistory:
         # Merge also auto-promotes to done.
         assert any("-> done" in t for t in texts)
 
-    def test_pr_merge_idempotent_no_duplicate_line(self, patched_server):
+    def test_pr_merge_idempotent_no_duplicate_line(self, patched_server,
+                                                    mock_tmux):
         """A second _update_pr_from_gh with the same merged state should
         not re-log 'PR #N merged' (prev_status is already merged)."""
         from common.prs import _update_pr_from_gh, add_pr

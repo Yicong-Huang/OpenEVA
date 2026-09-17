@@ -237,6 +237,70 @@ describe('AlertProvider - queue', () => {
   })
 })
 
+describe('AlertProvider - choose', () => {
+  function ChooseHarness({ opts, onResult }: { opts: Opts; onResult: (v: unknown) => void }) {
+    const a = useAlert()
+    const [fired, setFired] = useState(false)
+    useEffect(() => {
+      if (fired) return
+      setFired(true)
+      a.choose(opts).then(onResult)
+    }, [a, fired, opts, onResult])
+    return null
+  }
+
+  const opts = {
+    title: 'Pick one',
+    message: 'how to sequence',
+    choices: [
+      { key: 'a', label: 'Choice A', variant: 'primary' },
+      { key: 'b', label: 'Choice B' },
+      { key: 'c', label: 'Choice C' },
+    ],
+  }
+
+  it('renders every choice and resolves the picked key', async () => {
+    let result: unknown
+    render(
+      <AlertProvider>
+        <ChooseHarness opts={opts} onResult={(v) => { result = v }} />
+      </AlertProvider>
+    )
+    await waitFor(() => screen.getByTestId('alert-dialog'))
+    expect(screen.getByText('Pick one')).toBeInTheDocument()
+    expect(screen.getByTestId('alert-choice-a')).toBeInTheDocument()
+    expect(screen.getByTestId('alert-choice-b')).toBeInTheDocument()
+    expect(screen.getByTestId('alert-choice-c')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('alert-choice-b'))
+    await waitFor(() => expect(result).toBe('b'))
+    expect(screen.queryByTestId('alert-dialog')).not.toBeInTheDocument()
+  })
+
+  it('returns null when cancelled', async () => {
+    let result: unknown = 'sentinel'
+    render(
+      <AlertProvider>
+        <ChooseHarness opts={opts} onResult={(v) => { result = v }} />
+      </AlertProvider>
+    )
+    await waitFor(() => screen.getByTestId('alert-dialog'))
+    fireEvent.click(screen.getByTestId('alert-cancel'))
+    await waitFor(() => expect(result).toBeNull())
+  })
+
+  it('Enter picks the first choice', async () => {
+    let result: unknown
+    render(
+      <AlertProvider>
+        <ChooseHarness opts={opts} onResult={(v) => { result = v }} />
+      </AlertProvider>
+    )
+    await waitFor(() => screen.getByTestId('alert-dialog'))
+    fireEvent.keyDown(window, { key: 'Enter' })
+    await waitFor(() => expect(result).toBe('a'))
+  })
+})
+
 describe('useAlert without provider', () => {
   it('falls back to native window.confirm', async () => {
     const origConfirm = window.confirm

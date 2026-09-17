@@ -5,6 +5,7 @@ import { MobileTerminalToolbar } from './MobileTerminalToolbar'
 import { useAgentSessionStatus } from '../hooks/useAgentSessionStatus'
 import { useAlert } from './Alert'
 import { api } from '../api'
+import { resumeNotice } from './SessionCardHelpers'
 
 interface Props {
   sessionName: string
@@ -135,16 +136,8 @@ export function SessionCard({ sessionName, initialStatus, compact, autoExpand, o
       // Parent will pick up the `session.opened` SSE event and refetch;
       // auto-expand so the user sees agent come back online.
       setExpanded(true)
-      if (res.action === 'relaunched') {
-        // Fallback path: we didn't have the UUID on record. Tell the user
-        // the tmux is back but the prior conversation was NOT restored.
-        await alert({
-          title: 'Session relaunched (history not resumed)',
-          message: 'No agent session id on record for "' + sessionName + '", so a ' +
-                   'fresh agent was started. Previous conversation is lost.',
-          kind: 'warning',
-        })
-      }
+      const notice = resumeNotice(res, sessionName)
+      if (notice) await alert(notice)
     } catch (e) {
       await alert({
         title: 'Failed to resume session',

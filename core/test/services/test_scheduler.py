@@ -194,6 +194,13 @@ class TestJobsRoutes:
                 # Should be roughly "now" (within a couple seconds).
                 assert after_next < datetime.now(timezone.utc) + timedelta(seconds=5)
             finally:
+                # The endpoint intentionally makes the job immediately due.
+                # Pause it before teardown so this route-focused test does not
+                # race a real executor run while asyncio.run closes its loop.
+                sched.pause_job("runnow")
                 stop_scheduler()
+                # AsyncIOScheduler.shutdown is scheduled thread-safely; give
+                # that callback one loop turn before asyncio.run tears down.
+                await asyncio.sleep(0)
 
         asyncio.run(run())

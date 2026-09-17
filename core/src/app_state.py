@@ -77,7 +77,20 @@ def _apply_repo_overrides_from_settings():
     UX hint)."""
     from adapters import github as _gh
 
+    import os as _os
     import sys as _sys
+
+    # These "applied override" lines are pure informational noise that
+    # print to stderr on every process/import startup. The Bash tool
+    # (used by isaac sessions) captures stderr into command output, so
+    # they pollute tool results and confuse the agent. Keep them silent
+    # by default; set EVA_VERBOSE_INIT=1 to restore them for debugging.
+    # (The WARNING below is a real misconfig alert and stays loud.)
+    _verbose_init = _os.environ.get("EVA_VERBOSE_INIT") == "1"
+
+    def _init_log(msg):
+        if _verbose_init:
+            print(msg, flush=True, file=_sys.stderr)
 
     # Allowed repos: settings-table list wins over the hardcoded set.
     raw = _db.get_setting("service.github.allowed_repos")
@@ -90,8 +103,7 @@ def _apply_repo_overrides_from_settings():
             _gh.ALLOWED_ORGS.update(
                 r.split("/")[0] for r in cleaned if r.endswith("/*")
             )
-            print(f"[init] applied allowed_repos override: {len(cleaned)} entries",
-                  flush=True, file=_sys.stderr)
+            _init_log(f"[init] applied allowed_repos override: {len(cleaned)} entries")
 
     # Fork->upstream mapping: settings-table dict wins over hardcoded.
     raw_ftu = _db.get_setting("service.github.fork_to_upstream")
@@ -103,8 +115,7 @@ def _apply_repo_overrides_from_settings():
         if cleaned_ftu:
             _gh.FORK_TO_UPSTREAM.clear()
             _gh.FORK_TO_UPSTREAM.update(cleaned_ftu)
-            print(f"[init] applied fork_to_upstream override: {len(cleaned_ftu)} entries",
-                  flush=True, file=_sys.stderr)
+            _init_log(f"[init] applied fork_to_upstream override: {len(cleaned_ftu)} entries")
 
     # gh CLI account-rules: list of {match, account} dicts. Empty
     # list -> module falls back to the hardcoded maintainer heuristic.
@@ -123,8 +134,7 @@ def _apply_repo_overrides_from_settings():
             cleaned_rules.append({"match": match, "account": account})
         if cleaned_rules:
             _gh._account_rules = cleaned_rules
-            print(f"[init] applied gh account_rules: {len(cleaned_rules)} entries",
-                  flush=True, file=_sys.stderr)
+            _init_log(f"[init] applied gh account_rules: {len(cleaned_rules)} entries")
 
     # Safety check: if multiple gh CLI accounts are loaded but no
     # routing rules are configured, every repo gets routed to the

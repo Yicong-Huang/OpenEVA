@@ -1,14 +1,50 @@
 """Shared fixtures for Eva test suite."""
 
+import asyncio
 import os
 import sys
 import shutil
 import tempfile
+from functools import wraps
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 import yaml
+
+# Starlette's TestClient runs requests through an AnyIO blocking portal. Some
+# constrained Linux environments do not reliably wake the default asyncio
+# selector from the portal thread, causing every TestClient request to hang.
+# uvicorn[standard] already provides uvloop on supported platforms; use it for
+# tests when present, while retaining asyncio on platforms without uvloop.
+try:
+    import uvloop
+except ImportError:  # pragma: no cover - platform-dependent optional package
+    pass
+else:
+    from starlette.testclient import TestClient as _StarletteTestClient
+
+    _test_client_init = _StarletteTestClient.__init__
+    _asyncio_run = asyncio.run
+
+    @wraps(_test_client_init)
+    def _init_test_client_with_uvloop(self, *args, **kwargs):
+        backend_options = dict(kwargs.get("backend_options") or {})
+        backend_options.setdefault("use_uvloop", True)
+        kwargs["backend_options"] = backend_options
+        _test_client_init(self, *args, **kwargs)
+
+    _StarletteTestClient.__init__ = _init_test_client_with_uvloop
+
+    @wraps(_asyncio_run)
+    def _run_with_uvloop(main, *, debug=None, loop_factory=None):
+        if loop_factory is None:
+            loop_factory = uvloop.new_event_loop
+        return _asyncio_run(
+            main, debug=debug, loop_factory=loop_factory,
+        )
+
+    asyncio.run = _run_with_uvloop
 
 # Must be set BEFORE `import server` anywhere in the suite: the FastAPI
 # startup hook checks this env var to decide whether to spin up the
@@ -673,15 +709,24 @@ def mock_tmux():
     Each `from adapters.tmux import X` binds the function object into
     the importing module's namespace, so patching the adapter alone
     doesn't propagate. Each importing module is patched explicitly
-    below. A single patch on `adapters.tmux.X` would only cover code
-    that does `from adapters import tmux; tmux.X(...)` style access,
-    which Eva no longer uses.
+    below.
+
+    The adapter's OWN attributes are patched too, which covers modules
+    that reach tmux as `from adapters import tmux as _tmux;
+    _tmux.X(...)` (e.g. `common.session_state`). That form resolves the
+    attribute at call time, so without these the call would reach the
+    real tmux binary and spawn sessions on the developer's machine --
+    exactly what this fixture exists to prevent. Keep BOTH sets: the
+    caller-side patches cover value-copy imports, the adapter-side ones
+    cover attribute access.
     """
     exists_mock = MagicMock(return_value=False)
     capture_mock = MagicMock(return_value="")
     send_keys_mock = MagicMock()
     launch_mock = MagicMock()
     launch_argv_mock = MagicMock()
+    ready_mock = MagicMock(return_value=True)
+    paste_mock = MagicMock()
     with patch("app_state._tmux_session_exists", exists_mock), \
          patch("common.sessions.session_exists", exists_mock), \
          patch("common.sessions.launch_session_argv", launch_argv_mock), \
@@ -691,11 +736,27 @@ def mock_tmux():
          patch("routes.sessions.send_keys", send_keys_mock), \
          patch("routes.sessions.launch_session", launch_mock), \
          patch("routes.sessions.launch_session_argv", launch_argv_mock), \
-         patch("routes.terminal.session_exists", exists_mock):
+         patch("routes.terminal.session_exists", exists_mock), \
+         patch("adapters.tmux.session_exists", exists_mock), \
+         patch("adapters.tmux.capture_output", capture_mock), \
+         patch("adapters.tmux.send_keys", send_keys_mock), \
+         patch("adapters.tmux.launch_session", launch_mock), \
+         patch("adapters.tmux.launch_session_argv", launch_argv_mock), \
+         patch("adapters.tmux.wait_until_ready", ready_mock), \
+         patch("adapters.tmux.paste_text", paste_mock):
         yield {
             "exists": exists_mock,
             "capture": capture_mock,
             "send_keys": send_keys_mock,
             "launch": launch_mock,
             "launch_argv": launch_argv_mock,
+            "ready": ready_mock,
+            "paste": paste_mock,
         }
+        # fire_action resolves the adapter functions inside a daemon thread.
+        # Join those workers before removing the patches so a late import can
+        # never reach real tmux or leave a 60-second poll behind.
+        import threading
+        for worker in threading.enumerate():
+            if worker.name.startswith("fire-action-"):
+                worker.join(timeout=1)

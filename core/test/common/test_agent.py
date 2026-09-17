@@ -172,7 +172,93 @@ Claude Code Usage Summary for user (last 1 day)
         )["tier"] == "Power User"
 
 
+class TestUsageFromJson:
+    """Structured usage output is the authoritative parsing path."""
+
+    # Synthetic values exercise every supported field without embedding
+    # account-specific usage or budget data.
+    SAMPLE = {
+        "gateway_budget": {
+            "monthly": {"usage_usd": 123.45, "limit_usd": 1000.0},
+        },
+        "codex": {"requests": 0, "total_tokens": 0, "cost_usd": 0,
+                  "per_model": []},
+        "claude_code": {
+            "requests": 42, "total_tokens": 123456, "cost_usd": 12.34,
+            "power_user": False,
+            "spend": {"daily_usd": None, "weekly_usd": None,
+                      "monthly_usd": None},
+        },
+    }
+
+    def test_maps_gateway_and_claude_fields(self):
+        data = _agent._usage_from_json(self.SAMPLE)
+        assert data["monthly_total"] == "123"
+        assert data["monthly"] == "123"
+        assert data["monthly_budget"] == "1,000"
+        assert data["claude_cost"] == "12.34"
+        assert data["claude_tokens"] == "123456"
+
+    def test_daily_falls_back_to_window_spend_when_null(self):
+        # Missing per-tool daily spend falls back to the window total.
+        data = _agent._usage_from_json(self.SAMPLE)
+        assert data["daily"] == "12.34"
+
+    def test_empty_codex_window_omits_codex_row(self):
+        data = _agent._usage_from_json(self.SAMPLE)
+        assert data["codex_cost"] is None
+        assert data["codex_tokens"] is None
+
+    def test_prefers_explicit_daily_spend_when_present(self):
+        obj = dict(self.SAMPLE)
+        obj["claude_code"] = dict(self.SAMPLE["claude_code"],
+                                  spend={"daily_usd": 123.4, "weekly_usd": 900,
+                                         "monthly_usd": 3000})
+        data = _agent._usage_from_json(obj)
+        assert data["daily"] == "123.40"
+        assert data["weekly"] == "900.00"
+        assert data["claude_monthly"] == "3,000.00"
+
+    def test_power_user_tier(self):
+        obj = dict(self.SAMPLE)
+        obj["claude_code"] = dict(self.SAMPLE["claude_code"], power_user=True)
+        assert _agent._usage_from_json(obj)["tier"] == "Power User"
+
+    def test_no_gateway_falls_back_to_claude_monthly(self):
+        obj = {"claude_code": {"cost_usd": 10.0,
+                               "spend": {"monthly_usd": 200.0}}}
+        data = _agent._usage_from_json(obj)
+        assert data["monthly"] == "200.00"
+        assert data["monthly_total"] is None
+
+    def test_garbage_input_returns_all_none(self):
+        data = _agent._usage_from_json("not a dict")
+        assert data["daily"] is None and data["monthly"] is None
+
+
 class TestFetchUsage:
+    @patch("common.agent.subprocess.run")
+    def test_json_output_is_parsed(self, mock_run):
+        import json as _j
+        mock_run.return_value = MagicMock(
+            stdout=_j.dumps(TestUsageFromJson.SAMPLE), stderr="human report",
+        )
+        data = _my_agent.fetch_usage()
+        assert data["claude_cost"] == "12.34"
+        assert data["monthly_budget"] == "1,000"
+        assert data["daily"] == "12.34"
+
+    @patch("common.agent.subprocess.run")
+    def test_falls_back_to_text_when_not_json(self, mock_run):
+        # Older binary that rejects --json: JSON parse fails -> text scrape.
+        mock_run.return_value = MagicMock(
+            stdout="", stderr="Daily: 10.00\nWeekly: 50.00\nStandard",
+        )
+        data = _my_agent.fetch_usage()
+        assert data["daily"] == "10.00"
+        assert data["weekly"] == "50.00"
+        assert data["tier"] == "Standard"
+
     @patch("common.agent.subprocess.run")
     def test_success_returns_parsed_dict(self, mock_run):
         mock_run.return_value = MagicMock(
@@ -204,8 +290,8 @@ class TestFetchUsage:
         mock_run.return_value = MagicMock(stdout="", stderr="")
         _my_agent.fetch_usage(days=7)
         cmd = mock_run.call_args[0][0]
-        # Argv shape: <binary> usage --days <N>. Binary is configurable.
-        assert cmd == ["agent", "usage", "--days", "7"]
+        # Argv shape: <binary> usage --days <N> --json. Binary is configurable.
+        assert cmd == ["agent", "usage", "--days", "7", "--json"]
 
     @patch("common.agent.subprocess.run")
     def test_combines_stdout_and_stderr(self, mock_run):
@@ -375,6 +461,17 @@ def _strip_env_prefix(argv):
     return argv[i:]
 
 
+def _env_tokens(argv):
+    """Parse the leading `env K=V ...` prefix into a {K: V} dict."""
+    out = {}
+    i = 1
+    while i < len(argv) and "=" in argv[i]:
+        k, _, v = argv[i].partition("=")
+        out[k] = v
+        i += 1
+    return out
+
+
 class TestLaunchArgv:
     def test_bare_launch(self):
         argv = _my_agent.launch_argv("my-tmux")
@@ -430,42 +527,54 @@ _env_agent = _EnvAgent()
 
 
 class TestSessionEnvPrefix:
-    """Agent session argv includes terminal color env plus optional
-    vendor env."""
+    """Agent session argv includes terminal color env, a resolved PATH,
+    plus optional vendor env. PATH is dynamic (env-dependent) so tests
+    assert on the color/vendor keys + PATH presence, not an exact PATH."""
 
     def test_default_color_env_prefix(self):
         argv = _my_agent.launch_argv("s")
-        assert argv[:4] == [
-            "env", "COLORTERM=truecolor", "FORCE_COLOR=1",
-            "TERM=xterm-256color",
-        ]
+        env = _env_tokens(argv)
+        assert env["COLORTERM"] == "truecolor"
+        assert env["FORCE_COLOR"] == "1"
+        assert env["TERM"] == "xterm-256color"
+        # PATH is injected so a user-installed binary resolves even under
+        # a restricted server PATH (see agent._augmented_path).
+        assert "PATH" in env
         assert _strip_env_prefix(argv) == ["agent", "-n", "s"]
 
     def test_launch_prefixes_env_sorted(self):
         argv = _env_agent.launch_argv("s", system_prompt="bg")
+        env = _env_tokens(argv)
+        assert env["BAR"] == "x" and env["FOO"] == "1"
+        assert env["COLORTERM"] == "truecolor"
+        assert "PATH" in env
         # Keys emitted sorted for deterministic argv.
-        assert argv == [
-            "env", "BAR=x", "COLORTERM=truecolor", "FOO=1",
-            "FORCE_COLOR=1", "TERM=xterm-256color",
+        n = len(env)
+        keys = [tok.split("=", 1)[0] for tok in argv[1:1 + n]]
+        assert keys == sorted(keys)
+        assert _strip_env_prefix(argv) == [
             "agent", "-n", "s", "--append-system-prompt", "bg",
         ]
 
     def test_resume_uuid_prefixes_env(self):
         uuid = "48a6fd81-7f37-4e5a-a820-72b04d79ceab"
         argv = _env_agent.resume_argv(uuid)
-        assert argv == [
-            "env", "BAR=x", "COLORTERM=truecolor", "FOO=1",
-            "FORCE_COLOR=1", "TERM=xterm-256color",
-            "agent", "--resume", uuid,
-        ]
+        env = _env_tokens(argv)
+        assert env["BAR"] == "x" and "PATH" in env
+        assert _strip_env_prefix(argv) == ["agent", "--resume", uuid]
 
     def test_resume_cloud_id_prefixes_env(self):
         argv = _env_agent.resume_argv("1777500864453")
-        assert argv == [
-            "env", "BAR=x", "COLORTERM=truecolor", "FOO=1",
-            "FORCE_COLOR=1", "TERM=xterm-256color",
-            "agent", "resume", "1777500864453",
-        ]
+        env = _env_tokens(argv)
+        assert env["BAR"] == "x" and "PATH" in env
+        assert _strip_env_prefix(argv) == ["agent", "resume", "1777500864453"]
+
+    def test_path_prepends_user_bin_dirs(self, monkeypatch):
+        # _augmented_path prepends existing user bin dirs (order-preserved,
+        # de-duplicated) so ~/.local/bin wins over a restricted PATH.
+        monkeypatch.setattr(_agent, "_USER_BIN_DIRS", ["/usr/bin"])  # exists
+        monkeypatch.setenv("PATH", "/sbin:/usr/bin")
+        assert _agent._augmented_path() == "/usr/bin:/sbin"
 
 
 class TestActiveAgentResolution:
@@ -554,3 +663,82 @@ class TestNewSessionAgentSelection:
                                                            patched_server):
         self._register("claude")
         assert _agent.get_agent_by_id("nonexistent").id == "claude"
+
+
+class TestEnabledAgents:
+    """The user-enabled agent set + the new-session resolver that reads
+    it. Empty/unset -> the sole default agent (no prompt); an explicit id
+    always wins; 2+ enabled with no explicit id -> the default fallback
+    (the UI is what prompts the user to pick)."""
+
+    def _register(self, *ids):
+        _agent.reset_for_tests()
+        for aid in ids:
+            cls = type(
+                f"_E_{aid.replace('-', '_')}",
+                (_agent.CliAgentBase,),
+                {"id": aid, "name": aid.title(), "binary": aid},
+            )
+            _agent.register_agent(cls())
+
+    def test_unset_defaults_to_single_new_session_agent(self, patched_server):
+        self._register("claude", "codex")
+        # No enabled row -> just the resolved default (claude).
+        assert _agent.get_enabled_agent_ids() == ["claude"]
+
+    def test_enabled_filters_unregistered_and_dedups(self, patched_server):
+        self._register("claude", "codex")
+        patched_server._db.set_setting(
+            _agent.KEY_ENABLED_AGENT_IDS, ["claude", "ghost", "codex", "claude"])
+        assert _agent.get_enabled_agent_ids() == ["claude", "codex"]
+
+    def test_enabled_all_unregistered_falls_back_to_default(self, patched_server):
+        self._register("claude")
+        patched_server._db.set_setting(
+            _agent.KEY_ENABLED_AGENT_IDS, ["ghost", "phantom"])
+        assert _agent.get_enabled_agent_ids() == ["claude"]
+
+    def test_set_enabled_persists_deduplicated_ids(self, patched_server):
+        self._register("claude", "codex")
+        enabled = _agent.set_enabled_agent_ids(["codex", "claude", "codex"])
+        assert enabled == ["codex", "claude"]
+        assert _agent.get_enabled_agent_ids() == enabled
+
+    def test_set_enabled_repoints_default(self, patched_server):
+        self._register("claude", "codex")
+        _agent.set_enabled_agent_ids(["codex"])
+        assert _agent.get_agent_for_new_session().id == "codex"
+
+    def test_set_enabled_rejects_invalid_values(self, patched_server):
+        import pytest
+        self._register("claude")
+        with pytest.raises(ValueError, match="at least one"):
+            _agent.set_enabled_agent_ids([])
+        with pytest.raises(ValueError, match="ghost"):
+            _agent.set_enabled_agent_ids(["claude", "ghost"])
+
+    def test_resolve_explicit_id_wins(self, patched_server):
+        self._register("claude", "codex")
+        patched_server._db.set_setting(
+            _agent.KEY_ENABLED_AGENT_IDS, ["claude", "codex"])
+        assert _agent.resolve_new_session_agent("codex").id == "codex"
+
+    def test_resolve_single_enabled_used_silently(self, patched_server):
+        self._register("claude", "codex")
+        patched_server._db.set_setting(
+            _agent.KEY_ENABLED_AGENT_IDS, ["codex"])
+        assert _agent.resolve_new_session_agent().id == "codex"
+
+    def test_resolve_multiple_enabled_no_pick_uses_default(self, patched_server):
+        self._register("claude", "codex")
+        patched_server._db.set_setting(
+            _agent.KEY_ENABLED_AGENT_IDS, ["claude", "codex"])
+        # No explicit pick -> default fallback (claude); the UI is
+        # responsible for prompting before it reaches this path.
+        assert _agent.resolve_new_session_agent().id == "claude"
+
+    def test_resolve_unknown_explicit_id_raises(self, patched_server):
+        import pytest
+        self._register("claude")
+        with pytest.raises(ValueError, match="unknown agent"):
+            _agent.resolve_new_session_agent("nope")

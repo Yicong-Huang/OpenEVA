@@ -10,6 +10,7 @@ import {
   type PromptCheckboxOption,
   type PromptCheckboxResult,
   type PopConfirmAnchor,
+  type ChooseOptions,
 } from './alertContext'
 
 export { useAlert } from './alertContext'
@@ -22,6 +23,7 @@ type Dialog =
   | ({ mode: 'alert'; resolve: () => void } & AlertOptions)
   | ({ mode: 'prompt'; resolve: (v: string | null) => void } & PromptOptions)
   | ({ mode: 'promptCheckbox'; resolve: (v: PromptCheckboxResult | null) => void; checkbox: PromptCheckboxOption } & PromptOptions)
+  | ({ mode: 'choose'; resolve: (v: string | null) => void } & ChooseOptions)
 
 const KIND_COLOR: Record<AlertKind, string> = {
   info: 'var(--blue, #3b82f6)',
@@ -169,6 +171,60 @@ function ConfirmBody({
           onClick={() => onClose(true)}
         >
           {dlg.confirmLabel ?? 'Confirm'}
+        </BaseButton>
+      </div>
+    </DialogFrame>
+  )
+}
+
+// Multi-way choice modal. Renders each choice as a full-width button
+// stacked vertically (labels can be long), with a Cancel row below.
+// Escape / backdrop click resolves null. Enter picks the first choice
+// (the recommended default, listed first by convention).
+function ChooseBody({
+  dlg, onClose,
+}: { dlg: Extract<Dialog, { mode: 'choose' }>; onClose: (v: string | null) => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose(null) }
+      else if (e.key === 'Enter') {
+        e.preventDefault()
+        if (dlg.choices.length) onClose(dlg.choices[0].key)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [dlg.choices, onClose])
+
+  return (
+    <DialogFrame kind={dlg.kind ?? 'info'} title={dlg.title} message={dlg.message}
+                 onEscape={() => onClose(null)}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {dlg.choices.map((c, i) => (
+          <button
+            key={c.key}
+            data-testid={`alert-choice-${c.key}`}
+            autoFocus={i === 0}
+            onClick={() => onClose(c.key)}
+            style={{
+              padding: '8px 14px', borderRadius: 5, cursor: 'pointer',
+              fontSize: 12, fontFamily: 'inherit', fontWeight: 500,
+              textAlign: 'left',
+              border: c.variant && c.variant !== 'default'
+                ? '1px solid transparent' : '1px solid var(--border)',
+              background: c.variant === 'danger' ? 'var(--red, #ef4444)'
+                        : c.variant === 'primary' ? 'var(--accent, #6366f1)'
+                        : 'transparent',
+              color: c.variant && c.variant !== 'default' ? '#fff' : 'var(--text)',
+            }}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+        <BaseButton testId="alert-cancel" onClick={() => onClose(null)}>
+          {dlg.cancelLabel ?? 'Cancel'}
         </BaseButton>
       </div>
     </DialogFrame>
@@ -589,8 +645,12 @@ export function AlertProvider({ children }: { children: ReactNode }) {
     [push],
   )
 
+  const choose = useCallback((opts: ChooseOptions) => new Promise<string | null>((resolve) => {
+    push({ mode: 'choose', resolve, ...opts })
+  }), [push])
+
   const value: AlertContextValue = {
-    confirm, confirmAt, alert, prompt, promptWithCheckbox,
+    confirm, confirmAt, alert, prompt, promptWithCheckbox, choose,
   }
   const top = queue[0]
 
@@ -611,6 +671,9 @@ export function AlertProvider({ children }: { children: ReactNode }) {
       )}
       {top && top.mode === 'promptCheckbox' && (
         <PromptCheckboxBody dlg={top} onClose={(v) => resolveTop(v)} />
+      )}
+      {top && top.mode === 'choose' && (
+        <ChooseBody dlg={top} onClose={(v) => resolveTop(v)} />
       )}
     </AlertContext.Provider>
   )

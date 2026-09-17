@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { SessionStatusProvider } from '../hooks/SessionStatusProvider'
 
@@ -613,6 +613,42 @@ describe('SessionsPage', () => {
         (c: unknown[]) => String(c[0]).includes('/api/tickets/LIVE-1'),
       )).toBe(true)
       expect(screen.getByText('history from detail endpoint')).toBeInTheDocument()
+    })
+  })
+
+  it('right-clicking a task node chip opens the status context menu', async () => {
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage />)
+
+    const chip = await screen.findByTestId('task-node-chip-task-a')
+    fireEvent.contextMenu(chip)
+
+    const menu = await screen.findByTestId('task-node-context-menu')
+    expect(within(menu).getByText('Set status')).toBeInTheDocument()
+    for (const label of ['Not Started', 'In Progress', 'In Review', 'Needs Follow-up', 'Done', 'Closed']) {
+      expect(within(menu).getByText(label)).toBeInTheDocument()
+    }
+    // task-a is in_progress (fixture) -> marked current, and has no
+    // ticket -> Delete is offered.
+    expect(within(menu).getByText('[current]')).toBeInTheDocument()
+    expect(within(menu).getByText('Delete Task')).toBeInTheDocument()
+  })
+
+  it('setting status from the chip context menu PUTs the new status', async () => {
+    const { SessionsPage } = await import('../pages/SessionsPage')
+    renderWithProvider(<SessionsPage />)
+
+    const chip = await screen.findByTestId('task-node-chip-task-a')
+    fireEvent.contextMenu(chip)
+    const menu = await screen.findByTestId('task-node-context-menu')
+    fireEvent.click(within(menu).getByText('Done'))
+
+    await waitFor(() => {
+      expect(mockFetch.mock.calls.some((c: unknown[]) =>
+        String(c[0]).includes('/api/projects/proj-1/tasks/task-a')
+        && (c[1] as RequestInit | undefined)?.method === 'PUT'
+        && (c[1] as RequestInit).body === JSON.stringify({ status: 'done' }),
+      )).toBe(true)
     })
   })
 })

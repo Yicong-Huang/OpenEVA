@@ -810,13 +810,13 @@ class TestGhRunAsync:
         import asyncio
         fake_result = types.SimpleNamespace(returncode=0, stdout="async ok", stderr="")
         with patch.object(app_state, "gh_run", return_value=fake_result) as mock_gh:
-            loop = asyncio.new_event_loop()
-            try:
-                result = loop.run_until_complete(
-                    app_state.gh_run_async(["gh", "api", "test"], repo="example/repo", timeout=15)
+            result = asyncio.run(
+                app_state.gh_run_async(
+                    ["gh", "api", "test"],
+                    repo="example/repo",
+                    timeout=15,
                 )
-            finally:
-                loop.close()
+            )
         assert result.returncode == 0
         assert result.stdout == "async ok"
         mock_gh.assert_called_once_with(["gh", "api", "test"], repo="example/repo", timeout=15)

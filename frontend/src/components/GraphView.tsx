@@ -37,12 +37,14 @@ import {
   latestPrCiStatus, ciPillStyle,
   type TaskNodeData,
 } from './graphShared'
+import { TaskNodeContextMenu } from './TaskNodeContextMenu'
 
 interface ContextMenu {
   x: number
   y: number
   taskId?: string   // set when right-clicking a node
   hasTicket?: boolean
+  currentStatus?: string   // stored status of the right-clicked task (for the "Set status" submenu)
   /** Set when right-clicking a dependency edge. (from -> to) means
    * "to depends on from". Both fields go together; presence of these
    * is what tells the renderer to show the "Remove dependency" item. */
@@ -1036,6 +1038,7 @@ const GraphViewInner = React.memo(function GraphViewInner({ project, onSelectTas
       x: event.clientX, y: event.clientY,
       taskId: data.taskId,
       hasTicket: !!(task?.ticket_id),
+      currentStatus: task?.status,
     })
   }, [project.tasks])
 
@@ -1300,8 +1303,22 @@ const GraphViewInner = React.memo(function GraphViewInner({ project, onSelectTas
           />
         </ReactFlow>
 
-        {/* Context menu */}
-        {contextMenu && (
+        {/* Node context menu (set status + delete) -- shared with the
+            All Live Tasks page so both stay in lockstep. */}
+        {contextMenu && contextMenu.taskId && (
+          <TaskNodeContextMenu
+            projectId={project.id}
+            taskId={contextMenu.taskId}
+            hasTicket={contextMenu.hasTicket}
+            currentStatus={contextMenu.currentStatus}
+            x={contextMenu.x}
+            y={contextMenu.y}
+            onClose={() => setContextMenu(null)}
+          />
+        )}
+        {/* Pane / edge context menu (new task, remove dependency) --
+            graph-canvas-specific, stays inline here. */}
+        {contextMenu && !contextMenu.taskId && (
           <div
             style={{
               position: 'fixed', left: contextMenu.x, top: contextMenu.y,
@@ -1355,36 +1372,6 @@ const GraphViewInner = React.memo(function GraphViewInner({ project, onSelectTas
                 <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
                   {contextMenu.edgeTo} <span style={{ opacity: 0.5 }}>depends on</span> {contextMenu.edgeFrom}
                 </div>
-              </div>
-            )}
-            {contextMenu.taskId && !contextMenu.hasTicket && (
-              <div
-                className="menu-item"
-                style={{ padding: '6px 16px', fontSize: 12, cursor: 'pointer', borderRadius: 4, color: 'var(--red)' }}
-                onClick={async () => {
-                  const tid = contextMenu.taskId!
-                  setContextMenu(null)
-                  const ok = await confirm({
-                    title: `Delete task "${tid}"?`,
-                    message: 'This cannot be undone.',
-                    confirmLabel: 'Delete',
-                    danger: true,
-                  })
-                  if (!ok) return
-                  try {
-                    await fetch(`/api/projects/${encodeURIComponent(project.id)}/tasks/${encodeURIComponent(tid)}`, { method: 'DELETE' })
-                  } catch { /* ignore */ }
-                }}
-              >
-                Delete Task
-              </div>
-            )}
-            {contextMenu.taskId && contextMenu.hasTicket && (
-              <div
-                style={{ padding: '6px 16px', fontSize: 11, color: 'var(--text-faint)', cursor: 'not-allowed' }}
-                title="Tasks with tickets cannot be deleted"
-              >
-                Delete (has ticket)
               </div>
             )}
           </div>

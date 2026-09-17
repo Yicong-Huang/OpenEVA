@@ -328,6 +328,43 @@ class TestTmuxCapture:
         mock_run.return_value = MagicMock(stdout=b"")
         assert mux._tmux_capture("sess") == b""
 
+    @patch("routes.terminal.pane_on_alt_screen", return_value=True)
+    @patch("routes.terminal.subprocess.run")
+    def test_enters_alt_screen_when_pane_is_on_alt_screen(self, mock_run, _alt):
+        """Regression: the agent TUI repaints with ABSOLUTE cursor
+        positioning on tmux's alternate screen. If replay paints the snapshot
+        onto xterm's primary screen, every later repaint misses its row and
+        raw intermediate output (stray `course` words, `<invoke>` XML) is
+        stranded on screen. The snapshot must switch xterm to the alt-screen
+        FIRST, before the clear-screen reset."""
+        mock_run.return_value = MagicMock(stdout=b"hello\n")
+        out = mux._tmux_capture("sess")
+        assert out.startswith(mux._ENTER_ALT_SCREEN)
+        # Order matters: enter alt-screen, THEN clear it, then paint.
+        assert out.startswith(mux._ENTER_ALT_SCREEN + mux._REPLAY_RESET)
+        assert out.endswith(b"hello\r\n")
+
+    @patch("routes.terminal.pane_on_alt_screen", return_value=False)
+    @patch("routes.terminal.subprocess.run")
+    def test_no_alt_screen_switch_for_plain_pane(self, mock_run, _alt):
+        """A plain shell pane is on the primary screen -- forcing xterm into
+        the alt-screen there would throw away its real scrollback."""
+        mock_run.return_value = MagicMock(stdout=b"hello\n")
+        out = mux._tmux_capture("sess")
+        assert mux._ENTER_ALT_SCREEN not in out
+        assert out.startswith(mux._REPLAY_RESET)
+
+    @patch("routes.terminal.pane_on_alt_screen", side_effect=Exception("boom"))
+    @patch("routes.terminal.subprocess.run")
+    def test_alt_screen_probe_failure_degrades_to_plain_reset(self, mock_run,
+                                                              _alt):
+        """The probe is best-effort. The capture already succeeded by the time
+        we probe, so a probe failure must degrade to a plain reset and still
+        deliver the snapshot -- never swallow it."""
+        mock_run.return_value = MagicMock(stdout=b"hello\n")
+        out = mux._tmux_capture("sess")
+        assert out == mux._REPLAY_RESET + b"hello\r\n"
+
 
 class TestFanOut:
     """Multiple subscribers must each receive a copy of the same frame via

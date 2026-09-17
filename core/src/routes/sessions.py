@@ -164,6 +164,10 @@ class SessionOpen(BaseModel):
     # common
     action_id: str
     custom_prompt: Optional[str] = None
+    # Explicit agent pick sent by the UI when the user has enabled more
+    # than one agent and chose which to launch. None -> resolve the sole
+    # enabled agent or the default (see agent.resolve_new_session_agent).
+    agent_id: Optional[str] = None
 
 
 @app_state.app.post("/api/sessions/open")
@@ -196,6 +200,7 @@ def open_session(body: SessionOpen):
                 review_url=body.review_url,
                 action_id=body.action_id,
                 custom_prompt=body.custom_prompt,
+                agent_id=body.agent_id,
             )
         # default: task session
         from common.sessions import open_session as core_open_session
@@ -206,6 +211,7 @@ def open_session(body: SessionOpen):
             custom_prompt=body.custom_prompt,
             pr_number=body.pr_number,
             pr_repo=body.pr_repo,
+            agent_id=body.agent_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -538,6 +544,29 @@ def _apply_ticket_session_hook(session: str, event: str, _new_state: str,
     return True
 
 
+def _apply_project_session_hook(session: str, event: str, _new_state: str,
+                                 data: dict) -> bool:
+    """Persist the agent UUID for a PM (project-manager) session so a
+    later resume survives tmux death. Returns True when the session
+    matched the `pm-` prefix (dispatcher should stop here).
+
+    PM sessions live in their own `project_sessions` table (keyed by
+    project_id), not `sessions`, so they can't fall through into the
+    task path -- the tmux name is `pm-<project_id>`, so the project_id
+    is the suffix after the prefix.
+    """
+    from common.sessions import _PROJECT_SESSION_PREFIX
+    if not session.startswith(_PROJECT_SESSION_PREFIX):
+        return False
+    if event == "SessionStart":
+        sid = data.get("session_id") or ""
+        project_id = session[len(_PROJECT_SESSION_PREFIX):]
+        if sid and app_state._db.get_project_session(project_id):
+            app_state._db.update_project_session(
+                project_id, agent_session_id=sid)
+    return True
+
+
 def _apply_task_session_hook(session: str, event: str, _new_state: str,
                               data: dict) -> bool:
     """Persist the agent's session UUID for a regular task session so a
@@ -619,6 +648,8 @@ def receive_hook(request_body: dict):
     if _apply_review_session_hook(session, event, new_state, data):
         return {"ok": True}
     if _apply_ticket_session_hook(session, event, new_state, data):
+        return {"ok": True}
+    if _apply_project_session_hook(session, event, new_state, data):
         return {"ok": True}
     _apply_task_session_hook(session, event, new_state, data)
     return {"ok": True}

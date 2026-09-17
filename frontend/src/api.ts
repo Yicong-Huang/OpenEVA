@@ -46,8 +46,18 @@ export const api = {
   addDep: (pid: string, tid: string, dependsOn: string) => post<{ ok: boolean }>(`/api/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/deps`, { depends_on: dependsOn }),
   removeDep: (pid: string, tid: string, dependsOn: string) => fetchApi<void>(`/api/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/deps/${encodeURIComponent(dependsOn)}`, { method: 'DELETE' }),
   closeTask: (pid: string, tid: string, reason: string) => post<Task>(`/api/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/close`, { reason }),
+  // Set a task's stored status directly. Goes through the shared PUT
+  // update path (same as `closeTask`, which is just status=closed +
+  // a note), so event emission / history / dependent fanout all run.
+  // `blocked` is intentionally not settable -- it is a derived
+  // (effective) status, never stored (see eva_db.VALID_STATUSES).
+  updateTaskStatus: (pid: string, tid: string, status: string) =>
+    fetchApi<Task>(`/api/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    }),
   checkStatus: (pid: string, tid: string) => post<Task & { changed: boolean; old_status: string; new_status: string }>(`/api/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/check-status`, {}),
-  openSession: (body: { kind?: 'task' | 'review'; task_id?: string; project_id?: string; review_url?: string; action_id: string; pr_number?: number; pr_repo?: string; custom_prompt?: string }) => post<{ session: string; new: boolean; prompt: string }>('/api/sessions/open', body),
+  openSession: (body: { kind?: 'task' | 'review'; task_id?: string; project_id?: string; review_url?: string; action_id: string; pr_number?: number; pr_repo?: string; custom_prompt?: string; agent_id?: string }) => post<{ session: string; new: boolean; prompt: string }>('/api/sessions/open', body),
   openProjectManager: (pid: string) =>
     post<{ project_id: string; tmux_name: string; running: boolean; status?: string }>(
       `/api/projects/${encodeURIComponent(pid)}/manager`, {}),
@@ -168,10 +178,6 @@ export const api = {
   // Settings: generic JSON key/value store backing the SettingsModal.
   // Values can be any JSON (string, number, list, dict).
   listSettings: () => fetchApi<{ settings: Record<string, unknown> }>('/api/settings'),
-  listAgents: () => fetchApi<{
-    selected: string
-    agents: Array<{ id: string; name: string; binary: string; available: boolean }>
-  }>('/api/agents'),
   setSetting: (key: string, value: unknown) =>
     fetchApi<{ key: string; value: unknown }>(`/api/settings/${encodeURIComponent(key)}`, {
       method: 'PUT',
@@ -180,6 +186,25 @@ export const api = {
     }),
   deleteSetting: (key: string) =>
     fetchApi<{ ok: boolean }>(`/api/settings/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+  // Agents: the registered agent implementations + the user's enabled
+  // set. When `enabled` has 2+ ids, the open-session flow prompts the
+  // user to pick one at launch time (see useSessionLauncher).
+  listAgents: () => fetchApi<{
+    agents: Array<{
+      id: string
+      name: string
+      binary?: string
+      available?: boolean
+    }>
+    enabled: string[]
+    selected?: string | null
+  }>('/api/agents'),
+  setEnabledAgents: (ids: string[]) =>
+    fetchApi<{ enabled: string[] }>('/api/agents/enabled', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: ids }),
+    }),
   // Repos: list of rules + the live resolved repo set those rules
   // currently match (driven by the local prs table). Powers the
   // Settings UI's Repos tab.

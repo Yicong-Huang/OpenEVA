@@ -8,6 +8,7 @@ import { bucketize } from '../utils/sessionState'
 import { TaskCard } from '../components/TaskCard'
 import { PRCard } from '../components/PRCard'
 import { TaskNodeChip } from '../components/TaskNodeChip'
+import { TaskNodeContextMenu } from '../components/TaskNodeContextMenu'
 import { LiveSessionChip } from '../components/LiveSessionChip'
 import { ReviewCard } from '../components/ReviewCard'
 import { TicketNode } from '../components/TicketNode'
@@ -86,6 +87,12 @@ export function SessionsPage({
   const [actionResult, setActionResult] = useState<string | null>(null)
   const [openingSession, setOpeningSession] = useState(false)
   const { alert } = useAlert()
+  // Right-click task-node context menu (set status / delete). Shared
+  // component with the GraphView canvas.
+  const [nodeMenu, setNodeMenu] = useState<{
+    x: number; y: number; projectId: string; taskId: string;
+    hasTicket: boolean; currentStatus?: string
+  } | null>(null)
   const [externalAction, setExternalAction] = useState<{ actionId: string; taskId?: string; prNumber?: number; prRepo?: string; customPrompt?: string; ts: number } | null>(null)
   const [ticketDetails, setTicketDetails] = useState<Record<string, Ticket>>({})
 
@@ -378,6 +385,7 @@ export function SessionsPage({
     onSelectLiveTask?.(null, null)
     onSelectPR?.(null)
     setSelectedExtra(null)
+    setNodeMenu(null)
   }, [onSelectPR, onSelectLiveTask])
 
   // Resolve the cardRefs key for whichever entry is currently active --
@@ -523,12 +531,32 @@ export function SessionsPage({
         selected={isSelected}
         dimmed={!!selectedTask && !isSelected}
         onClick={() => handleSelectNode(projectId, s.task_id)}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          setNodeMenu({
+            x: e.clientX, y: e.clientY,
+            projectId, taskId: s.task_id,
+            hasTicket: !!task.ticket_id,
+            currentStatus: task.status,
+          })
+        }}
       />
     )
   }
 
   return (
     <div data-testid="all-live-tasks-page" style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+      {nodeMenu && (
+        <TaskNodeContextMenu
+          projectId={nodeMenu.projectId}
+          taskId={nodeMenu.taskId}
+          hasTicket={nodeMenu.hasTicket}
+          currentStatus={nodeMenu.currentStatus}
+          x={nodeMenu.x}
+          y={nodeMenu.y}
+          onClose={() => setNodeMenu(null)}
+        />
+      )}
       {/* Left: task node chips grouped by project */}
       <div
         onClick={handleLeftPaneBlankClick}

@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 def _strip_env_prefix(argv):
     if argv[0] != "env":
@@ -386,6 +388,28 @@ class TestKillSession:
         assert resp.json()["status"] == "killed"
 
 
+@pytest.fixture
+def resumable_transcript(tmp_path, monkeypatch):
+    """Make any UUID look resumable, and keep the post-launch liveness
+    check fast.
+
+    `resume_session` refuses to run `--resume` when the UUID's transcript
+    .jsonl is missing (the agent would exit 1 and tmux would reap the
+    pane). Tests that assert the resume path therefore need a transcript
+    on disk. Returns a function that creates one for a given uuid."""
+    import common.sessions as _sessions
+    monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+    monkeypatch.setattr(_sessions, "_PANE_CONFIRM_TIMEOUT", 0.02)
+    monkeypatch.setattr(_sessions, "_PANE_CONFIRM_INTERVAL", 0.01)
+    created = tmp_path / "-encoded-cwd"
+    created.mkdir()
+
+    def _make(uuid: str) -> None:
+        (created / f"{uuid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    return _make
+
+
 class TestResumeSessionRoute:
     """POST /api/sessions/{name}/resume relaunches tmux + resumes agent by UUID."""
 
@@ -395,16 +419,18 @@ class TestResumeSessionRoute:
         assert resp.status_code == 404
 
     def test_resume_dead_tmux_with_uuid_calls_agent_resume(
-            self, client, patched_server, mock_tmux):
-        mock_tmux["exists"].return_value = False
+            self, client, patched_server, mock_tmux, resumable_transcript):
+        uuid = "deadbeef-1234-5678-90ab-cdef01234567"
+        resumable_transcript(uuid)
+        # Pane is gone before launch, then alive (a healthy resume).
+        mock_tmux["exists"].side_effect = [False] + [True] * 20
         patched_server._db.create_session("r-sess", "test-proj", "r-sess")
-        patched_server._db.update_session(
-            "r-sess", agent_session_id="deadbeef-1234-5678-90ab-cdef01234567",
-        )
+        patched_server._db.update_session("r-sess", agent_session_id=uuid)
         resp = client.post("/api/sessions/r-sess/resume")
         assert resp.status_code == 200
         d = resp.json()
         assert d["action"] == "resumed"
+        assert d["running"] is True
         # A transcript UUID resumes the LOCAL conversation via
         # `--resume` (reads the on-disk transcript, independent of the
         # cloud session registry). The cloud `resume` subcommand is
@@ -435,26 +461,36 @@ class TestRestartSessionRoute:
         assert resp.status_code == 404
 
     def test_restart_kills_then_resumes_same_uuid(
-            self, client, patched_server, mock_tmux):
-        # Session starts alive, then tmux is gone after the kill so
-        # resume proceeds. Sequence session_exists accordingly.
-        calls = {"n": 0}
+            self, client, patched_server, mock_tmux, resumable_transcript):
+        uuid = "abcdef01-2345-6789-abcd-ef0123456789"
+        resumable_transcript(uuid)
+        # Model tmux liveness as real state rather than a call-count
+        # sequence: live at first, dead once killed, live again once
+        # relaunched. Counting calls breaks whenever the number of probes
+        # changes (restart alone probes at least three times).
+        state = {"alive": True}
 
         def _exists(_name):
-            calls["n"] += 1
-            return calls["n"] == 1  # alive on first check, gone after
+            return state["alive"]
+
+        def _kill(_name):
+            state["alive"] = False
+
+        def _launch(*_args, **_kwargs):
+            state["alive"] = True
 
         mock_tmux["exists"].side_effect = _exists
+        mock_tmux["launch_argv"].side_effect = _launch
         patched_server._db.create_session("live-sess", "test-proj", "live-sess")
-        patched_server._db.update_session(
-            "live-sess", agent_session_id="abcdef01-2345-6789-abcd-ef0123456789",
-        )
-        with patch("common.sessions.graceful_kill_session") as gk:
+        patched_server._db.update_session("live-sess", agent_session_id=uuid)
+        with patch("common.sessions.graceful_kill_session",
+                   side_effect=_kill) as gk:
             resp = client.post("/api/sessions/live-sess/restart")
         assert resp.status_code == 200
         d = resp.json()
         assert d["action"] == "resumed"
         assert d["restarted"] is True
+        assert d["running"] is True
         # tmux was killed (graceful, not the DB-deleting kill_session)...
         gk.assert_called_once_with("live-sess")
         # ...and the DB row (with the UUID) survives the restart.

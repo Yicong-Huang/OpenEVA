@@ -677,7 +677,8 @@ class TestUpdatePrFromGh:
         assert pr["status"] == "open"
 
     @patch("common.prs.app_state.gh_run")
-    def test_sync_path_backfills_status_changed_at(self, mock_gh, patched_server):
+    def test_sync_path_backfills_status_changed_at(self, mock_gh,
+                                                   patched_server, mock_tmux):
         """The scheduled PR sync (via `_update_pr_from_gh`) also needs
         to backfill `status_changed_at` from GitHub's mergedAt/closedAt.
         Before the shared `map_gh_pr_to_updates` refactor only the
@@ -806,7 +807,7 @@ class TestUpdatePrFromGh:
 
     @patch("common.prs.app_state.gh_run")
     def test_sync_path_preserves_existing_status_changed_at(
-            self, mock_gh, patched_server):
+            self, mock_gh, patched_server, mock_tmux):
         from common.prs import _update_pr_from_gh
         import app_state
 

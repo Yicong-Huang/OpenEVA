@@ -150,3 +150,77 @@ def test_build_background_pr_context_no_match():
 
     result = build_background(task_data, "Proj", "Fix it.", {}, pr_context=pr_context)
     assert "Focus PR" not in result
+
+
+def test_build_background_injects_history_oldest_first():
+    """History (newest-first from the DB) is rendered oldest-first so the
+    last line reads as the current state."""
+    from server import build_background
+
+    task_data = {
+        "task_id": "hist-task",
+        "description": "Task with history",
+        "status": "in_progress",
+        "ticket_id": None,
+        "ticket_url": None,
+        "dependencies": [],
+        "prs": [],
+        # DB returns newest-first
+        "history": [
+            {"ts": "2026-08-27T23:37:41", "text": "opened PR #42"},
+            {"ts": "2026-08-27T23:32:44", "text": "built + tests green"},
+        ],
+    }
+
+    result = build_background(task_data, "Proj", "Continue.", {})
+    assert "[Timeline]" in result
+    assert "built + tests green" in result
+    assert "opened PR #42" in result
+    # oldest entry appears before newest
+    assert result.index("built + tests green") < result.index("opened PR #42")
+    # compact MM-DD HH:MM timestamp, no year / no 'T'
+    assert "08-27 23:32" in result
+
+
+def test_build_background_no_history_no_timeline():
+    from server import build_background
+
+    task_data = {
+        "task_id": "no-hist",
+        "description": "No history yet",
+        "status": "not_started",
+        "ticket_id": None,
+        "ticket_url": None,
+        "dependencies": [],
+        "prs": [],
+        "history": [],
+    }
+    result = build_background(task_data, "Proj", "Do it.", {})
+    assert "[Timeline]" not in result
+
+
+def test_build_background_history_caps_and_reports_elision():
+    """More than the cap: only the most recent _HISTORY_IN_PROMPT are shown,
+    and the header reports how many older ones were elided."""
+    from server import build_background
+    from common.sessions import _HISTORY_IN_PROMPT
+
+    n = _HISTORY_IN_PROMPT + 5
+    # newest-first: entry 0 is newest
+    history = [{"ts": f"2026-08-27T23:{59 - i:02d}:00", "text": f"step {n - i}"}
+               for i in range(n)]
+    task_data = {
+        "task_id": "big-hist",
+        "description": "Long timeline",
+        "status": "in_progress",
+        "ticket_id": None,
+        "ticket_url": None,
+        "dependencies": [],
+        "prs": [],
+        "history": history,
+    }
+    result = build_background(task_data, "Proj", "Continue.", {})
+    assert f"({5} older elided" in result
+    # newest step is shown, an elided older one is not
+    assert f"step {n}" in result
+    assert "step 1 " not in result and "step 1\n" not in result

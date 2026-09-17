@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 import app_state
 from common import settings as core_settings
-from common import agent as core_agent
+from common import agent as _agent
 import shutil
 
 
@@ -20,25 +20,8 @@ class SettingValue(BaseModel):
     value: Any
 
 
-@app_state.app.get("/api/agents")
-def list_agents():
-    """List registered CLI agents and the choice used for new sessions."""
-    selected = core_settings.get_value(
-        core_agent.KEY_NEW_SESSION_AGENT_IMPL,
-        default=core_agent.get_active_agent().id,
-    )
-    return {
-        "selected": selected,
-        "agents": [
-            {
-                "id": agent.id,
-                "name": agent.name,
-                "binary": agent.binary,
-                "available": shutil.which(agent.binary) is not None,
-            }
-            for agent in core_agent.all_agents()
-        ],
-    }
+class EnabledAgentsBody(BaseModel):
+    value: list[str]
 
 
 @app_state.app.get("/api/settings")
@@ -70,6 +53,45 @@ def delete_setting(key: str):
     if not core_settings.delete_value(key):
         raise HTTPException(status_code=404, detail=f"setting '{key}' not found")
     return {"ok": True}
+
+
+# -- Agent selection (consumed by the Settings UI's Setup tab) --
+
+@app_state.app.get("/api/agents")
+def list_available_agents():
+    """Available agent implementations plus the user's enabled set.
+
+    `agents` is the registry (id + human name); `enabled` is the ids the
+    user checked (resolved: filtered to registered, defaults to the sole
+    default agent when unset). When `enabled` has 2+ ids the open-session
+    UI prompts the user to pick one at launch time."""
+    agents = [
+        {
+            "id": agent.id,
+            "name": getattr(agent, "name", agent.id),
+            "binary": agent.binary,
+            "available": shutil.which(agent.binary) is not None,
+        }
+        for agent in _agent.all_agents()
+    ]
+    if not agents:
+        return {"agents": [], "enabled": [], "selected": None}
+    enabled = _agent.get_enabled_agent_ids()
+    return {
+        "agents": agents,
+        "enabled": enabled,
+        "selected": enabled[0] if len(enabled) == 1 else None,
+    }
+
+
+@app_state.app.put("/api/agents/enabled")
+def set_enabled_agents(body: EnabledAgentsBody):
+    """Set the agents available for launching new sessions."""
+    try:
+        enabled = _agent.set_enabled_agent_ids(body.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"enabled": enabled}
 
 
 # -- Repo allow-list resolver (consumed by the Settings UI's Repos tab) --

@@ -319,14 +319,12 @@ class TestGhRunAsync:
 
         monkeypatch.setattr(app_state, "gh_run", lambda *a, **kw: mock_result)
 
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(
-                app_state.gh_run_async(["gh", "api", "test"], repo="example/repo")
+        result = asyncio.run(
+            app_state.gh_run_async(
+                ["gh", "api", "test"], repo="example/repo",
             )
-            assert result.returncode == 0
-        finally:
-            loop.close()
+        )
+        assert result.returncode == 0
 
 
 # ====================================================================

@@ -255,7 +255,7 @@ Respond with ONLY a JSON object (no other text):
   "status": "not_started|in_progress|in_review",
   "ticket_id": "TICKET-123 or null if none mentioned",
   "ticket_url": "full JIRA URL or null",
-  "notes": "concise summary (3-8 lines) of the user context: WHY this work matters, KEY constraints / acceptance criteria, any links or file paths the user referenced. Preserve specific names, IDs, paths verbatim. Plain text, no markdown headings.",
+  "notes": "concise summary (3-8 lines) of the user context: WHY this work matters, KEY constraints / acceptance criteria, any links or file paths the user referenced. Preserve specific names, ticket IDs, and file paths verbatim -- but NOT source line numbers or commit SHAs (see Rules). Plain text, no markdown headings.",
   "dependencies": ["existing-task-id", ...],
   "duplicate_of": "existing-task-id if duplicate, else null",
   "duplicate_reason": "why it is a duplicate, else null"
@@ -275,6 +275,14 @@ Rules:
   the list is even loosely related. Never invent ids -- only reference
   existing task IDs from the list above. Order: most relevant first.
 - notes: keep the original wording where it carries information; do NOT pad with platitudes or restate the description.
+- NO VOLATILE SPECIFICS in description or notes: never state source line
+  numbers (e.g. "worker.py:667") or commit SHAs as standing facts -- they
+  rot as the repo moves and later mislead the worker into distrusting its
+  own (correct) tool output. Anchor on stable references instead: function
+  / class / branch names, file paths, constant / eval-type names. If the
+  user supplied a line number or SHA, drop it in favor of the symbol it
+  points at; keep a SHA only if explicitly marked as a point-in-time
+  baseline ("as of <sha>").
 
 Ticket prefix -> URL base (configured via `jira.ticket_url_prefixes`):
 {prefixes_block}

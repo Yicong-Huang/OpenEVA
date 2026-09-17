@@ -49,6 +49,27 @@ export interface PromptCheckboxResult {
   checked: boolean
 }
 
+// A single button in a `choose` dialog. `key` is what the caller gets
+// back when this button is picked; `variant` tints it (primary/danger).
+export interface ChooseOption {
+  key: string
+  label: string
+  variant?: 'default' | 'primary' | 'danger'
+}
+
+// Multi-way choice modal. Used when a decision has MORE than two
+// outcomes (a plain confirm only offers yes/no) -- e.g. "Do This Task"
+// on a task with no ticket: create the ticket first, do the task first
+// then file the ticket, or just do the task. Resolves to the picked
+// option's `key`, or null when the user dismisses (Escape / backdrop).
+export interface ChooseOptions {
+  title: string
+  message?: string
+  choices: ChooseOption[]
+  cancelLabel?: string    // default: 'Cancel'
+  kind?: AlertKind
+}
+
 // Anchor point for non-blocking popover confirms. `confirmAt` floats a
 // small bubble near the user's pointer instead of opening a centred
 // modal -- chosen for low-stakes destructive actions (Unpin, Remove
@@ -66,6 +87,7 @@ export interface AlertContextValue {
   promptWithCheckbox: (
     opts: PromptOptions & { checkbox: PromptCheckboxOption },
   ) => Promise<PromptCheckboxResult | null>
+  choose: (opts: ChooseOptions) => Promise<string | null>
 }
 
 export const AlertContext = createContext<AlertContextValue | null>(null)
@@ -100,6 +122,20 @@ const _nativeFallback: AlertContextValue = {
     )
     if (v === null) return Promise.resolve(null)
     return Promise.resolve({ value: v, checked: !!opts.checkbox.defaultChecked })
+  },
+  // Native browser has no multi-button dialog; walk the choices with
+  // sequential confirms (OK picks that choice, Cancel moves on) and
+  // return null if every choice is declined.
+  choose: (opts) => {
+    for (const c of opts.choices) {
+      const ok = window.confirm(
+        opts.message
+          ? `${opts.title}\n${opts.message}\n\n${c.label}?`
+          : `${opts.title}\n\n${c.label}?`,
+      )
+      if (ok) return Promise.resolve(c.key)
+    }
+    return Promise.resolve(null)
   },
 }
 

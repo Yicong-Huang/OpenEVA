@@ -19,6 +19,20 @@ export const STATUS_COLORS: Record<string, string> = {
   closed: 'var(--text-dim)',
 }
 
+// Statuses a user can set directly from the node right-click menu,
+// in workflow order. Mirrors `eva_db.VALID_STATUSES` (the stored,
+// settable set) -- `blocked` is deliberately absent because it is a
+// derived/effective status computed from unclosed dependencies, never
+// stored, so setting it makes no sense. Labels match the legend bar.
+export const SETTABLE_STATUSES: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'not_started', label: 'Not Started' },
+  { value: 'in_progress', label: 'In Progress' },
+  { value: 'in_review', label: 'In Review' },
+  { value: 'needs_follow_up', label: 'Needs Follow-up' },
+  { value: 'done', label: 'Done' },
+  { value: 'closed', label: 'Closed' },
+]
+
 // Card width grows with task id length (see GraphView::computeWidth)
 // so the id always fits on a single line. NODE_W is just the floor
 // for short ids so the visual rhythm doesn't shrink to nothing.

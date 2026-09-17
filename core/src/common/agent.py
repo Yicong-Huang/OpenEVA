@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib
 import json as _json
+import os
 import re as _re
 import subprocess
 from typing import Protocol, runtime_checkable
@@ -46,6 +47,14 @@ _DEFAULT_AGENT_ID = "claude"
 # register additional agents point this at one of them via the setting.
 KEY_NEW_SESSION_AGENT_IMPL = "service.agent.new_session_impl"
 _DEFAULT_NEW_SESSION_AGENT_ID = _DEFAULT_AGENT_ID
+
+# Setting key: the user-enabled set of agent ids offered when launching a
+# new session. When the user enables more than one, the UI prompts at
+# open-session time to pick which one; when exactly one is enabled it is
+# used silently. Empty/unset means "no explicit set" and we fall back to
+# the single resolved new-session agent, so behavior is unchanged until
+# the user opts into a multi-agent choice.
+KEY_ENABLED_AGENT_IDS = "service.agent.enabled_ids"
 
 # Agent used to resume a session whose `agent_impl` is empty. Such rows
 # predate per-session agent binding; resuming them with the default
@@ -169,6 +178,69 @@ def get_agent_for_new_session() -> Agent:
     return get_active_agent()
 
 
+def get_enabled_agent_ids() -> list[str]:
+    """Ids the user enabled for launching new sessions, filtered to those
+    actually registered (order preserved).
+
+    Empty / unset -> `[get_agent_for_new_session().id]`, so an install
+    that never touched the setting offers exactly the default agent and
+    the open-session flow never has to prompt."""
+    raw = _settings.get_value(KEY_ENABLED_AGENT_IDS, default=None)
+    if isinstance(raw, list):
+        registered = (
+            agent_id for agent_id in raw
+            if isinstance(agent_id, str) and get_agent(agent_id) is not None
+        )
+        ids = list(dict.fromkeys(registered))
+        if ids:
+            return ids
+    return [get_agent_for_new_session().id]
+
+
+def set_enabled_agent_ids(agent_ids: list[str]) -> list[str]:
+    """Validate and persist the agents available for new sessions."""
+    ids = list(dict.fromkeys(agent_ids))
+    if not ids:
+        raise ValueError("at least one agent must be enabled")
+
+    known_ids = {agent.id for agent in all_agents()}
+    unknown = [agent_id for agent_id in ids if agent_id not in known_ids]
+    if unknown:
+        available = ", ".join(sorted(known_ids)) or "(none registered)"
+        raise ValueError(
+            f"unknown agent(s): {', '.join(unknown)}; available: {available}"
+        )
+
+    _settings.set_value(KEY_ENABLED_AGENT_IDS, ids)
+    if get_agent_for_new_session().id not in ids:
+        _settings.set_value(KEY_AGENT_IMPL, ids[0])
+        _settings.set_value(KEY_NEW_SESSION_AGENT_IMPL, ids[0])
+    return ids
+
+
+def resolve_new_session_agent(agent_id: str | None = None) -> Agent:
+    """Pick the agent that should launch a NEW session.
+
+    Resolution order:
+      1. explicit `agent_id` (must be registered) -- passed by the UI
+         after prompting the user to choose among several enabled agents;
+      2. the sole enabled agent, when exactly one is enabled (no prompt);
+      3. otherwise `get_agent_for_new_session()` (the default fallback).
+
+    Raises ValueError on an explicit id that isn't registered."""
+    if agent_id:
+        chosen = get_agent(agent_id)
+        if chosen is None:
+            raise ValueError(f"unknown agent '{agent_id}'")
+        return chosen
+    enabled = get_enabled_agent_ids()
+    if len(enabled) == 1:
+        only = get_agent(enabled[0])
+        if only is not None:
+            return only
+    return get_agent_for_new_session()
+
+
 def get_agent_by_id(agent_impl: str) -> Agent:
     """Return the agent that a session recorded in its `agent_impl`.
 
@@ -273,6 +345,26 @@ _DEFAULT_SESSION_ENV = {
     "TERM": "xterm-256color",
 }
 
+# User-local directories commonly omitted from the restricted PATH used by
+# service managers and shell wrappers. Prepending existing directories keeps
+# user-installed agent binaries discoverable.
+_USER_BIN_DIRS = [
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/bin"),
+]
+
+
+def _augmented_path() -> str:
+    """Current PATH with the user-local bin dirs prepended (existing,
+    de-duplicated, order-preserving). This is what the launched agent
+    process searches for its binary."""
+    current = os.environ.get("PATH", "")
+    parts = [d for d in _USER_BIN_DIRS if os.path.isdir(d)]
+    for p in current.split(os.pathsep):
+        if p and p not in parts:
+            parts.append(p)
+    return os.pathsep.join(parts)
+
 # Captures the numeric amount after "Daily:" / "Weekly:" / "Monthly:" in
 # the agent's text-mode usage report. The optional `$` + thousands-
 # separator comma are both tolerated -- some CLI variants prefix `$`,
@@ -302,6 +394,93 @@ _USAGE_GATEWAY_RE = _re.compile(
 )
 
 
+def _fmt_amount(v, decimals: int = 2) -> str | None:
+    """Money value -> comma-grouped fixed-decimal string; None passes
+    through. Keeps the JSON path's values the same shape (strings or
+    None) as the text parser, which the route + frontend expect."""
+    if v is None:
+        return None
+    try:
+        return f"{float(v):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_from_json(obj: dict) -> dict:
+    """Map structured agent usage output to Eva's usage dict.
+
+    Structured JSON is authoritative: the text report's line shapes
+    drift between isaac versions (the per-tool `Daily:` / `Weekly:`
+    lines were dropped and the section headers renamed), so we read
+    the JSON when it's available and only fall back to text scraping
+    when it isn't. Values are stringified to match the text parser's
+    shape (the route + frontend expect strings or None).
+
+    Field sources in the JSON:
+      * `gateway_budget.monthly` -> account-wide monthly spend + cap
+        (the headline `monthly` / `monthly_total` / `monthly_budget`).
+      * `claude_code` -> `cost_usd` / `total_tokens` for the requested
+        day window, `power_user` for tier, and the (now usually null)
+        `spend.*` per-tool daily/weekly/monthly slices.
+      * `codex` -> same shape; the spend row is omitted when there is
+        no usage in the window.
+      * `daily` headline: `spend.daily_usd` when present,
+        else the window's actual billed spend (claude + codex cost) so
+        the topbar shows today's spend instead of "--"."""
+    data = {
+        "daily": None, "weekly": None, "monthly": None, "tier": None,
+        "claude_cost": None, "claude_tokens": None,
+        "codex_cost": None, "codex_tokens": None,
+        "monthly_total": None, "monthly_budget": None, "claude_monthly": None,
+    }
+    if not isinstance(obj, dict):
+        return data
+
+    gw = (obj.get("gateway_budget") or {}).get("monthly") or {}
+    if gw.get("usage_usd") is not None:
+        # Whole-dollar rounding matches the quota dashboard headline
+        # (e.g. "4,444 / 15,000").
+        data["monthly_total"] = f"{round(float(gw['usage_usd'])):,}"
+        data["monthly"] = data["monthly_total"]
+    if gw.get("limit_usd") is not None:
+        data["monthly_budget"] = f"{round(float(gw['limit_usd'])):,}"
+
+    cc = obj.get("claude_code") or {}
+    if cc.get("power_user"):
+        data["tier"] = "Power User"
+    if cc.get("cost_usd") is not None:
+        data["claude_cost"] = _fmt_amount(cc["cost_usd"])
+    if cc.get("total_tokens"):
+        data["claude_tokens"] = str(int(cc["total_tokens"]))
+    cc_spend = cc.get("spend") or {}
+    data["claude_monthly"] = _fmt_amount(cc_spend.get("monthly_usd"))
+    data["weekly"] = _fmt_amount(cc_spend.get("weekly_usd"))
+
+    cx = obj.get("codex") or {}
+    if cx.get("requests"):  # omit the Codex spend row when the window is empty
+        data["codex_cost"] = _fmt_amount(cx.get("cost_usd"))
+        if cx.get("total_tokens"):
+            data["codex_tokens"] = str(int(cx["total_tokens"]))
+
+    # No gateway block -> fall back to the Claude-Code-only monthly
+    # slice for the headline (back-compat with the old text behaviour).
+    if data["monthly"] is None and data["claude_monthly"] is not None:
+        data["monthly"] = data["claude_monthly"]
+
+    daily_spend = cc_spend.get("daily_usd")
+    if daily_spend is not None:
+        data["daily"] = _fmt_amount(daily_spend)
+    else:
+        total, have = 0.0, False
+        for sect in (cc, cx):
+            c = sect.get("cost_usd")
+            if c is not None:
+                total += float(c)
+                have = True
+        data["daily"] = _fmt_amount(total) if have else None
+    return data
+
+
 def _parse_usage(text: str) -> dict:
     """Extract usage values from the agent's text-mode usage report.
 
@@ -328,9 +507,12 @@ def _parse_usage(text: str) -> dict:
     section = None  # "claude" | "codex" | None
     for line in text.split("\n"):
         line = line.strip()
-        if "Claude Code Usage Summary" in line:
+        # Match both the old ("... Usage Summary for user") and current
+        # ("... Usage for user") section headers -- isaac dropped the
+        # "Summary" word but the leading label is unchanged.
+        if "Claude Code Usage" in line:
             section = "claude"
-        elif "Codex Usage Summary" in line:
+        elif "Codex Usage" in line:
             section = "codex"
 
         # Account-wide gateway total takes priority for the headline
@@ -462,7 +644,10 @@ class CliAgentBase:
         the shared terminal env plus any vendor-specific env. Keys are
         emitted in sorted order for deterministic argv (stable tests,
         stable pane_start_command)."""
-        env = {**_DEFAULT_SESSION_ENV, **self.session_env}
+        # PATH is injected (not in the static defaults) so the launched
+        # agent binary resolves even when Eva's own PATH is restricted;
+        # session_env may still override it.
+        env = {"PATH": _augmented_path(), **_DEFAULT_SESSION_ENV, **self.session_env}
         return ["env"] + [f"{k}={env[k]}" for k in sorted(env)]
 
     def launch_argv(self, name: str, *,
@@ -516,15 +701,23 @@ class CliAgentBase:
 
     def fetch_usage(self, days: int = 1,
                     timeout: int = _DEFAULT_USAGE_TIMEOUT) -> dict | None:
-        """Run `<binary> usage --days N` and parse the text output."""
+        """Run `<binary> usage --days N --json` and map the result.
+
+        Structured JSON (stdout) is authoritative; the human report on
+        stderr is only used as a fallback for older binaries that don't
+        understand `--json` (they exit non-zero with the text report,
+        so `json.loads` fails and we scrape the text instead)."""
         try:
             result = subprocess.run(
-                [self.binary, "usage", "--days", str(days)],
+                [self.binary, "usage", "--days", str(days), "--json"],
                 capture_output=True, text=True, timeout=timeout,
             )
         except Exception:
             return None
-        return _parse_usage(result.stdout + result.stderr)
+        try:
+            return _usage_from_json(_json.loads(result.stdout))
+        except (ValueError, _json.JSONDecodeError):
+            return _parse_usage(result.stdout + result.stderr)
 
     # ---- One-shot analysis ----
 

@@ -222,6 +222,73 @@ describe('TaskCard interactions', () => {
     })
   })
 
+  it('Do Task offers the ticket-sequencing choice even when project has_tickets is false', async () => {
+    // Regression: the create-ticket-first option used to be gated on
+    // project.has_tickets, so non-ticket projects never saw it. Now the
+    // choice appears for any project whose task has no ticket yet.
+    const proj = makeProject({ ticket_id: '', ticket_url: '' })
+    proj.has_tickets = false
+    const actions = [
+      { id: 'do-task', label: 'Do Task', prompt_template: 'Do the work', context: 'task', condition: '', sort_order: 0 },
+      { id: 'create-ticket', label: 'Create Ticket', prompt_template: 'File a JIRA ticket', context: 'task', condition: '', sort_order: 1 },
+    ]
+    // Native choose() fallback walks choices with window.confirm; first
+    // OK picks 'ticket-first'.
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<TaskCard project={proj} taskId="task-1" actions={actions} />)
+    fireEvent.click(screen.getByText('Do Task'))
+    await waitFor(() => expect(api.openSession).toHaveBeenCalled())
+    const arg = vi.mocked(api.openSession).mock.calls[0][0] as { custom_prompt?: string }
+    expect(arg.custom_prompt).toContain('STEP 1: File a JIRA ticket')
+    expect(arg.custom_prompt).toContain('STEP 2')
+    expect(arg.custom_prompt).toContain('Do the work')
+  })
+
+  it('Do Task task-first choice puts the work before the ticket', async () => {
+    const proj = makeProject({ ticket_id: '', ticket_url: '' })
+    const actions = [
+      { id: 'do-task', label: 'Do Task', prompt_template: 'Do the work', context: 'task', condition: '', sort_order: 0 },
+      { id: 'create-ticket', label: 'Create Ticket', prompt_template: 'File a JIRA ticket', context: 'task', condition: '', sort_order: 1 },
+    ]
+    // Decline first choice (ticket-first), accept the second (task-first).
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValue(true)
+    render(<TaskCard project={proj} taskId="task-1" actions={actions} />)
+    fireEvent.click(screen.getByText('Do Task'))
+    await waitFor(() => expect(api.openSession).toHaveBeenCalled())
+    const arg = vi.mocked(api.openSession).mock.calls[0][0] as { custom_prompt?: string }
+    expect(arg.custom_prompt).toContain('STEP 1: Do the work')
+    expect(arg.custom_prompt).toContain('File a JIRA ticket')
+  })
+
+  it('Do Task dismissed (all choices declined) launches nothing', async () => {
+    const proj = makeProject({ ticket_id: '', ticket_url: '' })
+    const actions = [
+      { id: 'do-task', label: 'Do Task', prompt_template: 'Do the work', context: 'task', condition: '', sort_order: 0 },
+      { id: 'create-ticket', label: 'Create Ticket', prompt_template: 'File a JIRA ticket', context: 'task', condition: '', sort_order: 1 },
+    ]
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    render(<TaskCard project={proj} taskId="task-1" actions={actions} />)
+    fireEvent.click(screen.getByText('Do Task'))
+    // Give any async handler a tick to (not) fire.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(api.openSession).not.toHaveBeenCalled()
+  })
+
+  it('Do Task on a task that already has a ticket skips the choice dialog', async () => {
+    // baseTask has ticket_id EX-123, so no ticket needs creating.
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    const actions = [
+      { id: 'do-task', label: 'Do Task', prompt_template: 'Do the work', context: 'task', condition: '', sort_order: 0 },
+    ]
+    render(<TaskCard project={makeProject()} taskId="task-1" actions={actions} />)
+    fireEvent.click(screen.getByText('Do Task'))
+    await waitFor(() => expect(api.openSession).toHaveBeenCalled())
+    expect(confirmSpy).not.toHaveBeenCalled()
+    const arg = vi.mocked(api.openSession).mock.calls[0][0] as { custom_prompt?: string }
+    // Plain do-task path -- no combined STEP prompt.
+    expect(arg.custom_prompt ?? '').not.toContain('STEP 1')
+  })
+
   it('action button with condition ci_failed hidden when no failed CI', () => {
     const actions = [
       { id: 'fix-ci', label: 'Fix CI', prompt_template: '', context: 'task', condition: 'ci_failed', sort_order: 0 },

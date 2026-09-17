@@ -163,6 +163,40 @@ class TestPaneGrabsMouse:
         assert tmux._pane_grabs_mouse("hung") is False
 
 
+class TestPaneOnAltScreen:
+    """The agent TUI runs on tmux's alternate screen. Reconnect replay needs
+    to know that so it can put xterm on the same screen the live frames
+    address -- see routes.terminal._tmux_capture."""
+
+    @patch("adapters.tmux.subprocess.run")
+    def test_true_when_alternate_on(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="1\n")
+        assert tmux.pane_on_alt_screen("sess") is True
+
+    @patch("adapters.tmux.subprocess.run")
+    def test_queries_alternate_on_format(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="1\n")
+        tmux.pane_on_alt_screen("sess")
+        cmd = mock_run.call_args[0][0]
+        assert "#{alternate_on}" in cmd
+        # Must target the named session, not the tmux "current" pane.
+        assert "-t" in cmd and "sess" in cmd
+
+    @patch("adapters.tmux.subprocess.run")
+    def test_false_when_on_primary_screen(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="0\n")
+        assert tmux.pane_on_alt_screen("sess") is False
+
+    @patch("adapters.tmux.subprocess.run",
+           side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=3))
+    def test_false_on_timeout(self, _mock_run):
+        assert tmux.pane_on_alt_screen("hung") is False
+
+    @patch("adapters.tmux.subprocess.run", side_effect=OSError("no tmux"))
+    def test_false_when_tmux_missing(self, _mock_run):
+        assert tmux.pane_on_alt_screen("sess") is False
+
+
 class TestKillSession:
     @patch("adapters.tmux.subprocess.run")
     def test_invokes_kill_session_command(self, mock_run):

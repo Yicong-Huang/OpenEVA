@@ -144,6 +144,23 @@ def _pane_grabs_mouse(session_name: str) -> bool:
         return False
 
 
+def pane_on_alt_screen(session_name: str) -> bool:
+    """True when the pane's program is currently on the alternate screen.
+
+    Reconnect replay must select the same screen as the pane before painting
+    its snapshot; otherwise later cursor-relative updates target the wrong
+    buffer. Any tmux failure returns False and falls back to a plain reset."""
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", session_name,
+             "#{alternate_on}"],
+            capture_output=True, timeout=_SCROLL_TIMEOUT, text=True,
+        )
+        return r.stdout.strip() == "1"
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 # SGR mouse wheel reports (mode 1006): button 64 = wheel up, 65 = down.
 # Sent at cell (1,1); the agent only needs the button to scroll.
 _WHEEL_SGR = {"up": "\x1b[<64;1;1M", "down": "\x1b[<65;1;1M"}

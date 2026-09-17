@@ -291,6 +291,19 @@ class TestSmartCreateRoute:
                 events.append(json.loads(line[len("data: "):]))
         return events
 
+    def test_smart_create_prompt_forbids_volatile_specifics(self, patched_server):
+        """The haiku prompt tells the model not to bake source line numbers
+        or commit SHAs into the description/notes -- those go stale and later
+        make workers distrust their own correct tool output."""
+        from routes.tasks import _build_smart_create_prompt, SmartCreateBody
+        body = SmartCreateBody(context="Refactor worker.py return contracts")
+        prompt = _build_smart_create_prompt(
+            "test-proj", {"name": "Test Proj", "jira": "unknown"}, body,
+        )
+        assert "NO VOLATILE SPECIFICS" in prompt
+        assert "line number" in prompt.lower()
+        assert "sha" in prompt.lower()
+
     def test_smart_create_success(self, client, patched_server):
         """Successful smart-create returns SSE events ending with done."""
         plan = self._plan(task_id="smart-new-task", group="core")

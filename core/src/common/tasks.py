@@ -447,3 +447,42 @@ def rename_task(project_id, old_id, new_id):
         app_state._db.delete_session(old_id)
         app_state._db.create_session(new_id, project_id)
     return app_state._db.get_task(project_id, new_id)
+
+
+def move_task(project_id, task_id, new_project):
+    """Move a task from `project_id` to `new_project`.
+
+    Returns the moved task dict (now owned by `new_project`), or None if
+    the source task doesn't exist. Raises KeyError if the destination
+    project doesn't exist, ValueError if the task already lives in
+    `new_project` (a no-op guard so the history timeline isn't polluted
+    with a self-move).
+
+    Dependencies and linked PRs are keyed by the globally-unique task_id
+    so they follow the task automatically; only the owning-project
+    columns (task row, history, session) are rewritten.
+    """
+    task = app_state._db.get_task(project_id, task_id)
+    if not task:
+        return None
+    if not app_state._db.project_exists(new_project):
+        raise KeyError("Project not found")
+    # `get_task` matches by task_id alone, so trust the row's real
+    # project for the "moved from" label rather than the caller's arg.
+    current_project = task.get("project", "") or ""
+    if current_project == new_project:
+        raise ValueError(
+            f"Task '{task_id}' is already in project '{new_project}'"
+        )
+    if not app_state._db.move_task(task_id, new_project):
+        return None
+    _append_auto_history(new_project, task_id,
+                         f"moved: {current_project or 'none'} -> {new_project}")
+    # Refresh both the source and destination project views so open
+    # ProjectPage subscribers re-file the task without a manual reload.
+    _emit_task_event("task.updated", current_project, task_id,
+                     message=f"moved to {new_project}", persist=False)
+    _emit_task_event("task.updated", new_project, task_id,
+                     message=f"moved from {current_project or 'none'}",
+                     persist=False)
+    return app_state._db.get_task(new_project, task_id)

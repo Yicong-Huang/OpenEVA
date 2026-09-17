@@ -375,11 +375,94 @@ class TestGetSessionStatus:
 # resume_session
 # ---------------------------------------------------------------------------
 
+class TestLocalTranscriptExists:
+    """`--resume UUID` only works while the transcript .jsonl is on disk;
+    once it's deleted the agent exits 1 at startup. This predicate is the
+    pre-flight check that keeps us from launching a doomed resume."""
+
+    def test_true_when_transcript_present(self, tmp_path, monkeypatch):
+        import common.sessions as _sessions
+        uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        d = tmp_path / "-encoded-cwd"
+        d.mkdir()
+        (d / f"{uuid}.jsonl").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        assert _sessions._local_transcript_exists(uuid) is True
+
+    def test_false_when_transcript_absent(self, tmp_path, monkeypatch):
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        assert _sessions._local_transcript_exists(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") is False
+
+    def test_false_for_empty_uuid(self, tmp_path, monkeypatch):
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        assert _sessions._local_transcript_exists("") is False
+
+    def test_finds_transcript_under_any_cwd_dir(self, tmp_path, monkeypatch):
+        """Transcripts are keyed by an encoding of the session's cwd, so the
+        lookup must scan every project dir rather than guess one."""
+        import common.sessions as _sessions
+        uuid = "12121212-3434-5656-7878-909090909090"
+        for name in ("-home-a", "-home-b", "-home-c"):
+            (tmp_path / name).mkdir()
+        (tmp_path / "-home-c" / f"{uuid}.jsonl").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        assert _sessions._local_transcript_exists(uuid) is True
+
+
+class TestConfirmPaneAlive:
+    """`tmux new-session` exits 0 once the pane is forked, which says
+    nothing about the command inside surviving. This helper is what turns
+    "we launched it" into "it's actually running"."""
+
+    def test_false_when_pane_never_exists(self, monkeypatch):
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "session_exists", lambda n: False)
+        assert _sessions._confirm_pane_alive("x", timeout=0.05) is False
+
+    def test_true_when_pane_stays_alive(self, monkeypatch):
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "session_exists", lambda n: True)
+        monkeypatch.setattr(_sessions, "_PANE_CONFIRM_INTERVAL", 0.01)
+        assert _sessions._confirm_pane_alive("x", timeout=0.05) is True
+
+    def test_false_when_pane_dies_partway_through_window(self, monkeypatch):
+        """The failure mode we actually hit: the pane exists right after
+        launch, then the agent exits and tmux reaps it."""
+        import common.sessions as _sessions
+        calls = {"n": 0}
+
+        def flaky(_name):
+            calls["n"] += 1
+            return calls["n"] <= 2       # alive twice, then gone
+
+        monkeypatch.setattr(_sessions, "session_exists", flaky)
+        monkeypatch.setattr(_sessions, "_PANE_CONFIRM_INTERVAL", 0.01)
+        assert _sessions._confirm_pane_alive("x", timeout=5.0) is False
+
+    def test_zero_timeout_still_probes_once(self, monkeypatch):
+        """A 0 window must not skip the check entirely -- one probe still
+        catches an already-dead pane."""
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "session_exists", lambda n: False)
+        assert _sessions._confirm_pane_alive("x", timeout=0.0) is False
+
+
 class TestResumeSession:
     """host recovery reboot leaves agent session files intact but kills every tmux.
     `resume_session` should relaunch tmux with the same name and, when we
     have an agent session UUID on record, run `agent resume <uuid>` inside
     so the conversation history is restored."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_pane_confirm(self, monkeypatch):
+        """Shrink the post-launch liveness window so the healthy path
+        doesn't spend the real 1s watch window in every test."""
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "_PANE_CONFIRM_TIMEOUT", 0.02)
+        monkeypatch.setattr(_sessions, "_PANE_CONFIRM_INTERVAL", 0.01)
 
     def test_raises_on_missing_db_row(self, patched_server, mock_tmux):
         with pytest.raises(ValueError, match="Session not found"):
@@ -394,14 +477,25 @@ class TestResumeSession:
         # Shouldn't spawn a second tmux.
         mock_tmux["launch_argv"].assert_not_called()
 
-    def test_resumes_by_uuid_when_recorded(self, patched_server, mock_tmux):
-        mock_tmux["exists"].return_value = False
+    def test_resumes_by_uuid_when_recorded(self, patched_server, mock_tmux,
+                                           tmp_path, monkeypatch):
+        import common.sessions as _sessions
+        uuid = "11111111-2222-3333-4444-555555555555"
+        # The transcript must exist on disk: resume only uses `--resume`
+        # when it can still find the conversation (see
+        # test_relaunches_fresh_when_transcript_vanished).
+        proj_dir = tmp_path / "-some-cwd"
+        proj_dir.mkdir()
+        (proj_dir / f"{uuid}.jsonl").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        # Pane is gone before launch, alive afterwards (what a healthy
+        # resume looks like to the liveness probe).
+        mock_tmux["exists"].side_effect = [False] + [True] * 20
         patched_server._db.create_session("u-sess", "test-proj", "u-sess")
-        patched_server._db.update_session(
-            "u-sess", agent_session_id="11111111-2222-3333-4444-555555555555",
-        )
+        patched_server._db.update_session("u-sess", agent_session_id=uuid)
         result = resume_session("u-sess")
         assert result["action"] == "resumed"
+        assert result["running"] is True
         # A transcript UUID resumes the LOCAL conversation via
         # `--resume` (cloud-independent), NOT the cloud `resume`
         # subcommand -- the latter dies with "No sessions found" once
@@ -450,6 +544,75 @@ class TestResumeSession:
         # Legacy row (empty agent_impl) relaunches with the default agent.
         assert argv[0] == "claude" and argv[1] == "-n"
         assert argv[2] == "legacy"
+
+    def test_relaunches_fresh_when_transcript_vanished(
+        self, patched_server, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """Regression: a recorded UUID whose transcript file is GONE cannot
+        be resumed -- the agent prints "No conversation found with session
+        ID" and exits 1, so tmux reaps the pane a beat later and the UI
+        shows a session nothing is listening on. Degrade to a fresh launch
+        rather than running a resume that can only fail."""
+        import common.sessions as _sessions
+        # Empty projects dir -> no transcript for this uuid.
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        mock_tmux["exists"].side_effect = [False] + [True] * 20
+        patched_server._db.create_session("dead-tx", "test-proj", "dead-tx")
+        patched_server._db.update_session(
+            "dead-tx", agent_session_id="deadbeef-0000-1111-2222-333344445555",
+        )
+        result = resume_session("dead-tx")
+        assert result["action"] == "relaunched"
+        call = mock_tmux["launch_argv"].call_args
+        argv = call.args[2] if len(call.args) >= 3 else call.kwargs.get("argv")
+        argv = _strip_env_prefix(argv)
+        # Fresh launch (-n <name>), NOT --resume against the dead uuid.
+        assert "--resume" not in argv
+        assert argv[0] == "claude" and argv[1] == "-n"
+
+    def test_clears_dead_uuid_from_db_on_relaunch(
+        self, patched_server, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """The unusable UUID must be forgotten, otherwise every later
+        startup-recovery pass retries a resume that can only ever fail."""
+        import common.sessions as _sessions
+        monkeypatch.setattr(_sessions, "CLAUDE_PROJECTS_DIR", str(tmp_path))
+        mock_tmux["exists"].side_effect = [False] + [True] * 20
+        patched_server._db.create_session("dead-tx2", "test-proj", "dead-tx2")
+        patched_server._db.update_session(
+            "dead-tx2", agent_session_id="deadbeef-9999-8888-7777-666655554444",
+        )
+        resume_session("dead-tx2")
+        row = patched_server._db.get_session("dead-tx2")
+        assert (row.get("agent_session_id") or "") == ""
+
+    def test_reports_not_running_when_pane_dies_immediately(
+        self, patched_server, mock_tmux,
+    ):
+        """Regression: `tmux new-session` exiting 0 only means the pane was
+        forked -- it says nothing about the agent inside surviving. Claiming
+        success here is what made a dead session look connectable in the UI.
+        The pane is observed gone right after launch, so report running=False."""
+        mock_tmux["exists"].return_value = False   # never comes alive
+        patched_server._db.create_session("stillborn", "test-proj", "stillborn")
+        result = resume_session("stillborn")
+        assert result["running"] is False
+        # It still reports which path it attempted, for the UI/log.
+        assert result["action"] == "relaunched"
+
+    def test_crashed_state_recorded_when_pane_dies(
+        self, patched_server, mock_tmux,
+    ):
+        """A failed resume must leave the state cache at `crashed`, not
+        `starting` -- the card should show the failure, not a spinner that
+        never resolves."""
+        from common import session_state
+        mock_tmux["exists"].return_value = False
+        patched_server._db.create_session("stillborn2", "test-proj",
+                                          "stillborn2")
+        resume_session("stillborn2")
+        row = session_state.get("stillborn2") or {}
+        assert row.get("state") == "crashed"
 
     def test_defaults_to_home_working_dir(self, patched_server, mock_tmux):
         """Projects currently have no `working_dir` column -- resume should

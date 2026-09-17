@@ -3,6 +3,7 @@
 import glob
 import json
 import os
+import time
 
 import app_state
 from adapters.tmux import session_exists, launch_session_argv, graceful_kill_session
@@ -46,6 +47,63 @@ def _local_transcript_cwd(session_uuid: str) -> str | None:
     except OSError:
         return None
     return None
+
+
+def _local_transcript_exists(session_uuid: str) -> bool:
+    """True iff a local transcript file exists for `session_uuid`.
+
+    `claude/isaac --resume UUID` exits 1 immediately ("No conversation
+    found with session ID: ...") when the transcript is gone -- and since
+    that process IS the tmux pane's command, the pane dies with it a
+    moment after `new-session` reported success. Resuming a dead UUID
+    therefore looks like "the session won't connect" in the UI.
+
+    Callers check this BEFORE choosing `--resume` so a vanished
+    transcript degrades to a fresh launch instead of a guaranteed crash.
+
+    Only meaningful for local transcript UUIDs. Cloud session ids have
+    no local file, so callers must not gate cloud resume on this."""
+    if not session_uuid:
+        return False
+    root = os.path.expanduser(CLAUDE_PROJECTS_DIR)
+    return bool(glob.glob(os.path.join(root, "*", f"{session_uuid}.jsonl")))
+
+
+# How long to watch a just-launched pane for an immediate self-exit, and
+# how often to re-probe. A resume that fails (vanished transcript, bad
+# cwd, missing binary) dies in well under a second, so a short window
+# catches it. This cost is paid on every resume -- including the startup
+# recovery pass, which resumes sessions serially -- so keep it small.
+_PANE_CONFIRM_TIMEOUT = 1.0
+_PANE_CONFIRM_INTERVAL = 0.2
+
+
+def _confirm_pane_alive(session_name: str,
+                        timeout: float | None = None) -> bool:
+    """True iff the tmux pane survives a short observation window.
+
+    `tmux new-session` exits 0 as soon as it has forked the pane, which
+    says nothing about whether the command inside stayed up. When the
+    agent exits at startup (vanished transcript, bad cwd, missing binary)
+    tmux reaps the pane a beat later -- so a naive "we launched it"
+    success claim leaves the UI showing a session nothing is behind.
+
+    Returns False as soon as the pane is observed gone; otherwise watches
+    until `timeout` elapses and reports it alive. The full window is only
+    spent on the healthy path, so keep `timeout` small (see the constant).
+
+    `timeout=None` reads `_PANE_CONFIRM_TIMEOUT` at CALL time (not as a
+    default-arg binding) so tests can shrink the window by patching the
+    module constant."""
+    if timeout is None:
+        timeout = _PANE_CONFIRM_TIMEOUT
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if not session_exists(session_name):
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_PANE_CONFIRM_INTERVAL)
 
 
 def _enrich(s: dict) -> dict:
@@ -94,7 +152,7 @@ def list_all_sessions():
 
 
 def open_session(task_id, project_id, action_id="open", custom_prompt=None,
-                 pr_number=None, pr_repo=None):
+                 pr_number=None, pr_repo=None, agent_id=None):
     """Open or resume an agent session for a task. Returns session info dict.
 
     Background (task description, deps, PRs, notes) is injected via the agent's
@@ -135,7 +193,11 @@ def open_session(task_id, project_id, action_id="open", custom_prompt=None,
     needs_launch = is_new or not session_exists(session_name)
 
     from . import agent as _agent
-    new_agent = _agent.get_agent_for_new_session()
+    # `agent_id` is the explicit pick the UI sends when the user enabled
+    # several agents and chose one at open time; without it we resolve
+    # the sole enabled agent or the default fallback. Bad id -> ValueError
+    # (surfaced as 422 by the route).
+    new_agent = _agent.resolve_new_session_agent(agent_id)
     # Agents without a launch-time system-prompt channel (e.g. Codex)
     # can't carry `bg_system` in the launch argv. For them we launch
     # bare and fold the background into the FIRST delivered prompt
@@ -285,7 +347,20 @@ def resume_session(session_name):
     # the default agent inside `get_agent_by_id`.
     sess_agent = _agent.get_agent_by_id(session.get("agent_impl", "") or "")
     uuid = (session.get("agent_session_id") or "").strip()
-    if uuid:
+    # A local transcript UUID whose .jsonl is gone can NOT be resumed:
+    # the agent exits 1 ("No conversation found with session ID") and,
+    # because that process is the pane's command, tmux tears the pane
+    # down a moment after `new-session` returned success -- the UI then
+    # shows a session that simply won't connect. Detect the vanished
+    # transcript up front and degrade to a fresh launch instead.
+    # Cloud ids (non-UUID shape) have no local file, so they skip this.
+    resumable = bool(uuid)
+    if uuid and _agent._looks_like_session_uuid(uuid) \
+            and not _local_transcript_exists(uuid):
+        print(f"[resume_session] {session_name}: transcript for {uuid} is "
+              f"gone; launching a fresh agent instead", flush=True)
+        resumable = False
+    if resumable:
         # `resume_argv` routes by id shape: a transcript UUID resumes
         # the LOCAL conversation via `--resume` (cloud-independent),
         # while a numeric cloud id goes through the cloud `resume`
@@ -299,13 +374,35 @@ def resume_session(session_name):
         argv = sess_agent.resume_argv(uuid)
         action = "resumed"
     else:
-        # No UUID on record (legacy row written before the column
-        # existed). Best effort: launch a fresh agent under the same
-        # tmux name so the card comes back alive; conversation history
-        # is lost in this branch.
+        # Either no UUID on record (legacy row written before the column
+        # existed) or the UUID's transcript has vanished. Best effort:
+        # launch a fresh agent under the same tmux name so the card comes
+        # back alive; conversation history is lost in this branch.
         argv = sess_agent.launch_argv(session_name)
         action = "relaunched"
+        if uuid:
+            # Forget the dead UUID so the next startup recovery pass (and
+            # the next manual resume) doesn't retry a resume that can only
+            # ever fail. The fresh agent's SessionStart hook writes a new
+            # one in its place.
+            try:
+                app_state._db.update_session(session_name, agent_session_id="")
+            except Exception as e:  # noqa: BLE001 -- best effort cleanup
+                print(f"[resume_session] could not clear dead uuid for "
+                      f"{session_name}: {e}", flush=True)
+            uuid = ""
     launch_session_argv(session_name, working_dir, argv)
+
+    # `tmux new-session` returning 0 only means tmux forked the pane --
+    # NOT that the agent inside survived. A resume against a dead
+    # transcript, a missing binary, or a bad cwd exits within a beat and
+    # tmux reaps the pane, so reporting success here would tell the UI a
+    # session is live when nothing is listening. Confirm the pane is
+    # still there after a short grace window and report what's real.
+    running = _confirm_pane_alive(session_name)
+    if not running:
+        print(f"[resume_session] {session_name}: pane died immediately after "
+              f"{action}; reporting failure", flush=True)
 
     # Flip the snapshot to `starting` immediately so the SessionCard
     # stops showing `stopped` (the state it was in while crashed).
@@ -314,13 +411,21 @@ def resume_session(session_name):
     task_id = session.get("task_id", "") or ""
     session_state.set_state(
         session_name,
-        state="starting",
-        detail=f"resume ({action})",
+        state="starting" if running else "crashed",
+        detail=(f"resume ({action})" if running
+                else f"{action} failed: agent exited at startup"),
         kind=inferred_kind,
         project_id=project_id,
         target_id=task_id,
         agent_session_id=uuid,
     )
+    if not running:
+        # Nothing to refine and nothing to announce -- the pane is gone, so
+        # skip the pane-recheck timer and the `session.opened` event. The
+        # caller gets `running: False` and surfaces the failure (the route
+        # passes this through; SessionCard turns it into an error alert).
+        return {"session": session_name, "action": action,
+                "running": False, "agent_session_id": uuid}
 
     # `claude resume <uuid>` does NOT fire the SessionStart hook
     # (only fresh `claude` invocations do), so without this nudge the
@@ -380,11 +485,10 @@ def restart_session(session_name):
         # graceful_kill_session is synchronous through tmux kill-session,
         # but poll to be certain tmux is gone before resume re-binds the
         # name (resume no-ops if it still sees the session alive).
-        import time as _time
         for _ in range(20):
             if not session_exists(session_name):
                 break
-            _time.sleep(0.25)
+            time.sleep(0.25)
 
     result = resume_session(session_name)
     result["restarted"] = True
@@ -551,15 +655,32 @@ def open_project_session(project_id: str) -> dict:
     record = app_state._db.get_project_session(project_id)
     is_new = record is None
 
+    # Existing row whose tmux died but whose transcript UUID is on record:
+    # reconnect the conversation instead of starting a fresh one.
+    if (not is_new and not session_exists(tmux_name)
+            and (record.get("agent_session_id") or "").strip()):
+        resumed = resume_project_session(project_id)
+        if resumed.get("running"):
+            return {
+                "project_id": project_id,
+                "tmux_name": tmux_name,
+                "running": True,
+                **(app_state._db.get_project_session(project_id) or {}),
+            }
+        # Resume failed (transcript gone / bad cwd) -- fall through to a
+        # fresh launch below so the manager still comes back alive.
+
     if is_new or not session_exists(tmux_name):
         tasks = app_state.load_tasks(project_id)
         bg = build_project_background_system(proj, tasks)
         working_dir = proj.get("working_dir", "~")
         from . import agent as _agent
-        argv = _agent.get_agent_for_new_session().launch_argv(
-            tmux_name, system_prompt=bg)
+        new_agent = _agent.get_agent_for_new_session()
+        argv = new_agent.launch_argv(tmux_name, system_prompt=bg)
         launch_session_argv(tmux_name, working_dir, argv)
-        app_state._db.create_project_session(project_id, tmux_name)
+        # Record which agent launched it so resume uses the same one.
+        app_state._db.create_project_session(
+            project_id, tmux_name, agent_impl=new_agent.id)
         if is_new:
             app_state.emit_event("session.opened", {
                 "title": f"Project session opened: {project_id}",
@@ -631,6 +752,89 @@ def kill_project_session(project_id: str) -> dict:
     return {"killed": True, "tmux_name": tmux_name}
 
 
+def resume_project_session(project_id: str) -> dict:
+    """Re-open a PM session's tmux wrapper and resume its agent
+    conversation. The PM analog of `resume_session`.
+
+    Use case: the host rebooted (every tmux server is gone) but the
+    agent's transcript under ~/.claude/projects/ is intact. We restart
+    tmux with the same `pm-<project_id>` name and run the agent's resume
+    so it picks up where it left off. Falls back to a fresh launch (with
+    the project background rebuilt) when there's no usable UUID.
+    """
+    record = app_state._db.get_project_session(project_id)
+    if not record:
+        raise ValueError(f"Project session not found: {project_id}")
+    tmux_name = record["tmux_name"]
+    if session_exists(tmux_name):
+        return {"project_id": project_id, "tmux_name": tmux_name,
+                "action": "noop", "running": True}
+
+    proj = app_state._db.get_project(project_id)
+    if not proj:
+        raise ValueError(f"Project not found: {project_id}")
+    working_dir = (proj.get("working_dir", "~") or "~")
+
+    from . import agent as _agent
+    sess_agent = _agent.get_agent_by_id(record.get("agent_impl", "") or "")
+    uuid = (record.get("agent_session_id") or "").strip()
+    # A local transcript UUID whose .jsonl is gone can't be resumed (the
+    # agent exits and tmux reaps the pane), so degrade to a fresh launch.
+    resumable = bool(uuid)
+    if uuid and _agent._looks_like_session_uuid(uuid) \
+            and not _local_transcript_exists(uuid):
+        print(f"[resume_project_session] {tmux_name}: transcript for {uuid} "
+              f"is gone; launching a fresh agent instead", flush=True)
+        resumable = False
+
+    if resumable:
+        transcript_cwd = _local_transcript_cwd(uuid)
+        if transcript_cwd:
+            working_dir = transcript_cwd
+        argv = sess_agent.resume_argv(uuid)
+        action = "resumed"
+    else:
+        # No usable UUID: relaunch fresh with the project background baked
+        # in so the manager still boots with its role + project state.
+        tasks = app_state.load_tasks(project_id)
+        bg = build_project_background_system(proj, tasks)
+        argv = sess_agent.launch_argv(tmux_name, system_prompt=bg)
+        action = "relaunched"
+        if uuid:
+            try:
+                app_state._db.update_project_session(
+                    project_id, agent_session_id="")
+            except Exception as e:  # noqa: BLE001 -- best effort cleanup
+                print(f"[resume_project_session] could not clear dead uuid "
+                      f"for {tmux_name}: {e}", flush=True)
+            uuid = ""
+
+    launch_session_argv(tmux_name, working_dir, argv)
+    running = _confirm_pane_alive(tmux_name)
+    if not running:
+        print(f"[resume_project_session] {tmux_name}: pane died immediately "
+              f"after {action}; reporting failure", flush=True)
+
+    from . import session_state
+    session_state.set_state(
+        tmux_name,
+        state="starting" if running else "crashed",
+        detail=(f"resume ({action})" if running
+                else f"{action} failed: agent exited at startup"),
+        kind="project",
+        project_id=project_id,
+        agent_session_id=uuid,
+    )
+    return {"project_id": project_id, "tmux_name": tmux_name,
+            "action": action, "running": running, "agent_session_id": uuid}
+
+
+# How many most-recent history entries to inline into the launch system
+# prompt. History is capped at 50 by EvaDB._get_history; keep the prompt
+# slice smaller so a long-lived task doesn't blow up every session launch.
+_HISTORY_IN_PROMPT = 20
+
+
 def build_background_system(
     task_data: dict,
     project_name: str,
@@ -671,6 +875,22 @@ def build_background_system(
         if matched:
             lines.append(f"Focus PR #{pr_num}: {pr_context.get('repo','')} branch={matched.get('head_branch','')} ci={matched.get('ci_status','?')} review={matched.get('review_status','')}")
 
+    # History is stored newest-first; prompts read naturally in chronological
+    # order, with the current state last.
+    history = task_data.get("history") or []
+    if history:
+        recent = list(reversed(history[:_HISTORY_IN_PROMPT]))
+        elided = len(history) - len(recent)
+        lines.append("")
+        header = "[Timeline] What happened so far (oldest first):"
+        if elided > 0:
+            header = f"[Timeline] What happened so far ({elided} older elided, oldest shown first):"
+        lines.append(header)
+        for h in recent:
+            ts = (h.get("ts") or "")[5:16].replace("T", " ")  # MM-DD HH:MM
+            text = h.get("text") or ""
+            lines.append(f"  {ts}  {text}" if ts else f"  {text}")
+
     proj_arg = task_data.get("project") or ""
     tid = task_data.get("task_id") or "<task>"
     # task.type drives surface (feature / bug / test / chore / review /
@@ -683,7 +903,7 @@ def build_background_system(
     lines.append("Every work item is a `task` with an open `type` field. "
                  "type=feature/bug/review/flaky-test/etc. is metadata only -- "
                  "the same CRUD applies (link PRs, append history, change status).")
-    lines.append("[History] After each meaningful step (commit, PR event, blocker) run:")
+    lines.append("[History] Continue the timeline above. After each meaningful step (commit, PR event, blocker) run:")
     lines.append(f"  eva-cli append-history {proj_arg or '\"\"'} {tid} \"<=100 chars, terse\"")
     lines.append("Keep each line one fact: what you did or what's blocking. "
                  "Append-only timeline, no editing old lines.")
@@ -693,6 +913,13 @@ def build_background_system(
                  "conventionally stay 1:1 with their PR; other types can "
                  "carry many).")
     lines.append("Also call `eva-cli check-status` when you think status should change.")
+    # Task descriptions are snapshots and may become stale as the repository
+    # changes. Tell the agent to prefer current tool output.
+    lines.append("[Ground truth] Live tool output (Bash/Read/Grep) is authoritative. "
+                 "Any line numbers, commit SHAs, or file layout cited above were "
+                 "captured when the task was created and may have drifted. If a tool "
+                 "result conflicts with them, the description is stale: trust the tool, "
+                 "re-derive from it, and do NOT conclude your tools are polluted or broken.")
     lines.append("[Language] Reply in Chinese (中文).")
 
     return "\n".join(lines)

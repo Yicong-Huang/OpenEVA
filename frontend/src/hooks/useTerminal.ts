@@ -2,6 +2,11 @@ import { useRef, useEffect, useCallback } from 'react'
 import type { Terminal as TerminalT } from 'xterm'
 import type { FitAddon as FitAddonT } from 'xterm-addon-fit'
 import { terminalMux } from './terminalMux'
+import {
+  stripTerminalTracking,
+  TERMINAL_WHEEL_OPTIONS,
+  wheelScrollRequest,
+} from './useTerminalHelpers'
 
 interface UseTerminalOptions {
   sessionName: string
@@ -18,33 +23,15 @@ function isMouseSequence(data: string): boolean {
 }
 
 /**
- * Strip escape sequences that would change how the BROWSER xterm
- * handles the buffer / the mouse, so the embedded terminal behaves like
- * a normal scrollable, selectable web terminal:
- *
- *   - Alternate screen (`?1049/1047/47`): without stripping, TUI apps
- *     (tmux, the agent) switch to the alt-screen, which has no
- *     scrollback.
- *   - Mouse tracking (`?1000/1001/1002/1003/1004/1005/1006/1015`):
- *     without stripping, the agent's mouse-enable puts xterm into
- *     mouse-report mode, where a plain drag becomes a mouse report
- *     instead of a TEXT SELECTION -- so the user can't highlight/copy.
- *     We keep xterm out of mouse mode (selection works) and instead
- *     drive the agent's own scroll out-of-band via POST /scroll, which
- *     feeds it synthesized wheel reports server-side.
- *
- * The real tmux pane still tracks the agent's mouse-enable, so the
- * server-side wheel forwarding still reaches the agent -- we only
- * suppress mouse mode in the browser xterm.
+ * Remove mouse and focus-tracking toggles so browser drag selection remains
+ * available. Preserve alternate-screen switches because xterm must mirror
+ * the tmux pane's active buffer. Wheel input is forwarded through /scroll.
  */
-const TERMINAL_STRIP_RE =
-  /\x1b\[\?(?:1049|1047|47|1000|1001|1002|1003|1004|1005|1006|1015)[hl]/g
-
 function filterTerminalBytes(bytes: Uint8Array): Uint8Array {
   // Decoding to latin-1 preserves byte values 0..255 roundtrip.
   let s = ''
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i])
-  const filtered = s.replace(TERMINAL_STRIP_RE, '')
+  const filtered = stripTerminalTracking(s)
   const out = new Uint8Array(filtered.length)
   for (let i = 0; i < filtered.length; i++) out[i] = filtered.charCodeAt(i)
   return out
@@ -211,44 +198,18 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
       }
 
       const wheelHandler = (e: WheelEvent) => {
-        // The terminal OWNS the wheel: never let the browser's default
-        // scroll bubble out to the parent card list. `stopPropagation`
-        // alone isn't enough -- the parent's `overflow-y: auto` scroll
-        // is the browser's DEFAULT action, which only `preventDefault`
-        // suppresses (hence the listener is `{ passive: false }`).
-        // Without this the agent's alt-screen terminal has no xterm
-        // scrollback to consume, so the wheel fell through and scrolled
-        // the task-node list instead.
+        // Capture the wheel before xterm converts it to cursor keys on an
+        // alternate screen, and prevent the parent card list from scrolling.
         e.preventDefault()
         e.stopPropagation()
-        try {
-          const buf = term.buffer.active
-          // viewportY is the top-of-screen line within the scrollback
-          // buffer; baseY is the bottom-most viewport position (i.e.
-          // "live tail"). Equality at either end means xterm has no
-          // slack in that direction -- drive the tmux scrollback / the
-          // agent's own viewport via POST /scroll instead.
-          const atTop = buf.viewportY <= 0
-          const atBottom = buf.viewportY >= buf.baseY
-          const goingUp = e.deltaY < 0
-          const goingDown = e.deltaY > 0
-          if ((goingUp && atTop) || (goingDown && atBottom)) {
-            const dir: 'up' | 'down' = goingUp ? 'up' : 'down'
-            // ~1 line per 24px of wheel delta, capped so a trackpad
-            // fling doesn't request a huge jump in one call.
-            const lines = Math.max(1, Math.min(10,
-              Math.round(Math.abs(e.deltaY) / 24)))
-            if (dir !== pendingDir) { pendingDir = dir; pendingLines = 0 }
-            pendingLines += lines
-            flushScroll()
-          }
-        } catch {
-          // term not yet open (race during teardown / SSR-ish init):
-          // the preventDefault above already kept the parent from
-          // scrolling, which is the important part.
-        }
+        const { dir, lines } = wheelScrollRequest(e.deltaY)
+        if (dir !== pendingDir) { pendingDir = dir; pendingLines = 0 }
+        pendingLines += lines
+        flushScroll()
       }
-      container.addEventListener('wheel', wheelHandler, { passive: false })
+      // Capture runs before xterm's inner listener; non-passive permits
+      // preventDefault().
+      container.addEventListener('wheel', wheelHandler, TERMINAL_WHEEL_OPTIONS)
 
       // Touch-to-history for phones/tablets. xterm's native touch handling can
       // only traverse browser-side scrollback; interactive agent TUIs keep
@@ -361,7 +322,9 @@ export function useTerminal({ sessionName, containerRef, active, onStatusChange 
         clearTimeout(refitTimer)
         observer.disconnect()
         unsubscribe()
-        container.removeEventListener('wheel', wheelHandler)
+        // Capture must match the addEventListener call.
+        container.removeEventListener('wheel', wheelHandler,
+                                      TERMINAL_WHEEL_OPTIONS)
         container.removeEventListener('touchstart', touchStartHandler, true)
         container.removeEventListener('touchmove', touchMoveHandler, true)
         container.removeEventListener('touchend', touchEndHandler, true)

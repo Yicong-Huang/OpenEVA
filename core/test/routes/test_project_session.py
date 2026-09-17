@@ -272,3 +272,84 @@ class TestRoutes:
         assert resp.status_code == 200
         assert resp.json()["ran"] is False
         send_keys.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Resume / reconnect: PM sessions must survive tmux death like task sessions
+# ---------------------------------------------------------------------------
+
+class TestProjectSessionResume:
+    """A PM session (`pm-<project_id>`) has to be named + reconnectable
+    the same way task / ticket / review sessions are: its transcript UUID
+    is captured on SessionStart, and a dead pane is auto-resumed on the
+    startup recovery pass rather than lost."""
+
+    def test_hook_persists_agent_session_id_for_pm_session(
+            self, patched_server, mock_tmux):
+        from routes.sessions import _apply_project_session_hook
+        patched_server._db.create_project_session("test-proj", "pm-test-proj")
+        handled = _apply_project_session_hook(
+            "pm-test-proj", "SessionStart", "idle",
+            {"session_id": "1777500864453"})
+        assert handled is True
+        rec = patched_server._db.get_project_session("test-proj")
+        assert rec["agent_session_id"] == "1777500864453"
+
+    def test_hook_ignores_non_pm_session(self, patched_server, mock_tmux):
+        from routes.sessions import _apply_project_session_hook
+        # A task-named session must fall through (return False) so the
+        # dispatcher hands it to the task handler instead.
+        assert _apply_project_session_hook(
+            "some-task", "SessionStart", "idle",
+            {"session_id": "x"}) is False
+
+    def test_create_project_session_records_agent_impl(
+            self, patched_server, mock_tmux):
+        from common.sessions import open_project_session
+        open_project_session("test-proj")
+        rec = patched_server._db.get_project_session("test-proj")
+        # Whatever agent launched it is persisted so resume uses the same.
+        assert rec["agent_impl"]
+
+    def test_recover_resumes_dead_pm_session(self, patched_server, mock_tmux):
+        from common import session_state
+        patched_server._db.create_project_session(
+            "test-proj", "pm-test-proj", agent_impl="claude")
+        patched_server._db.update_project_session(
+            "test-proj", agent_session_id="1777500864453")
+        mock_tmux["exists"].return_value = False  # pane gone
+        with patch("common.sessions._confirm_pane_alive", return_value=True):
+            out = session_state.recover_crashed_sessions()
+        assert "pm-test-proj" in out["resumed"]
+        # The relaunch used the agent's cloud resume subcommand + the
+        # recorded id -- NOT a fresh launch (no --append-system-prompt).
+        argv = mock_tmux["launch_argv"].call_args.args[2]
+        assert "resume" in argv and "1777500864453" in argv
+        assert "--append-system-prompt" not in argv
+
+    def test_open_reconnects_when_uuid_recorded(
+            self, patched_server, mock_tmux):
+        from common.sessions import open_project_session
+        patched_server._db.create_project_session(
+            "test-proj", "pm-test-proj", agent_impl="claude")
+        patched_server._db.update_project_session(
+            "test-proj", agent_session_id="1777500864453")
+        mock_tmux["exists"].return_value = False  # pane died
+        with patch("common.sessions._confirm_pane_alive", return_value=True):
+            info = open_project_session("test-proj")
+        assert info["running"] is True
+        argv = mock_tmux["launch_argv"].call_args.args[2]
+        # Reconnect (resume), not a fresh manager launch.
+        assert "resume" in argv and "1777500864453" in argv
+        assert "--append-system-prompt" not in argv
+
+    def test_recover_skips_pm_session_without_uuid(
+            self, patched_server, mock_tmux):
+        # No agent_session_id on record -> not a resume candidate (the
+        # startup pass can't reconnect a conversation it never captured).
+        from common import session_state
+        patched_server._db.create_project_session("test-proj", "pm-test-proj")
+        mock_tmux["exists"].return_value = False
+        out = session_state.recover_crashed_sessions()
+        assert "pm-test-proj" not in out["resumed"]
+        assert "pm-test-proj" not in out["crashed"]

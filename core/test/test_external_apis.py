@@ -84,7 +84,7 @@ class TestGetUsage:
         client.get("/api/usage")
         mock_run.assert_called_once()
         argv, kwargs = mock_run.call_args
-        assert argv[0][1:] == ["usage", "--days", "1"]
+        assert argv[0][1:] == ["usage", "--days", "1", "--json"]
         assert kwargs == {
             "capture_output": True, "text": True, "timeout": 15,
         }

@@ -532,7 +532,7 @@ class TestFinishRunForSession:
 
 
 class TestRunNowEndpoint:
-    def test_post_runs_job_and_leaves_run_open(self, client):
+    def test_post_runs_job_and_leaves_run_open(self, client, mock_tmux):
         # Use the default executor (the route doesn't accept an
         # executor override -- production-shaped path). The tmux
         # adapter is mocked in conftest.py so no real session spawns.
@@ -553,7 +553,8 @@ class TestRunNowEndpoint:
 
 
 class TestStopHookFinishesRun:
-    def test_stop_hook_stamps_finished_at_for_cron_session(self, client):
+    def test_stop_hook_stamps_finished_at_for_cron_session(self, client,
+                                                           mock_tmux):
         # End-to-end: post to /api/cron-jobs/{id}/run leaves the run
         # open, then the agent Stop hook for cron-job-{id} stamps it
         # terminal. The user-visible effect is finished_at = "session
@@ -578,7 +579,7 @@ class TestStopHookFinishesRun:
         assert runs[0]["finished_at"] != ""
 
     def test_stop_hook_for_unrelated_session_does_not_touch_cron(
-        self, client,
+        self, client, mock_tmux,
     ):
         # A Stop hook for a non-cron session must not corrupt cron
         # run rows.

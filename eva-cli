@@ -601,6 +601,20 @@ def cmd_rename_task(args):
     print(_green("Renamed '%s' -> '%s'" % (args.old_id, args.new_id)))
 
 
+def cmd_move_task(args):
+    try:
+        result = tasks.move_task(args.project, args.task_id, args.to_project)
+    except KeyError:
+        _err_project_not_found(args.to_project)
+    except ValueError as e:
+        _error(str(e))
+    if not result:
+        _err_task_not_found(args.project, args.task_id)
+    if _emit_json_if_requested(args, result): return
+    print(_green("Moved task '%s' from '%s' to '%s'" % (
+        args.task_id, args.project, args.to_project)))
+
+
 # -- PR commands --
 
 def cmd_list_prs(args):
@@ -1359,6 +1373,11 @@ def build_parser():
     p.add_argument("old_id", help="current task ID")
     p.add_argument("new_id", help="new task ID")
 
+    p = sub.add_parser("move-task",
+                       help="move a task to a different project")
+    _add_project_task_args(p)
+    p.add_argument("to_project", help="destination project ID")
+
     # -- PR commands --
     p = sub.add_parser("list-prs", help="list all PRs grouped by project")
     p.add_argument("--project", default="",
@@ -1588,6 +1607,7 @@ _DISPATCH = {
     "list-history": cmd_list_history,
     "delete-task": cmd_delete_task,
     "rename-task": cmd_rename_task,
+    "move-task": cmd_move_task,
     "list-prs": cmd_list_prs,
     "add-pr": cmd_add_pr,
     "remove-pr": cmd_remove_pr,

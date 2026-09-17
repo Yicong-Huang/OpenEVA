@@ -155,7 +155,7 @@ def _persist_review_session_state(
 
 def _launch_new_review_session(
     session_name: str, review_url: str, action_id: str,
-    pr_row: dict,
+    pr_row: dict, agent_id: str = None,
 ) -> None:
     """Launch tmux + the agent for a fresh review session, injecting the
     PR metadata as Claude's system prompt (`--append-system-prompt`)
@@ -166,7 +166,7 @@ def _launch_new_review_session(
     """
     bg_system = build_review_system_prompt(pr_row)
     from . import agent as _agent
-    new_agent = _agent.get_agent_for_new_session()
+    new_agent = _agent.resolve_new_session_agent(agent_id)
     # Claude family gets the PR context as a launch-time system prompt;
     # Codex has no such channel, so launch bare -- `open_review_session`
     # folds bg_system into the first delivered prompt instead.
@@ -200,7 +200,7 @@ def _launch_new_review_session(
 
 
 def open_review_session(review_url: str, action_id: str = "review-pr",
-                        custom_prompt: str = None) -> dict:
+                        custom_prompt: str = None, agent_id: str = None) -> dict:
     """Launch or resume the review session for a PR. Returns dict with
     `session`, `prompt`, and `new` fields (mirrors sessions.open_session).
 
@@ -226,12 +226,13 @@ def open_review_session(review_url: str, action_id: str = "review-pr",
               else action.get("prompt_template", ""))
 
     if is_new:
-        _launch_new_review_session(session_name, review_url, action_id, pr_row)
+        _launch_new_review_session(session_name, review_url, action_id, pr_row,
+                                   agent_id=agent_id)
         # Agents without a launch-time system-prompt channel (Codex)
         # get the PR context folded into this first delivered prompt,
         # since `_launch_new_review_session` couldn't put it in the argv.
         from . import agent as _agent
-        new_agent = _agent.get_agent_for_new_session()
+        new_agent = _agent.resolve_new_session_agent(agent_id)
         if not new_agent.system_prompt_via_launch:
             bg_system = build_review_system_prompt(pr_row)
             if bg_system:

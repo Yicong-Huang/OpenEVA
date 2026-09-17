@@ -1,13 +1,12 @@
 import { describe, it, expect, vi } from 'vitest'
+import {
+  stripTerminalTracking,
+  TERMINAL_WHEEL_OPTIONS,
+  wheelScrollRequest,
+} from '../hooks/useTerminalHelpers'
 
-// We test the pure helper functions exported from useTerminal
-// The hook itself depends on xterm/DOM, so we test it through its helpers
-
-// Import the module source to test helper functions
-// Since isMouseSequence and stripAltScreen are not exported, we test them
-// via the hook behavior with mocked dependencies
-
-// --- Test pure logic extracted from useTerminal ---
+// Pure terminal logic lives outside the React hook so it can be tested without
+// loading xterm or constructing a DOM terminal.
 
 describe('useTerminal helpers', () => {
   describe('isMouseSequence', () => {
@@ -44,38 +43,67 @@ describe('useTerminal helpers', () => {
     })
   })
 
-  describe('stripAltScreen', () => {
-    const ALT_SCREEN_RE = /\x1b\[\?(?:1049|1047|47)[hl]/g
-    function stripAltScreen(text: string): string {
-      return text.replace(ALT_SCREEN_RE, '')
-    }
-
-    it('strips alternate screen enable sequence (1049h)', () => {
-      expect(stripAltScreen('\x1b[?1049hHello')).toBe('Hello')
+  describe('filterTerminalBytes escape handling', () => {
+    it('strips SGR mouse tracking (1006) and basic tracking (1000)', () => {
+      expect(stripTerminalTracking('\x1b[?1006h\x1b[?1000hHello')).toBe('Hello')
     })
 
-    it('strips alternate screen disable sequence (1049l)', () => {
-      expect(stripAltScreen('\x1b[?1049lGoodbye')).toBe('Goodbye')
+    it('strips button/any-motion tracking (1002/1003)', () => {
+      expect(stripTerminalTracking('\x1b[?1002hdata\x1b[?1003l')).toBe('data')
     })
 
-    it('strips 1047h/l variants', () => {
-      expect(stripAltScreen('\x1b[?1047htext\x1b[?1047l')).toBe('text')
+    it('strips focus tracking (1004)', () => {
+      expect(stripTerminalTracking('\x1b[?1004hfocus\x1b[?1004l')).toBe('focus')
     })
 
-    it('strips 47h/l variants', () => {
-      expect(stripAltScreen('\x1b[?47hdata\x1b[?47l')).toBe('data')
+    // Alternate-screen switches must pass through so xterm mirrors the pane.
+    it('preserves alternate screen enable (1049h)', () => {
+      expect(stripTerminalTracking('\x1b[?1049hHello')).toBe('\x1b[?1049hHello')
     })
 
-    it('preserves text without alt screen sequences', () => {
-      expect(stripAltScreen('normal text with \x1b[32m color')).toBe('normal text with \x1b[32m color')
+    it('preserves alternate screen disable (1049l)', () => {
+      expect(stripTerminalTracking('\x1b[?1049lGoodbye')).toBe('\x1b[?1049lGoodbye')
     })
 
-    it('strips multiple alt screen sequences', () => {
-      expect(stripAltScreen('\x1b[?1049h\x1b[?1049l\x1b[?47h')).toBe('')
+    it('preserves legacy alt-screen variants (1047/47)', () => {
+      expect(stripTerminalTracking('\x1b[?1047ha\x1b[?47hb')).toBe('\x1b[?1047ha\x1b[?47hb')
+    })
+
+    it('preserves absolute cursor positioning used by TUI repaints', () => {
+      expect(stripTerminalTracking('\x1b[20;3H\x1b[K\x1b[H\x1b[2J'))
+        .toBe('\x1b[20;3H\x1b[K\x1b[H\x1b[2J')
+    })
+
+    it('preserves colour codes and ordinary text', () => {
+      expect(stripTerminalTracking('normal text with \x1b[32m color'))
+        .toBe('normal text with \x1b[32m color')
+    })
+
+    it('strips only the mouse toggles from a mixed stream', () => {
+      expect(stripTerminalTracking('\x1b[?1049h\x1b[?1000h\x1b[?1006hX'))
+        .toBe('\x1b[?1049hX')
     })
 
     it('handles empty string', () => {
-      expect(stripAltScreen('')).toBe('')
+      expect(stripTerminalTracking('')).toBe('')
+    })
+  })
+
+  describe('wheel handling contract', () => {
+    it('uses a capturing, non-passive wheel listener', () => {
+      expect(TERMINAL_WHEEL_OPTIONS).toEqual({
+        passive: false,
+        capture: true,
+      })
+    })
+
+    it('maps wheel delta to a direction and a clamped line count', () => {
+      expect(wheelScrollRequest(-100).dir).toBe('up')
+      expect(wheelScrollRequest(100).dir).toBe('down')
+      // A tiny delta still scrolls at least one line...
+      expect(wheelScrollRequest(1).lines).toBe(1)
+      // ...and a trackpad fling is capped so one tick can't jump miles.
+      expect(wheelScrollRequest(100000).lines).toBe(10)
     })
   })
 

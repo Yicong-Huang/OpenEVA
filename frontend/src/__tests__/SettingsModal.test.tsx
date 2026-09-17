@@ -15,6 +15,10 @@ let ticketsResponse: {
 } = { tickets: [], configured: false, instances: [] }
 let putRequests: Array<{ url: string; body: unknown }> = []
 let resolveCalls = 0
+let agentsResponse: { agents: Array<{ id: string; name: string }>; enabled: string[] } = {
+  agents: [{ id: 'claude', name: 'Claude Code' }, { id: 'codex', name: 'Codex' }],
+  enabled: ['claude'],
+}
 
 function mockFetch() {
   globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -32,6 +36,16 @@ function mockFetch() {
     if (init?.method === 'DELETE' && u.includes('/api/tickets/instances/')) {
       putRequests.push({ url: u, body: null })
       return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    }
+    if (init?.method === 'PUT' && u.includes('/api/agents/enabled')) {
+      const body = init.body ? JSON.parse(init.body as string) : null
+      putRequests.push({ url: u, body })
+      const enabled = (body as { value: string[] }).value
+      agentsResponse = { ...agentsResponse, enabled }
+      return new Response(JSON.stringify({ enabled }), { status: 200 })
+    }
+    if (u.endsWith('/api/agents')) {
+      return new Response(JSON.stringify(agentsResponse), { status: 200 })
     }
     if (u.endsWith('/api/repos/resolved')) {
       resolveCalls += 1
@@ -56,6 +70,10 @@ describe('SettingsModal', () => {
     ticketsResponse = { tickets: [], configured: false, instances: [] }
     putRequests = []
     resolveCalls = 0
+    agentsResponse = {
+      agents: [{ id: 'claude', name: 'Claude Code' }, { id: 'codex', name: 'Codex' }],
+      enabled: ['claude'],
+    }
     origFetch = globalThis.fetch
     mockFetch()
   })
@@ -78,6 +96,31 @@ describe('SettingsModal', () => {
     // exists on the Repos tab.
     expect(await screen.findByTestId('settings-resolved-refresh'))
       .toBeInTheDocument()
+  })
+
+  it('Setup tab: Agents section toggles the enabled set via PUT', async () => {
+    const { within } = await import('@testing-library/react')
+    render(<SettingsModal onClose={vi.fn()} initialTab="setup" />)
+    await screen.findByTestId('settings-modal')
+
+    const claudeRow = await screen.findByTestId('agent-toggle-claude')
+    const codexRow = await screen.findByTestId('agent-toggle-codex')
+    const claudeBox = within(claudeRow).getByRole('checkbox') as HTMLInputElement
+    const codexBox = within(codexRow).getByRole('checkbox') as HTMLInputElement
+    // Only claude enabled initially; it's the sole one -> disabled (can't
+    // uncheck the last enabled agent).
+    expect(claudeBox.checked).toBe(true)
+    expect(claudeBox.disabled).toBe(true)
+    expect(codexBox.checked).toBe(false)
+
+    fireEvent.click(codexBox)
+    await waitFor(() => {
+      expect(putRequests.some((r) =>
+        r.url.includes('/api/agents/enabled') &&
+        JSON.stringify((r.body as { value: string[] }).value) ===
+          JSON.stringify(['claude', 'codex']),
+      )).toBe(true)
+    })
   })
 
   it('clicking a root sidebar item switches the tab', async () => {

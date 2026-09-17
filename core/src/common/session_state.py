@@ -229,6 +229,26 @@ def recover_crashed_sessions() -> dict:
     except Exception as e:
         print(f"[session_state] recover review scan failed: {e}", flush=True)
 
+    # PM sessions: rows in `project_sessions` with agent_session_id set.
+    # They live in their own table (keyed by project_id) so they don't
+    # appear in the task scan above; resume them through the PM-aware path.
+    try:
+        for r in app_state._db.list_project_sessions():
+            uuid = (r.get("agent_session_id") or "").strip()
+            if not uuid:
+                continue
+            name = r.get("tmux_name", "") or ""
+            if not name:
+                continue
+            try:
+                if _tmux.session_exists(name):
+                    continue
+            except Exception:
+                continue
+            candidates.append((name, "project", uuid))
+    except Exception as e:
+        print(f"[session_state] recover project scan failed: {e}", flush=True)
+
     if not candidates:
         return out
 
@@ -255,14 +275,26 @@ def recover_crashed_sessions() -> dict:
     from . import sessions as _sessions
     for name, kind, _uuid in candidates:
         try:
-            res = _resume_review(name) if kind == "review" \
-                  else _sessions.resume_session(name)
+            if kind == "review":
+                res = _resume_review(name)
+            elif kind == "project":
+                pid = name[len(_sessions._PROJECT_SESSION_PREFIX):]
+                res = _sessions.resume_project_session(pid)
+            else:
+                res = _sessions.resume_session(name)
             if res and res.get("running") is not False:
                 out["resumed"].append(name)
                 # state stays 'crashed' until the SessionStart hook
                 # fires for the resumed pane; that updates it to
                 # 'starting' / 'idle'. We could optimistically flip
                 # to 'starting' here but the hook is the truth.
+            elif res and res.get("running") is False:
+                # The launch went through but the agent exited at startup
+                # (resume_session already confirmed the pane died and set
+                # the cache to `crashed`). That's a failed recovery, not a
+                # skip -- counting it as `resumed` is what made a session
+                # nothing was listening on look healthy in the UI.
+                out["crashed"].append(name)
             else:
                 out["skipped"].append(name)
         except Exception as e:
@@ -287,7 +319,12 @@ def _resume_review(name: str) -> dict | None:
         uuid = (r.get("agent_session_id") or "").strip()
         if not uuid:
             return None
-        from adapters.tmux import launch_session_argv
+        # Import the MODULE, not the function: `from ... import launch_...`
+        # copies the value, so test fixtures that patch
+        # `adapters.tmux.launch_session_argv` can't intercept it and the
+        # call spawns a real tmux session. Every other tmux touchpoint in
+        # this module uses the same `_tmux.<fn>` attribute-access form.
+        from adapters import tmux as _tmux_mod
         from . import agent as _agent
         from . import sessions as _sessions
         # Resume with the agent that launched this review session (empty
@@ -297,13 +334,40 @@ def _resume_review(name: str) -> dict | None:
         # session was created in (recovered from the transcript), falling
         # back to `~` for cloud ids / missing transcripts.
         sess_agent = _agent.get_agent_by_id(r.get("agent_impl", "") or "")
-        argv = sess_agent.resume_argv(uuid)
-        cwd = _sessions._local_transcript_cwd(uuid) or "~"
+        # A local transcript UUID whose .jsonl is gone can't be resumed --
+        # the agent exits 1 at startup and tmux reaps the pane, leaving a
+        # session the UI shows as live but nothing is listening on. Fall
+        # back to a fresh launch (history is lost either way, but the card
+        # comes back usable). Cloud ids have no local file, so skip the
+        # check for them.
+        if _agent._looks_like_session_uuid(uuid) \
+                and not _sessions._local_transcript_exists(uuid):
+            print(f"[session_state] review {name}: transcript for {uuid} is "
+                  f"gone; launching a fresh agent instead", flush=True)
+            argv = sess_agent.launch_argv(name)
+            cwd = "~"
+            action = "relaunched"
+            # Forget the unusable UUID (review session ids live on the
+            # shared `sessions` table) so the next startup pass doesn't
+            # re-attempt a resume that can only fail. Without this the
+            # "transcript is gone" warning repeats on every boot.
+            try:
+                app_state._db.update_session(name, agent_session_id="")
+            except Exception as e:  # noqa: BLE001 -- best effort cleanup
+                print(f"[session_state] could not clear dead uuid for "
+                      f"review {name}: {e}", flush=True)
+        else:
+            argv = sess_agent.resume_argv(uuid)
+            cwd = _sessions._local_transcript_cwd(uuid) or "~"
+            action = "resumed"
         try:
-            launch_session_argv(name, cwd, argv)
-            return {"session": name, "action": "resumed", "running": True}
+            _tmux_mod.launch_session_argv(name, cwd, argv)
         except Exception:
             return None
+        # `new-session` exiting 0 only means the pane was forked; confirm
+        # the agent inside actually stayed up before claiming success.
+        running = _sessions._confirm_pane_alive(name)
+        return {"session": name, "action": action, "running": running}
     return None
 
 
@@ -380,6 +444,8 @@ def _infer_kind(name: str) -> str:
         return "review"
     if name.startswith("ticket-"):
         return "ticket"
+    if name.startswith("pm-"):
+        return "project"
     return "task"
 
 
@@ -433,6 +499,15 @@ def _resolve_target_metadata(name: str, kind: str) -> dict:
                     out["target_id"] = r.get("url", "") or ""
                     out["agent_session_id"] = r.get("agent_session_id", "") or ""
                     break
+        elif kind == "project":
+            # PM sessions are keyed by project_id in `project_sessions`;
+            # the tmux name is `pm-<project_id>`.
+            from .sessions import _PROJECT_SESSION_PREFIX
+            pid = name[len(_PROJECT_SESSION_PREFIX):]
+            row = app_state._db.get_project_session(pid) or {}
+            out["project_id"] = pid
+            out["target_id"] = pid
+            out["agent_session_id"] = row.get("agent_session_id", "") or ""
         elif kind == "ticket":
             from .tickets import session_name_for_ticket
             for t in app_state._db.list_tickets(limit=1000):

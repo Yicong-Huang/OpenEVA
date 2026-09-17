@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { Project, GraphData } from '../types'
@@ -67,11 +67,13 @@ vi.mock('dagre', () => {
 const mockGetGraph = vi.fn()
 const mockCreateTask = vi.fn()
 const mockRemoveDep = vi.fn()
+const mockUpdateStatus = vi.fn()
 vi.mock('../api', () => ({
   api: {
     getGraph: (...args: any[]) => mockGetGraph(...args),
     createTask: (...args: any[]) => mockCreateTask(...args),
     removeDep: (...args: any[]) => mockRemoveDep(...args),
+    updateTaskStatus: (...args: any[]) => mockUpdateStatus(...args),
   },
 }))
 
@@ -135,6 +137,7 @@ const mockGraphData: GraphData = {
 describe('GraphView', () => {
   beforeEach(() => {
     mockGetGraph.mockReset()
+    mockUpdateStatus.mockReset()
   })
 
   it('shows loading state initially', async () => {
@@ -399,6 +402,86 @@ describe('GraphView', () => {
 
     window.confirm = origConfirm
     globalThis.fetch = origFetch
+  })
+
+  it('node right-click shows "Set status" with all settable statuses and no Blocked', async () => {
+    mockGetGraph.mockResolvedValue(mockGraphData)
+    const { GraphView } = await import('../components/GraphView')
+    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
+    })
+
+    act(() => {
+      latestRFProps.onNodeContextMenu(
+        { preventDefault: vi.fn(), clientX: 150, clientY: 250 },
+        { id: 'task-1', data: { taskId: 'task-1' } },
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('set-status-menu')).toBeInTheDocument()
+    })
+    const menu = screen.getByTestId('set-status-menu')
+    for (const label of ['Not Started', 'In Progress', 'In Review', 'Needs Follow-up', 'Done', 'Closed']) {
+      expect(within(menu).getByText(label)).toBeInTheDocument()
+    }
+    // `blocked` is derived, never settable.
+    expect(within(menu).queryByText('Blocked')).not.toBeInTheDocument()
+    // task-1 is in_progress -> that row is marked current, not clickable.
+    expect(within(menu).getByText('[current]')).toBeInTheDocument()
+  })
+
+  it('set status from context menu calls updateTaskStatus with the chosen status', async () => {
+    mockGetGraph.mockResolvedValue(mockGraphData)
+    mockUpdateStatus.mockResolvedValue({})
+    const { GraphView } = await import('../components/GraphView')
+
+    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
+    })
+
+    act(() => {
+      latestRFProps.onNodeContextMenu(
+        { preventDefault: vi.fn(), clientX: 150, clientY: 250 },
+        { id: 'task-1', data: { taskId: 'task-1' } },
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('set-status-menu')).toBeInTheDocument()
+    })
+    fireEvent.click(within(screen.getByTestId('set-status-menu')).getByText('Done'))
+
+    await waitFor(() => {
+      expect(mockUpdateStatus).toHaveBeenCalledWith('test-proj', 'task-1', 'done')
+    })
+  })
+
+  it('set status: clicking the current status is a no-op', async () => {
+    mockGetGraph.mockResolvedValue(mockGraphData)
+    mockUpdateStatus.mockResolvedValue({})
+    const { GraphView } = await import('../components/GraphView')
+
+    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
+    })
+
+    act(() => {
+      latestRFProps.onNodeContextMenu(
+        { preventDefault: vi.fn(), clientX: 150, clientY: 250 },
+        { id: 'task-1', data: { taskId: 'task-1' } },
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('set-status-menu')).toBeInTheDocument()
+    })
+    // task-1 is in_progress -> clicking "In Progress" must NOT issue a call.
+    fireEvent.click(within(screen.getByTestId('set-status-menu')).getByText('In Progress'))
+    expect(mockUpdateStatus).not.toHaveBeenCalled()
   })
 
   it('+ New Task spawns an inline draft node (replaces old modal)', async () => {
@@ -802,54 +885,6 @@ describe('GraphView', () => {
     expect(mockGetGraph).toHaveBeenCalledTimes(1)
   })
 
-  it.skip('OBSOLETE create task dialog: SSE error lines are shown in red', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    const { GraphView } = await import('../components/GraphView')
-
-    const origFetch = globalThis.fetch
-    const mockFetch = vi.fn().mockImplementation((url: string) => {
-      if (typeof url === 'string' && url.includes('smart-create')) {
-        const encoder = new TextEncoder()
-        const streamData = encoder.encode('data: {"error":"Something went wrong"}\ndata: {"done":true}\n')
-        const stream = new ReadableStream({
-          start(controller) {
-            controller.enqueue(streamData)
-            controller.close()
-          },
-        })
-        return Promise.resolve({ ok: true, body: stream })
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
-    })
-    globalThis.fetch = mockFetch as any
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    // Open context menu -> New Task -> fill context -> submit
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-    const contextTextarea = screen.getByPlaceholderText(/EX-55754/)
-    fireEvent.change(contextTextarea, { target: { value: 'Test error handling' } })
-    fireEvent.click(screen.getByText('Create with AI'))
-
-    await waitFor(() => {
-      expect(screen.getByText('ERROR: Something went wrong')).toBeInTheDocument()
-    })
-
-    globalThis.fetch = origFetch
-  })
-
   it('context menu closes when clicking outside', async () => {
     mockGetGraph.mockResolvedValue(mockGraphData)
     const { GraphView } = await import('../components/GraphView')
@@ -1090,127 +1125,6 @@ describe('GraphView', () => {
     await waitFor(() => {
       expect(latestRFProps.edges).toBeDefined()
     })
-  })
-
-  it.skip('OBSOLETE create task dialog: direct create (no context, with task ID)', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    mockCreateTask.mockResolvedValue({})
-    const { GraphView } = await import('../components/GraphView')
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    // Open context menu -> New Task
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-
-    // Open manual override section
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-
-    // Expand manual override
-    const summary = screen.getByText(/Manual override/)
-    fireEvent.click(summary)
-
-    // Fill in task ID (no context)
-    const idInput = screen.getByPlaceholderText(/task-id/)
-    fireEvent.change(idInput, { target: { value: 'new-task-1' } })
-
-    // Button should say "Create" (not "Create with AI")
-    await waitFor(() => {
-      expect(screen.getByText('Create')).toBeInTheDocument()
-    })
-
-    fireEvent.click(screen.getByText('Create'))
-
-    await waitFor(() => {
-      expect(mockCreateTask).toHaveBeenCalledWith('test-proj', {
-        id: 'new-task-1',
-        description: '',
-      })
-    })
-  })
-
-  it.skip('OBSOLETE create task dialog: direct create failure shows alert', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    mockCreateTask.mockRejectedValue(new Error('Duplicate task'))
-    const origAlert = window.alert
-    window.alert = vi.fn()
-    const { GraphView } = await import('../components/GraphView')
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-
-    const summary = screen.getByText(/Manual override/)
-    fireEvent.click(summary)
-
-    const idInput = screen.getByPlaceholderText(/task-id/)
-    fireEvent.change(idInput, { target: { value: 'dup-task' } })
-
-    fireEvent.click(screen.getByText('Create'))
-
-    await waitFor(() => {
-      expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('Duplicate task'))
-    })
-
-    window.alert = origAlert
-  })
-
-  it.skip('OBSOLETE create task dialog: SSE fetch failure shows error in AI response', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    const { GraphView } = await import('../components/GraphView')
-
-    const origFetch = globalThis.fetch
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network failure')) as any
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-
-    const contextTextarea = screen.getByPlaceholderText(/EX-55754/)
-    fireEvent.change(contextTextarea, { target: { value: 'Something that fails' } })
-    fireEvent.click(screen.getByText('Create with AI'))
-
-    await waitFor(() => {
-      expect(screen.getByText(/Error: Network failure/)).toBeInTheDocument()
-    })
-
-    globalThis.fetch = origFetch
   })
 
   it('create task button disabled when both context and id are empty', async () => {
@@ -1496,76 +1410,6 @@ describe('GraphView', () => {
     // Node with unknown status should return fallback
     const resultUnknown = nodeColor({ data: { status: 'unknown_status' } })
     expect(resultUnknown).toBe('var(--text-faint)')
-  })
-
-  it.skip('OBSOLETE create dialog: clicking overlay closes dialog when not creating', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    const { GraphView } = await import('../components/GraphView')
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    // Open create dialog
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-
-    // Click the overlay (the fixed backdrop)
-    // The overlay has the onClick that calls setCreateDialog(null)
-    // The overlay is the element with position: fixed, inset: 0
-    const fixedOverlay = document.querySelector('[style*="position: fixed"][style*="inset: 0"]') as HTMLElement
-    expect(fixedOverlay).toBeTruthy()
-    fireEvent.click(fixedOverlay)
-
-    // Dialog should close
-    await waitFor(() => {
-      expect(screen.queryByText('New Task')).not.toBeInTheDocument()
-    })
-  })
-
-  it.skip('OBSOLETE create dialog: description input in manual override section is editable', async () => {
-    mockGetGraph.mockResolvedValue(mockGraphData)
-    const { GraphView } = await import('../components/GraphView')
-
-    render(<GraphView project={mockProject} onSelectTask={vi.fn()} selectedTask={null} />)
-    await waitFor(() => {
-      expect(screen.getByTestId('react-flow')).toBeInTheDocument()
-    })
-
-    // Open create dialog
-    act(() => {
-      latestRFProps.onPaneContextMenu({ preventDefault: vi.fn(), clientX: 100, clientY: 200 })
-    })
-    await waitFor(() => {
-      expect(screen.getByText('+ New Task')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('+ New Task'))
-
-    await waitFor(() => {
-      expect(screen.getByText('New Task')).toBeInTheDocument()
-    })
-
-    // Expand manual override
-    const summary = screen.getByText(/Manual override/)
-    fireEvent.click(summary)
-
-    // Find the description input
-    const descInput = screen.getByPlaceholderText(/Description/)
-    expect(descInput).toBeInTheDocument()
-
-    // Type into the description input
-    fireEvent.change(descInput, { target: { value: 'A detailed description' } })
-    expect((descInput as HTMLInputElement).value).toBe('A detailed description')
   })
 
   // ============================================================
